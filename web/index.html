@@ -1084,6 +1084,32 @@
                         <!-- Map Column -->
                         <div class="map-column">
                             <div class="section-title">ROUTE VISUALIZATION</div>
+                            
+                            <!-- Filters Section -->
+                            <div id="filtersSection" style="display: none; margin-bottom: 16px; padding: 16px; background: var(--surface-bg); border: 1px solid var(--border-color); border-radius: 8px;">
+                                <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.05em;">FILTERS</div>
+                                <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end;">
+                                    <div class="param-group" style="min-width: 200px;">
+                                        <label class="param-label" for="weekFilter">Week</label>
+                                        <select class="param-input" id="weekFilter" onchange="applyFilters()">
+                                            <option value="">All weeks</option>
+                                        </select>
+                                    </div>
+                                    <div class="param-group" style="min-width: 220px;">
+                                        <label class="param-label" for="vendorFilter">Vendor</label>
+                                        <select class="param-input" id="vendorFilter" onchange="applyFilters()">
+                                            <option value="">All vendors</option>
+                                        </select>
+                                    </div>
+                                    <div class="param-group" style="min-width: 180px;">
+                                        <label class="param-label" for="routeFilter">Route</label>
+                                        <select class="param-input" id="routeFilter" onchange="applyFilters()">
+                                            <option value="">All routes</option>
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
+                            
                             <div class="map-container">
                                 <div class="map-placeholder"></div>
                                 <iframe id="mapFrame"></iframe>
@@ -1253,6 +1279,7 @@
         let vendors = [];
         let csvFilepath = null;
         const API_BASE = window.location.origin;
+        let activeRouteFilterSet = null;
         
         // Debug logging
         const debugLogs = [];
@@ -1831,10 +1858,11 @@
             operationHistory = [JSON.parse(JSON.stringify(data))];
             historyIndex = 0;
             updateHistoryButtons();
-            
-            // Show export and route operations sections
+
+            // Show export, filters, and route operations sections
             document.getElementById('exportSection').style.display = 'block';
             document.getElementById('routeOpsSection').style.display = 'block';
+            document.getElementById('filtersSection').style.display = 'block';
             
             // Populate truck dropdown with number of routes
             if (data.statistics && data.statistics.num_routes) {
@@ -1894,97 +1922,37 @@
             const mapFrame = document.getElementById('mapFrame');
             mapFrame.src = data.map_url;
 
+            // Initialize filters
+            initFilters(data.filter_metadata);
+
             // Monitor map layer control for route visibility and add expand/collapse to base layers
             mapFrame.onload = function() {
+                // Ensure map visibility reflects current filters once iframe is ready
+                try {
+                    if (typeof updateMapRouteVisibility === 'function' && activeRouteFilterSet) {
+                        updateMapRouteVisibility(activeRouteFilterSet);
+                    }
+                } catch (e) {}
                 let syncInitialized = false;
                 
                 function monitorCheckboxes() {
-                    try {
-                        const mapDoc = mapFrame.contentDocument || mapFrame.contentWindow.document;
-                        const layerControl = mapDoc.querySelector('.leaflet-control-layers-overlays');
-                        
-                        if (!layerControl) return;
-                        
-                        const labels = layerControl.querySelectorAll('label');
-                        
-                        labels.forEach(label => {
-                            const checkbox = label.querySelector('input[type="checkbox"]');
-                            const text = label.textContent.trim();
-                            const match = text.match(/Route (\d+)/);
-                            
-                            if (match && checkbox) {
-                                const routeId = parseInt(match[1]);
-                                const card = document.getElementById(`route-card-${routeId}`);
-                                
-                                if (card) {
-                                    card.style.display = checkbox.checked ? 'block' : 'none';
-                                    
-                                    if (!syncInitialized) {
-                                        checkbox.addEventListener('change', function() {
-                                            card.style.display = this.checked ? 'block' : 'none';
-                                        });
-                                    }
-                                }
-                            }
-                        });
-                        
-                        if (!syncInitialized) {
-                            syncInitialized = true;
-                        }
-                        
-                    } catch (e) {
-                        // CORS restriction
+                    // Route summary should not toggle when route layers are clicked; keep cards aligned to current filters only.
+                    const cards = document.querySelectorAll('[id^="route-card-"]');
+                    if (cards) {
+                        // If we have an active filter set, honor it; otherwise show all cards.
+                        const routesToShow = (activeRouteFilterSet && activeRouteFilterSet.size > 0)
+                            ? new Set(Array.from(activeRouteFilterSet).map(r => parseInt(r)))
+                            : null;
+                        updateRouteCardVisibility(routesToShow);
                     }
-                }
-                
-                function addBaseLayerCollapse() {
-                    try {
-                        const mapDoc = mapFrame.contentDocument || mapFrame.contentWindow.document;
-                        const layerControlContainer = mapDoc.querySelector('.leaflet-control-layers');
-                        
-                        if (!layerControlContainer || layerControlContainer.dataset.collapseAdded) return;
-                        
-                        const baseLayersSection = mapDoc.querySelector('.leaflet-control-layers-base');
-                        if (!baseLayersSection) return;
-                        
-                        // Mark as processed
-                        layerControlContainer.dataset.collapseAdded = 'true';
-                        
-                        // Add collapse/expand functionality
-                        const layerControlExpanded = mapDoc.querySelector('.leaflet-control-layers-expanded');
-                        if (layerControlExpanded) {
-                            // Make the base layers collapsible by default
-                            baseLayersSection.style.maxHeight = '0';
-                            baseLayersSection.style.overflow = 'hidden';
-                            baseLayersSection.style.transition = 'max-height 0.3s ease';
-                            
-                            // Create toggle button
-                            const separator = mapDoc.querySelector('.leaflet-control-layers-separator');
-                            if (separator && !mapDoc.querySelector('.base-layer-toggle')) {
-                                const toggleButton = mapDoc.createElement('div');
-                                toggleButton.className = 'base-layer-toggle';
-                                toggleButton.innerHTML = '<span style="cursor: pointer; padding: 4px 8px; display: inline-block; font-size: 11px; color: #666; user-select: none;"> Map Styles</span>';
-                                toggleButton.style.marginBottom = '6px';
-                                
-                                let isExpanded = false;
-                                toggleButton.addEventListener('click', function() {
-                                    isExpanded = !isExpanded;
-                                    baseLayersSection.style.maxHeight = isExpanded ? '200px' : '0';
-                                    toggleButton.querySelector('span').innerHTML = isExpanded ? ' Map Styles' : ' Map Styles';
-                                });
-                                
-                                separator.parentNode.insertBefore(toggleButton, separator);
-                            }
-                        }
-                    } catch (e) {
-                        // CORS restriction
+                    if (!syncInitialized) {
+                        syncInitialized = true;
                     }
                 }
                 
                 let pollCount = 0;
                 const pollInterval = setInterval(() => {
                     monitorCheckboxes();
-                    addBaseLayerCollapse();
                     pollCount++;
                     
                     if (syncInitialized || pollCount > 50) {
@@ -2022,6 +1990,295 @@
                     `).join('')}
                 </div>
             `;
+        }
+
+        function initFilters(filterMetadata = {}) {
+            const vendorRoutes = filterMetadata.vendor_routes || {};
+            const routeVendors = filterMetadata.route_vendors || {};
+            const weekOptions = filterMetadata.week_options || [];
+
+            const weekSelect = document.getElementById('weekFilter');
+            const vendorSelect = document.getElementById('vendorFilter');
+            const routeSelect = document.getElementById('routeFilter');
+
+            if (!weekSelect || !vendorSelect || !routeSelect) return;
+
+            // Reset options
+            weekSelect.innerHTML = '<option value="">All weeks</option>';
+            vendorSelect.innerHTML = '<option value="">All vendors</option>';
+            routeSelect.innerHTML = '<option value="">All routes</option>';
+
+            // Populate week options
+            weekOptions.forEach(opt => {
+                const option = document.createElement('option');
+                option.value = opt.value;
+                option.textContent = opt.label;
+                weekSelect.appendChild(option);
+            });
+
+            // Populate vendor options (sorted)
+            Object.keys(vendorRoutes).sort((a, b) => a.localeCompare(b)).forEach(vendorName => {
+                const option = document.createElement('option');
+                option.value = vendorName;
+                option.textContent = vendorName;
+                vendorSelect.appendChild(option);
+            });
+
+            // Populate route options (sorted numerically)
+            Object.keys(routeVendors).map(Number).sort((a, b) => a - b).forEach(routeId => {
+                const option = document.createElement('option');
+                option.value = String(routeId);
+                option.textContent = `Route ${routeId}`;
+                routeSelect.appendChild(option);
+            });
+
+            // Reset active filter state
+            activeRouteFilterSet = null;
+
+            // Apply default (show all) filter state
+            applyFilters();
+        }
+
+        function applyFilters() {
+            if (!currentSolutionData) return;
+
+            const metadata = currentSolutionData.filter_metadata || {};
+            const vendorRoutes = metadata.vendor_routes || {};
+            const routeVendors = metadata.route_vendors || {};
+            const vendorDates = metadata.vendor_delivery_dates || {};
+            const weekOptions = metadata.week_options || [];
+
+            if (Object.keys(routeVendors).length === 0) {
+                activeRouteFilterSet = null;
+                return;
+            }
+
+            const weekSelectEl = document.getElementById('weekFilter');
+            const vendorSelectEl = document.getElementById('vendorFilter');
+            const routeSelectEl = document.getElementById('routeFilter');
+
+            let weekValue = weekSelectEl?.value || '';
+            let vendorValue = vendorSelectEl?.value || '';
+            let routeValue = routeSelectEl?.value || '';
+
+            // If user explicitly picked an "All ..." option, reset the other filters to show everything
+            const activeId = document.activeElement?.id;
+            if (routeValue === '' && activeId === 'routeFilter') {
+                if (weekSelectEl) weekSelectEl.value = '';
+                if (vendorSelectEl) vendorSelectEl.value = '';
+                weekValue = '';
+                vendorValue = '';
+            }
+            if (vendorValue === '' && activeId === 'vendorFilter') {
+                if (weekSelectEl) weekSelectEl.value = '';
+                if (routeSelectEl) routeSelectEl.value = '';
+                weekValue = '';
+                routeValue = '';
+            }
+            if (weekValue === '' && activeId === 'weekFilter') {
+                if (vendorSelectEl) vendorSelectEl.value = '';
+                if (routeSelectEl) routeSelectEl.value = '';
+                vendorValue = '';
+                routeValue = '';
+            }
+
+            // Start with all routes
+            let routesToShow = new Set(Object.keys(routeVendors).map(r => parseInt(r)));
+
+            // Filter by route (direct selection)
+            if (routeValue) {
+                const selectedRoute = parseInt(routeValue);
+                routesToShow = new Set([selectedRoute]);
+            }
+
+            // Filter by vendor (intersect with vendor's routes)
+            if (vendorValue && !routeValue) {
+                const vendorRouteList = vendorRoutes[vendorValue] || [];
+                routesToShow = new Set([...routesToShow].filter(r => vendorRouteList.includes(r)));
+            }
+
+            // Filter by week range
+            if (weekValue && !routeValue) {
+                const [startStr, endStr] = weekValue.split('|');
+                const startDate = new Date(startStr + 'T00:00:00');
+                const endDate = new Date(endStr + 'T23:59:59');
+
+                const routesWithinWeek = new Set();
+                Object.entries(routeVendors).forEach(([routeIdStr, vendorIds]) => {
+                    const routeId = parseInt(routeIdStr);
+                    vendorIds.forEach(vid => {
+                        const dateStr = vendorDates[vid] || vendorDates[String(vid)];
+                        if (dateStr) {
+                            const dt = new Date(dateStr + 'T00:00:00');
+                            if (dt >= startDate && dt <= endDate) {
+                                routesWithinWeek.add(routeId);
+                            }
+                        }
+                    });
+                });
+                routesToShow = new Set([...routesToShow].filter(r => routesWithinWeek.has(r)));
+            }
+
+            // Track current filter set
+            activeRouteFilterSet = routesToShow;
+
+            // Update route cards
+            updateRouteCardVisibility(routesToShow);
+            
+            // Update map route visibility
+            updateMapRouteVisibility(routesToShow);
+
+            // Update linked filter options so selections are related
+            updateLinkedFilterOptions(metadata, routesToShow, { weekValue, vendorValue, routeValue });
+        }
+
+        function updateRouteCardVisibility(routesToShow) {
+            const cards = document.querySelectorAll('[id^="route-card-"]');
+            if (!cards) return;
+
+            if (!routesToShow || routesToShow.size === 0) {
+                cards.forEach(card => card.style.display = 'none');
+                return;
+            }
+
+            cards.forEach(card => {
+                const idMatch = card.id.match(/route-card-(\d+)/);
+                if (idMatch) {
+                    const routeId = parseInt(idMatch[1]);
+                    card.style.display = routesToShow.has(routeId) ? 'block' : 'none';
+                }
+            });
+        }
+        
+        function updateMapRouteVisibility(routesToShow) {
+            const mapFrame = document.getElementById('mapFrame');
+            if (!mapFrame || !mapFrame.contentWindow) return;
+
+            try {
+                const mapWin = mapFrame.contentWindow;
+                const map = mapWin.routeMap;
+                const layerGroups = mapWin.routeLayerGroups;
+                if (!map || !layerGroups) return;
+
+                const activeSet = routesToShow ? new Set(Array.from(routesToShow).map(n => parseInt(n))) : new Set();
+
+                Object.entries(layerGroups).forEach(([routeIdStr, layer]) => {
+                    const routeId = parseInt(routeIdStr);
+                    const shouldShow = activeSet.size === 0 || activeSet.has(routeId);
+                    if (shouldShow) {
+                        map.addLayer(layer);
+                    } else {
+                        map.removeLayer(layer);
+                    }
+                });
+            } catch (e) {
+                // Cross-origin or other access error - map filtering won't work
+                console.warn('Cannot access map iframe:', e);
+            }
+        }
+
+        // Dynamically constrain filter options based on current selection
+        function updateLinkedFilterOptions(metadata, routesToShow, selectionCtx) {
+            const vendorRoutes = metadata.vendor_routes || {};
+            const routeVendors = metadata.route_vendors || {};
+            const vendorDates = metadata.vendor_delivery_dates || {};
+            const weekOptions = metadata.week_options || [];
+
+            const weekSelect = document.getElementById('weekFilter');
+            const vendorSelect = document.getElementById('vendorFilter');
+            const routeSelect = document.getElementById('routeFilter');
+            if (!weekSelect || !vendorSelect || !routeSelect) return;
+
+            const currentWeekValue = weekSelect.value;
+            const currentVendorValue = vendorSelect.value;
+            const currentRouteValue = routeSelect.value;
+
+            // Allowed routes = routesToShow
+            const allowedRoutes = new Set(Array.from(routesToShow).map(r => parseInt(r)));
+
+            // Allowed vendors = vendors that have at least one route in allowedRoutes
+            const allowedVendors = new Set();
+            Object.keys(vendorRoutes).forEach(vendorName => {
+                const rlist = vendorRoutes[vendorName] || [];
+                if (rlist.some(r => allowedRoutes.has(parseInt(r)))) {
+                    allowedVendors.add(vendorName);
+                }
+            });
+
+            // Allowed weeks = weeks that contain at least one vendor date from allowedRoutes
+            const allowedWeeksSet = new Set();
+            weekOptions.forEach(wo => {
+                const [startStr, endStr] = String(wo.value).split('|');
+                if (!startStr || !endStr) return;
+                const startDate = new Date(startStr + 'T00:00:00');
+                const endDate = new Date(endStr + 'T23:59:59');
+                outer: for (const routeId of allowedRoutes) {
+                    const vendorIds = routeVendors[String(routeId)] || routeVendors[routeId] || [];
+                    for (const vid of vendorIds) {
+                        const dateStr = vendorDates[vid] || vendorDates[String(vid)];
+                        if (dateStr) {
+                            const dt = new Date(dateStr + 'T00:00:00');
+                            if (dt >= startDate && dt <= endDate) {
+                                allowedWeeksSet.add(wo.value);
+                                break outer;
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Always keep "All ..." options as a clear/reset choice, regardless of other filters
+            const includeDefaultFor = {
+                routes: true,
+                vendors: true,
+                weeks: true
+            };
+
+            // Update Route options
+            const allowedRouteItems = Array.from(allowedRoutes)
+                .map(r => parseInt(r))
+                .sort((a, b) => a - b)
+                .map(routeId => ({ value: String(routeId), label: `Route ${routeId}` }));
+            setSelectOptions(routeSelect, 'All routes', allowedRouteItems, currentRouteValue, includeDefaultFor.routes);
+
+            // Update Vendor options
+            const allowedVendorItems = Array.from(allowedVendors)
+                .sort((a, b) => a.localeCompare(b))
+                .map(v => ({ value: v, label: v }));
+            setSelectOptions(vendorSelect, 'All vendors', allowedVendorItems, currentVendorValue, includeDefaultFor.vendors);
+
+            // Update Week options (preserve labels)
+            const allowedWeekItems = weekOptions
+                .filter(wo => allowedWeeksSet.has(wo.value))
+                .map(wo => ({ value: String(wo.value), label: String(wo.label) }));
+            setSelectOptions(weekSelect, 'All weeks', allowedWeekItems, currentWeekValue, includeDefaultFor.weeks);
+        }
+
+        function setSelectOptions(selectEl, defaultLabel, items, currentValue, includeDefault = true) {
+            if (!selectEl) return;
+            const prevValue = currentValue ?? selectEl.value ?? '';
+
+            // Rebuild options
+            selectEl.innerHTML = '';
+            if (includeDefault) {
+                const defaultOpt = document.createElement('option');
+                defaultOpt.value = '';
+                defaultOpt.textContent = defaultLabel;
+                selectEl.appendChild(defaultOpt);
+            }
+            items.forEach(it => {
+                const opt = document.createElement('option');
+                opt.value = String(it.value);
+                opt.textContent = String(it.label);
+                selectEl.appendChild(opt);
+            });
+
+            const allowedValues = new Set(items.map(it => String(it.value)));
+            if (prevValue && allowedValues.has(String(prevValue))) {
+                selectEl.value = String(prevValue);
+            } else {
+                selectEl.value = includeDefault ? '' : (items[0]?.value ?? '');
+            }
         }
 
         // Route Operations Functions
