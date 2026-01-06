@@ -9,6 +9,8 @@ import pandas as pd
 import numpy as np
 import os
 import sys
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import requests
 
@@ -17,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model.graph_creator.graph_creator import Graph
 from model.optimizer.delivery_model import DeliveryOptimizer
+from model.utils.coordinate_validator import validate_coordinates
 from model.optimizer.alns_solver import ALNSSolver
 from model.optimizer.route_edit import insert_stop_best_position, remove_stop
 from model.utils.run_storage import save_run, list_runs, load_run, generate_run_id
@@ -24,6 +27,22 @@ import json
 
 app = Flask(__name__, static_folder='web', static_url_path='')
 CORS(app)
+
+# Configure file logging to /tmp/flask_app.log
+log_path = '/tmp/flask_app.log'
+try:
+    file_handler = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=3)
+    file_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+    file_handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    if not any(getattr(h, 'baseFilename', None) == file_handler.baseFilename for h in root_logger.handlers):
+        root_logger.setLevel(logging.INFO)
+        root_logger.addHandler(file_handler)
+except Exception:
+    # Non-fatal: if handler fails, continue with stdout logging
+    pass
 
 # Create necessary directories
 os.makedirs('uploads', exist_ok=True)
@@ -280,9 +299,34 @@ def optimize_routes():
                 else:
                     print("✅ All addresses geocoded successfully!")
             
+            # Add node_id column to preserve DataFrame index for route matching
+            # The optimizer uses df.iterrows() which returns the actual index, not sequential position
+            df['node_id'] = df.index
+            
             # Save processed CSV for read_data
             temp_csv = os.path.join('uploads', f'processed_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
             df.to_csv(temp_csv, index=False)
+            
+            # Coordinate validation report
+            try:
+                issues_df, summary = validate_coordinates(df)
+                print("\n" + "="*80)
+                print("COORDINATE VALIDATION REPORT")
+                print("="*80)
+                print(f"Total rows: {summary['total_rows']}")
+                print(f"Rows with issues: {summary['total_issues']}")
+                if summary['total_issues'] > 0:
+                    print("Issues breakdown:")
+                    for k, v in summary.get('by_issue', {}).items():
+                        print(f"  - {k}: {v}")
+                    # Save issues to results for inspection
+                    os.makedirs('results/validation', exist_ok=True)
+                    issues_path = os.path.join('results/validation', f"coordinate_issues_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+                    issues_df.to_csv(issues_path, index=False)
+                    print(f"Saved detailed issues to: {issues_path}")
+                print("="*80 + "\n")
+            except Exception as e:
+                print(f"⚠️  Coordinate validation failed: {e}")
         else:
             # Fallback: create DataFrame from JSON vendors_data (no geocoding needed)
             failed_geocodes = []
@@ -305,8 +349,31 @@ def optimize_routes():
                 df['Requested Delivery'] = df['delivery_date']
                 df['Requested Loading'] = df['delivery_date']
             
+            # Add node_id column to preserve DataFrame index for route matching
+            df['node_id'] = df.index
+            
             temp_csv = os.path.join('uploads', f'temp_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
             df.to_csv(temp_csv, index=False)
+            
+            # Coordinate validation report
+            try:
+                issues_df, summary = validate_coordinates(df)
+                print("\n" + "="*80)
+                print("COORDINATE VALIDATION REPORT")
+                print("="*80)
+                print(f"Total rows: {summary['total_rows']}")
+                print(f"Rows with issues: {summary['total_issues']}")
+                if summary['total_issues'] > 0:
+                    print("Issues breakdown:")
+                    for k, v in summary.get('by_issue', {}).items():
+                        print(f"  - {k}: {v}")
+                    os.makedirs('results/validation', exist_ok=True)
+                    issues_path = os.path.join('results/validation', f"coordinate_issues_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+                    issues_df.to_csv(issues_path, index=False)
+                    print(f"Saved detailed issues to: {issues_path}")
+                print("="*80 + "\n")
+            except Exception as e:
+                print(f"⚠️  Coordinate validation failed: {e}")
         
         # Get depot coordinates from the first recipient row (they should all be the same depot)
         depot_lat = df['recipient_latitude'].iloc[0] if 'recipient_latitude' in df.columns else 47.6062
@@ -438,7 +505,15 @@ def optimize_routes():
         os.makedirs('results/optimization', exist_ok=True)
         
         # Plot routes using the optimizer's built-in method
-        _, route_stats = optimizer.plot_routes(x, y, show_plot=False, save_path=map_path)
+        # Suppress stdout to prevent BrokenPipeError from excessive printing
+        import sys
+        from io import StringIO
+        old_stdout = sys.stdout
+        sys.stdout = StringIO()  # Redirect stdout
+        try:
+            _, route_stats = optimizer.plot_routes(x, y, show_plot=False, save_path=map_path)
+        finally:
+            sys.stdout = old_stdout  # Restore stdout
         
         # Store map_path in APP_STATE for manual saves
         APP_STATE['map_path'] = map_path
@@ -446,13 +521,36 @@ def optimize_routes():
         # Extract statistics from route_stats returned by plot_routes
         num_vehicles_used = len(route_stats)
         total_distance = sum(stats['total_distance'] for stats in route_stats.values())
-        total_cargo = sum(stats['total_cargo'] for stats in route_stats.values())
+        total_cargo_kg = sum(stats['total_cargo'] for stats in route_stats.values())
+        total_cargo_tons = total_cargo_kg / 1000.0
         total_loading = sum(stats['total_loading'] for stats in route_stats.values())
+
+        # Identify included vendors first
+        included_vendor_ids = set()
+        for vehicle_id in sorted(route_stats.keys()):
+            vendors_seq = route_stats[vehicle_id].get('vendors', [])
+            included_vendor_ids.update([int(v) for v in vendors_seq])
+        
+        # Total volume (m³) - only for INCLUDED vendors
+        volume_series = None
+        for vol_col in ['Vendor Dimensions in m3', 'Total Volume (cbm)', 'volume', 'Vendor Loading Meters', 'Calculated Loading Meters']:
+            if vol_col in vendors_df.columns:
+                volume_series = vendors_df[vol_col]
+                break
+        
+        # Calculate total volume only for included vendors (1-indexed vendor IDs)
+        if volume_series is not None:
+            included_indices = [vid - 1 for vid in included_vendor_ids]  # Convert to 0-indexed
+            total_volume = float(volume_series.iloc[included_indices].fillna(0).sum())
+        else:
+            total_volume = 0.0
         
         print(f"Solution found: {num_vehicles_used} vehicles used")
         print(f"Total distance: {total_distance:.0f} km")
-        print(f"Total cargo: {total_cargo:.0f} kg")
-        print(f"Total loading: {total_loading:.1f} m³")
+        print(f"Total weight: {total_cargo_tons:.1f} tons (raw kg: {total_cargo_kg:.0f})")
+        print(f"Total loading: {total_loading:.1f} m")
+        print(f"Total volume (included vendors only): {total_volume:.1f} m³")
+        print(f"[DEBUG] Stats being sent - total_cargo value: {float(round(total_cargo_tons, 3))}")
         
         # Create detailed route summaries from statistics
         route_summaries = []
@@ -462,11 +560,126 @@ def optimize_routes():
                 'route_id': int(vehicle_id + 1),
                 'num_vendors': int(stats['num_vendors']),
                 'distance': float(round(stats['total_distance'], 1)),
-                'cargo': float(round(stats['total_cargo'], 0)),
+                'cargo': float(round(stats['total_cargo'] / 1000.0, 3)),  # tons
                 'loading': float(round(stats['total_loading'], 2))
             })
 
-        # Cache plan state for subsequent local edits
+        # Build filter metadata (vendor names, delivery dates, route-vendor mappings, week options)
+        vendor_name_map = {}
+        vendor_date_map = {}
+        vendor_routes_map = {}
+        route_vendors_map = {}
+        week_options = []
+
+        try:
+            # Prepare vendor name and delivery date lookup (1-indexed)
+            for idx, row in vendors_df.iterrows():
+                vendor_id = int(idx + 1)
+                vendor_name_map[vendor_id] = str(row.get('vendor Name', row.get('Vendor Name', f'Vendor {vendor_id}')))
+
+                raw_date = row.get('Requested Delivery', row.get('Requested Delivery Date', ''))
+                parsed_date = pd.to_datetime(raw_date, errors='coerce')
+                if pd.notna(parsed_date):
+                    vendor_date_map[vendor_id] = parsed_date.strftime('%Y-%m-%d')
+
+            # Map routes to vendors (and vendors to routes for fast lookup)
+            for vehicle_id in sorted(route_stats.keys()):
+                vendors_seq = route_stats[vehicle_id].get('vendors', [])
+                route_number = int(vehicle_id + 1)
+                route_vendors_map[route_number] = [int(v) for v in vendors_seq]
+
+                for v in vendors_seq:
+                    v_int = int(v)
+                    v_name = vendor_name_map.get(v_int)
+                    if v_name:
+                        vendor_routes_map.setdefault(v_name, []).append(route_number)
+
+            # Compute contiguous weekly options based on available delivery dates (Mon-Sun)
+            if len(vendor_date_map) > 0:
+                all_dates = pd.to_datetime(list(vendor_date_map.values()), errors='coerce').dropna()
+                if len(all_dates) > 0:
+                    min_date = all_dates.min()
+                    max_date = all_dates.max()
+
+                    week_start = min_date - pd.to_timedelta(min_date.weekday(), unit='d')
+                    week_end = max_date + pd.to_timedelta(6 - max_date.weekday(), unit='d')
+
+                    current_start = week_start
+                    week_idx = 1
+                    while current_start <= week_end:
+                        current_end = current_start + pd.Timedelta(days=6)
+                        week_options.append({
+                            'value': f"{current_start.strftime('%Y-%m-%d')}|{current_end.strftime('%Y-%m-%d')}",
+                            'label': f"Week {week_idx}: {current_start.strftime('%Y-%m-%d')} to {current_end.strftime('%Y-%m-%d')}"
+                        })
+                        week_idx += 1
+                        current_start += pd.Timedelta(days=7)
+        except Exception as _:
+            # Non-fatal; filters will simply not be pre-populated
+            pass
+
+        # Identify excluded vendors
+        
+        all_vendor_ids = set(range(1, len(vendors_df) + 1))  # 1-indexed
+        excluded_vendor_ids = sorted(list(all_vendor_ids - included_vendor_ids))
+        
+        excluded_vendors = []
+        for vendor_id in excluded_vendor_ids:
+            vendor_row = vendors_df.iloc[vendor_id - 1]  # Convert back to 0-indexed
+            vendor_name = vendor_row.get('Vendor Name', vendor_row.get('vendor Name', f'Vendor {vendor_id}'))
+            vendor_city = vendor_row.get('Vendor City', 'N/A')
+            weight = vendor_row.get('Vendor Gross Weight', vendor_row.get('Total Gross Weight', 0))
+            
+            # Determine specific constraint violation
+            reasons = []
+            
+            # Check weight capacity (in kg)
+            max_weight_kg = network_params['max_weight'] * 1000  # Convert tons to kg
+            if weight > max_weight_kg:
+                reasons.append(f'Weight exceeds capacity ({weight:.0f} kg > {max_weight_kg:.0f} kg)')
+            
+            # Check loading meters capacity
+            loading_meters = 0
+            for ldm_col in ['Vendor Loading Meters', 'Calculated Loading Meters', 'loading_meters']:
+                if ldm_col in vendor_row and pd.notna(vendor_row[ldm_col]):
+                    loading_meters = float(vendor_row[ldm_col])
+                    break
+            
+            max_ldms = network_params['max_ldms']
+            if loading_meters > max_ldms:
+                reasons.append(f'Loading exceeds capacity ({loading_meters:.1f} m > {max_ldms:.1f} m)')
+            
+            # Check geocoding failure
+            vendor_lat = vendor_row.get('vendor_latitude', 0)
+            vendor_lon = vendor_row.get('vendor_longitude', 0)
+            if vendor_lat == 0 or vendor_lon == 0:
+                reasons.append('Geocoding failed (invalid coordinates)')
+            
+            # Check time window feasibility
+            requested_delivery = vendor_row.get('Requested Delivery', None)
+            if pd.notna(requested_delivery):
+                try:
+                    delivery_time = pd.to_datetime(requested_delivery)
+                    # Check if delivery time is outside the optimization period
+                    if period and (delivery_time < period[0] or delivery_time > period[1]):
+                        reasons.append(f'Delivery time outside period ({delivery_time.strftime("%Y-%m-%d")} not in [{period[0].strftime("%Y-%m-%d")}, {period[1].strftime("%Y-%m-%d")}])')
+                except:
+                    reasons.append('Invalid delivery date format')
+            else:
+                reasons.append('Missing delivery time window')
+            
+            # Default reason if no specific constraint found
+            reason = '; '.join(reasons) if reasons else 'Infeasible constraint (solver rejected)'
+            
+            excluded_vendors.append({
+                'vendor_id': int(vendor_id),
+                'vendor_name': str(vendor_name),
+                'city': str(vendor_city),
+                'weight': float(weight),
+                'reason': reason
+            })
+        
+        print(f"Included {len(included_vendor_ids)} vendors, excluded {len(excluded_vendors)} vendors")
         try:
             # Reconstruct simple routes as [0] + vendors + [0]
             cached_routes = []
@@ -542,19 +755,32 @@ def optimize_routes():
         except Exception as _:
             pass
         
+        # Ensure total_cargo is in tons (divide by 1000 if needed)
+        final_total_cargo = total_cargo_tons
+        if final_total_cargo > 10000:  # If still looks like kg, divide again
+            final_total_cargo = final_total_cargo / 1000.0
+        
         return jsonify({
             'success': True,
             'map_url': f'/results/optimization/{map_filename}',
             'statistics': {
                 'total_distance': float(round(total_distance, 1)),
-                'total_cargo': float(round(total_cargo, 0)),
+                'total_cargo': float(round(final_total_cargo, 3)),
                 'total_loading': float(round(total_loading, 2)),
+                'total_volume': float(round(total_volume, 2)),
                 'num_routes': int(num_vehicles_used),
-                'num_vendors': int(len(vendors_data)),
+                'num_vendors': int(len(included_vendor_ids)),  # Only included vendors
                 'solving_time': float(round(solving_time, 2)),
                 'solver_type': str(solver_type)
             },
             'routes': route_summaries,
+            'filter_metadata': {
+                'vendor_routes': vendor_routes_map,
+                'vendor_delivery_dates': vendor_date_map,
+                'route_vendors': route_vendors_map,
+                'week_options': week_options
+            },
+            'excluded_vendors': excluded_vendors,
             'failed_geocodes': failed_geocodes,
             'run_id': run_id
         })
@@ -966,6 +1192,15 @@ def health_check():
 
 
 if __name__ == '__main__':
+    # Truncate flask_app.log on each restart to keep logs fresh
+    try:
+        log_path = '/tmp/flask_app.log'
+        # Ensure file exists, then truncate
+        open(log_path, 'w').close()
+    except Exception as _:
+        # Non-fatal: if we can't truncate, continue startup
+        pass
+
     print("🚀 Starting Parcel Delivery Optimizer Server...")
     print("📍 Open http://localhost:8080 in your browser")
     # Disable debug reloader for stable single-process listening
