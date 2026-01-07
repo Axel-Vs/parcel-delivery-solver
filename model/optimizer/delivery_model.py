@@ -1352,12 +1352,6 @@ class DeliveryOptimizer:
                                                 </div>
                                             </div>
                                         </div>
-                                        
-                                        <div style="background: rgba(179, 154, 124, 0.08); padding: 8px 10px; border-radius: 8px; margin-top: 10px; border-left: 3px solid #B39A7C;">
-                                            <p style="margin: 0; font-size: 10px; color: #5C5B56;">
-                                                💡 <b>Click</b> the route for more detailed information
-                                            </p>
-                                        </div>
                                     </div>
                                 </div>
                                 """
