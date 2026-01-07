@@ -2122,17 +2122,32 @@
                 const mapWin = mapFrame.contentWindow;
                 const map = mapWin.routeMap;
                 const layerGroups = mapWin.routeLayerGroups;
-                if (!map || !layerGroups) return;
+                
+                if (!map) {
+                    console.warn('Map not ready yet');
+                    return;
+                }
+
+                // Wait a bit if layer groups aren't ready yet
+                if (!layerGroups || Object.keys(layerGroups).length === 0) {
+                    setTimeout(() => updateMapRouteVisibility(routesToShow), 200);
+                    return;
+                }
 
                 const activeSet = routesToShow ? new Set(Array.from(routesToShow).map(n => parseInt(n))) : new Set();
-
+                
                 Object.entries(layerGroups).forEach(([routeIdStr, layer]) => {
                     const routeId = parseInt(routeIdStr);
                     const shouldShow = activeSet.size === 0 || activeSet.has(routeId);
-                    if (shouldShow) {
-                        map.addLayer(layer);
-                    } else {
-                        map.removeLayer(layer);
+                    
+                    try {
+                        if (shouldShow && !map.hasLayer(layer)) {
+                            map.addLayer(layer);
+                        } else if (!shouldShow && map.hasLayer(layer)) {
+                            map.removeLayer(layer);
+                        }
+                    } catch (layerErr) {
+                        console.warn('Error toggling layer for route', routeId, ':', layerErr);
                     }
                 });
             } catch (e) {

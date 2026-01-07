@@ -1724,25 +1724,41 @@ class DeliveryOptimizer:
         '''
         m.get_root().html.add_child(folium.Element(excel_filter_html))
         
-        # Expose map and layer groups to window for external filter control
+        # Expose map and route layer groups to window for external filter control
+        # Build a JavaScript mapping of route numbers to layer groups
+        route_groups_json = {}
+        for route_num, fg in route_feature_groups.items():
+            # Store the feature group with the route number as key
+            route_groups_json[str(route_num)] = f"window.routeLayerGroups[{route_num}]"
+        
         expose_layers_js = """
         <script>
             window.routeMap = map;
-            window.routeLayerGroups = {};
-            // Layer groups will be added as features are created by Folium
-            map.eachLayer(function(layer) {
-                if (layer._leaflet_id) {
-                    window.routeLayerGroups[layer.options.name || layer._leaflet_id] = layer;
-                }
-            });
+            window.routeLayerGroups = {{}};
             
-            // Alternative: try to access layer control and extract from there
-            map.on('layeradd', function(e) {
-                var layer = e.layer;
-                if (layer.options && layer.options.name) {
-                    window.routeLayerGroups[layer.options.name] = layer;
-                }
-            });
+            // Wait for all layers to be added to the map
+            var populateLayers = function() {{
+                var found = 0;
+                map.eachLayer(function(layer) {{
+                    if (layer.options && layer.options.name) {{
+                        // Extract route number from name like "🚚 Route 3"
+                        var match = layer.options.name.match(/Route (\d+)/);
+                        if (match) {{
+                            var routeNum = parseInt(match[1]);
+                            window.routeLayerGroups[routeNum] = layer;
+                            found++;
+                        }}
+                    }}
+                }});
+                
+                // If we didn't find all expected routes yet, try again
+                if (found === 0) {{
+                    setTimeout(populateLayers, 100);
+                }}
+            }};
+            
+            // Delay slightly to ensure all layers are added
+            setTimeout(populateLayers, 200);
         </script>
         """
         m.get_root().html.add_child(folium.Element(expose_layers_js))
