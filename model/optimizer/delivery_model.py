@@ -1731,31 +1731,31 @@ class DeliveryOptimizer:
             # Store the feature group with the route number as key
             route_groups_json[str(route_num)] = f"window.routeLayerGroups[{route_num}]"
         
-        expose_layers_js = """
+        expose_layers_js = r"""
         <script>
             window.routeMap = map;
-            window.routeLayerGroups = {{}};
+            window.routeLayerGroups = {};
             
             // Wait for all layers to be added to the map
-            var populateLayers = function() {{
+            var populateLayers = function() {
                 var found = 0;
-                map.eachLayer(function(layer) {{
-                    if (layer.options && layer.options.name) {{
+                map.eachLayer(function(layer) {
+                    if (layer.options && layer.options.name) {
                         // Extract route number from name like "🚚 Route 3"
                         var match = layer.options.name.match(/Route (\d+)/);
-                        if (match) {{
+                        if (match) {
                             var routeNum = parseInt(match[1]);
                             window.routeLayerGroups[routeNum] = layer;
                             found++;
-                        }}
-                    }}
-                }});
+                        }
+                    }
+                });
                 
                 // If we didn't find all expected routes yet, try again
-                if (found === 0) {{
+                if (found === 0) {
                     setTimeout(populateLayers, 100);
-                }}
-            }};
+                }
+            };
             
             // Delay slightly to ensure all layers are added
             setTimeout(populateLayers, 200);
