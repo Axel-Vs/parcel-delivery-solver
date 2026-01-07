@@ -115,7 +115,91 @@ Run through this checklist to verify all features are working correctly.
 
 ---
 
-## 5. Export Options
+## 5. Results Filtering (NEW)
+
+### Filter Visibility
+- [ ] After optimization completes
+- [ ] Scroll to route list area
+- [ ] Verify three filter dropdowns present: Week, Vendor, Route
+- [ ] Verify each dropdown shows "All weeks/vendors/routes" as first option
+- [ ] Verify dropdown lists are populated with available options
+
+### Linked Filter: Week Selection
+- [ ] Select a specific week from Week dropdown (e.g., "Week 1")
+- [ ] Verify Vendor dropdown updates to show only vendors in Week 1
+- [ ] Verify Route dropdown updates to show only routes in Week 1
+- [ ] Verify route summary cards update to show only Week 1 routes
+- [ ] Verify route count reduced on map
+
+### Linked Filter: Vendor Selection
+- [ ] Click Week dropdown, select "All weeks" (reset)
+- [ ] Select a specific vendor from Vendor dropdown (e.g., "Vendor A")
+- [ ] Verify Week dropdown updates to show only weeks with Vendor A
+- [ ] Verify Route dropdown updates to show only routes with Vendor A
+- [ ] Verify route summary cards update accordingly
+- [ ] Verify map shows only routes containing Vendor A
+
+### Linked Filter: Route Selection
+- [ ] Click Vendor dropdown, select "All vendors" (reset)
+- [ ] Select a specific route from Route dropdown (e.g., "Route 3")
+- [ ] Verify Week dropdown updates to show only the week of Route 3
+- [ ] Verify Vendor dropdown updates to show only vendors on Route 3
+- [ ] Verify only Route 3 summary card displays
+- [ ] Verify map highlights only Route 3
+
+### Cascade Reset: All Weeks Button
+- [ ] Select Week: "Week 2"
+- [ ] Select Vendor: "Vendor B"
+- [ ] Select Route: "Route 5"
+- [ ] Click Week dropdown and select "All weeks"
+- [ ] Verify Vendor dropdown resets to "All vendors"
+- [ ] Verify Route dropdown resets to "All routes"
+- [ ] Verify all route summary cards visible
+
+### Cascade Reset: All Vendors Button
+- [ ] Select Week: "Week 3"
+- [ ] Select Vendor: "Vendor C"
+- [ ] Select Route: "Route 8"
+- [ ] Click Vendor dropdown and select "All vendors"
+- [ ] Verify Week dropdown resets to "All weeks"
+- [ ] Verify Route dropdown resets to "All routes"
+- [ ] Verify all route cards and map routes visible
+
+### Cascade Reset: All Routes Button
+- [ ] Select Week: "Week 1"
+- [ ] Select Vendor: "Vendor D"
+- [ ] Select Route: "Route 1"
+- [ ] Click Route dropdown and select "All routes"
+- [ ] Verify Week dropdown resets to "All weeks"
+- [ ] Verify Vendor dropdown resets to "All vendors"
+- [ ] Verify all route cards and map routes visible
+
+### Route Card Visibility
+- [ ] Apply filter: Week = "Week 2", Vendor = "All vendors"
+- [ ] Verify only route cards containing vendors from Week 2 display
+- [ ] Apply filter: Vendor = "Vendor E", Week = "All weeks"
+- [ ] Verify only route cards containing Vendor E display
+- [ ] Apply filter: Route = "Route 12"
+- [ ] Verify only Route 12 summary card displays
+
+### Map Layer Synchronization
+- [ ] Select Week: "Week 4"
+- [ ] Verify map shows only routes in Week 4 (colored layers visible)
+- [ ] Select Vendor: "Vendor F"
+- [ ] Verify map shows only routes containing Vendor F
+- [ ] Select Route: "Route 15"
+- [ ] Verify map highlights only Route 15 with distinct styling
+
+### Filter Count Display
+- [ ] Open Week dropdown
+- [ ] Verify "All weeks" option shows total count (e.g., "All weeks (4)")
+- [ ] Select a vendor
+- [ ] Verify Week dropdown "All weeks" updates to show filtered count (e.g., "All weeks (2)")
+- [ ] Same for Vendor and Route dropdowns
+
+---
+
+## 6. Download and Export
 
 ### Download CSV
 - [ ] After optimization completes
@@ -142,7 +226,7 @@ Run through this checklist to verify all features are working correctly.
 
 ---
 
-## 6. Route Operations
+## 7. Route Operations
 
 ### Add Delivery
 - [ ] After optimization
@@ -169,7 +253,7 @@ Run through this checklist to verify all features are working correctly.
 
 ---
 
-## 7. Undo/Redo
+## 8. Undo/Redo
 
 ### Undo Operation
 - [ ] After optimization, perform an add/remove operation
@@ -192,7 +276,7 @@ Run through this checklist to verify all features are working correctly.
 
 ---
 
-## 8. Route Details Modal
+## 9. Route Details Modal
 
 ### Open Modal
 - [ ] After optimization
@@ -213,7 +297,7 @@ Run through this checklist to verify all features are working correctly.
 
 ---
 
-## 9. Saved Runs Management
+## 10. Saved Runs Management
 
 ### View Runs Table
 - [ ] Click "Saved Runs" tab
@@ -241,7 +325,7 @@ Run through this checklist to verify all features are working correctly.
 
 ---
 
-## 10. Comparison Mode
+## 11. Comparison Mode
 
 ### Select Runs
 - [ ] In Saved Runs tab
@@ -275,7 +359,7 @@ Run through this checklist to verify all features are working correctly.
 
 ---
 
-## 11. Sidebar Toggle
+## 12. Sidebar Toggle
 
 ### Show/Hide Sidebar
 - [ ] In Optimizer tab, verify sidebar visible
@@ -295,7 +379,7 @@ Run through this checklist to verify all features are working correctly.
 
 ---
 
-## 12. Modal Interactions
+## 13. Modal Interactions
 
 ### Save Dialog
 - [ ] Trigger save dialog
@@ -321,7 +405,7 @@ Run through this checklist to verify all features are working correctly.
 
 ---
 
-## 13. UI/UX Polish
+## 14. UI/UX Polish
 
 ### Color Scheme
 - [ ] Verify all buttons black (except disabled = gray)
@@ -344,7 +428,7 @@ Run through this checklist to verify all features are working correctly.
 
 ---
 
-## 14. Error Handling
+## 15. Error Handling
 
 ### Network Errors
 - [ ] Stop Flask server
@@ -371,7 +455,7 @@ Run through this checklist to verify all features are working correctly.
 
 ---
 
-## 15. Performance
+## 16. Performance
 
 ### Load Times
 - [ ] Upload small dataset (5 vendors)

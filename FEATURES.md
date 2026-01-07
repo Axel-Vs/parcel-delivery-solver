@@ -208,6 +208,42 @@ This document describes all features implemented in the web application, includi
 7. **History Management**: Undo/redo through changes
 8. **Export/Save**: Download or archive final solution
 
+### 3. Results Filtering (NEW)
+
+#### Linked Filter System
+- **Location**: Results panel > Top of route list
+- **Components**: Three filter dropdowns: Week, Vendor, Route
+- **Behavior**: Filters are interdependent (selecting one constrains the others)
+  - Select a **Week**: Only vendors and routes in that week appear in related dropdowns
+  - Select a **Vendor**: Only weeks containing that vendor and routes serving that vendor appear
+  - Select a **Route**: Only the week and vendors on that route appear
+- **Visual Feedback**: 
+  - "All weeks/vendors/routes" options always present at top of each dropdown (shows count of filtered items)
+  - Available options gray out or disappear if no related data exists
+  - Route summary cards update immediately to show only filtered routes
+
+#### Cascade Reset Behavior
+- **Reset Button**: "All weeks", "All vendors", "All routes" act as reset buttons
+- **Cascade Effect**: Selecting "All" in one filter resets all other filters to "All"
+- **Example**: Select "All vendors" → all filters reset to show all weeks, vendors, and routes
+
+#### Route Summary Cards
+- **Display**: Filtered route cards show:
+  - Route number (e.g., "Route 3")
+  - Stop count
+  - Total cargo weight (kg)
+  - Total volume (m³)
+  - Total distance (km)
+  - Capacity utilization percentages
+  - List of vendors on route
+- **Visibility**: Cards automatically hidden/shown based on active filters
+- **No Toggle Sync**: Route cards no longer toggle on map layer clicks (decoupled for UX clarity)
+
+#### Interactive Map Integration
+- **Route Visibility**: Map route layers correspond to filtered route selection
+- **Interaction**: Click route layer to highlight on map; route card displays related metadata
+- **Layers**: Color-coded by route; OSRM real-road routing with polyline display
+
 ## Keyboard Shortcuts
 
 - **ESC**: Close any open modal (Save Dialog, Route Details, Comparison Results)
