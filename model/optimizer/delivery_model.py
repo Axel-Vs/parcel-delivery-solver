@@ -1261,100 +1261,8 @@ class DeliveryOptimizer:
                                             seen_vendors.add(v_id)
                                             v_name = node_info.get(v_id, {}).get('name', f'Vendor {v_id}')
                                             v_city = node_info.get(v_id, {}).get('city', 'N/A')
-                                            vendor_list_items.append(f'<li style="margin: 2px 0; font-size: 10px;">📍 {v_name} ({v_city})</li>')
-                                    vendor_list_html = ''.join(vendor_list_items)
+                                            vendor_list_html = v_name
                                 
-                                # Calculate capacity utilization
-                                cargo_utilization = (total_cargo / self.max_capacity_kg[vehicle_id]) * 100 if vehicle_id < len(self.max_capacity_kg) else 0
-                                loading_utilization = (total_loading / self.max_ldms_vc[vehicle_id]) * 100 if vehicle_id < len(self.max_ldms_vc) else 0
-                                
-                                tooltip_html = f"""
-                                <div style="font-family: 'Segoe UI', Arial, sans-serif; min-width: 320px; max-width: 400px;">
-                                    <div style="background: linear-gradient(135deg, {color} 0%, {color}DD 100%); 
-                                                color: white; padding: 10px 15px; 
-                                                border-radius: 8px 8px 0 0; margin: -10px -10px 10px -10px;">
-                                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                                            <b style="font-size: 15px;">🚚 Route {route_number}</b>
-                                            <span style="background: rgba(255,255,255,0.2); padding: 3px 8px; 
-                                                        border-radius: 12px; font-size: 11px;">Step {step_number}/{total_steps}</span>
-                                        </div>
-                                    </div>
-                                    <div style="padding: 8px 0;">
-                                        {'<div style="background: #fff3cd; padding: 6px 8px; border-radius: 4px; margin-bottom: 8px; border-left: 3px solid #ffc107;"><p style="margin: 0; font-size: 10px; color: #856404;">' + location_note + '</p></div>' if is_same_location else ''}
-                                        <div style="background: #f8f9fa; padding: 8px 10px; border-radius: 6px; margin-bottom: 10px;">
-                                            <p style="margin: 3px 0; font-size: 12px;">
-                                                <b>From:</b> {node_info[node_from]["name"]} ({node_info[node_from].get('city', 'N/A') if node_from != 0 else 'Seattle'})
-                                            </p>
-                                            <p style="margin: 3px 0; font-size: 12px;">
-                                                <b>To:</b> {node_info[node_to]["name"]} ({node_info[node_to].get('city', 'N/A') if node_to != 0 else 'Seattle'})
-                                            </p>
-                                        </div>
-                                        
-                                        <div style="font-size: 11px; line-height: 1.7;">
-                                            <div style="border-left: 3px solid {color}; padding-left: 8px; margin-bottom: 8px;">
-                                                <b>This Segment:</b>
-                                            </div>
-                                            <table style="width: 100%; margin-bottom: 10px;">
-                                                <tr>
-                                                    <td>📦 Cargo Pickup:</td>
-                                                    <td style="text-align: right;"><b>{segment_cargo:.0f} kg</b></td>
-                                                </tr>
-                                                <tr>
-                                                    <td>📐 Loading Pickup:</td>
-                                                    <td style="text-align: right;"><b>{segment_loading:.1f} m³</b></td>
-                                                </tr>
-                                                <tr>
-                                                    <td>📏 Distance:</td>
-                                                    <td style="text-align: right;"><b>{distance_km:.1f} km</b></td>
-                                                </tr>
-                                                <tr>
-                                                    <td>⏱️ Duration:</td>
-                                                    <td style="text-align: right;"><b>{duration_hrs:.2f} hrs</b></td>
-                                                </tr>
-                                                {'<tr><td>💨 Avg Speed:</td><td style="text-align: right;"><b>' + f'{avg_speed:.0f}' + ' km/h</b></td></tr>' if not is_same_location else ''}
-                                            </table>
-                                            
-                                            <div style="border-left: 3px solid {color}; padding-left: 8px; margin-bottom: 8px;">
-                                                <b>Complete Route Summary:</b>
-                                            </div>
-                                            <table style="width: 100%; margin-bottom: 8px;">
-                                                <tr>
-                                                    <td>🎯 Total Stops:</td>
-                                                    <td style="text-align: right;"><b>{num_vendors} vendor{'s' if num_vendors != 1 else ''}</b></td>
-                                                </tr>
-                                                <tr>
-                                                    <td>🛣️ Total Distance:</td>
-                                                    <td style="text-align: right;"><b>{total_distance:.0f} km</b></td>
-                                                </tr>
-                                                <tr>
-                                                    <td>📦 Total Cargo:</td>
-                                                    <td style="text-align: right;"><b>{total_cargo:.0f} kg</b></td>
-                                                </tr>
-                                                <tr>
-                                                    <td>📐 Loading:</td>
-                                                    <td style="text-align: right;"><b>{total_loading:.1f} m³</b></td>
-                                                </tr>
-                                            </table>
-                                            
-                                            <div style="border-left: 3px solid {color}; padding-left: 8px; margin-bottom: 8px;">
-                                                <b>Vendors in Route:</b>
-                                            </div>
-                                            <ul style="margin: 0; padding-left: 15px; max-height: 150px; overflow-y: auto;">
-                                                {vendor_list_html}
-                                            </ul>
-                                            
-                                            <div style="background: #F8F7F4; padding: 8px 10px; border-radius: 8px; margin-top: 10px; border-left: 3px solid #5A7A65;">
-                                                <div style="font-size: 10px; color: #5A7A65; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">
-                                                    Capacity Utilization
-                                                </div>
-                                                <div style="font-size: 11px; color: #5C5B56; margin-top: 4px;">
-                                                    Weight: {cargo_utilization:.1f}% • Volume: {loading_utilization:.1f}%
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                                """
                                 # Draw route line (or marker for same location)
                                 if is_same_location:
                                     # For same location pickups, draw a small circular arrow indicator
@@ -1365,8 +1273,7 @@ class DeliveryOptimizer:
                                         fill=True,
                                         fillColor=color,
                                         fillOpacity=0.6,
-                                        popup=folium.Popup(popup_html, max_width=280),
-                                        tooltip=folium.Tooltip(tooltip_html, sticky=False, direction='auto')
+                                        popup=folium.Popup(popup_html, max_width=280)
                                     ).add_to(vehicle_group)
                                 else:
                                     # Normal route with polyline
@@ -1376,7 +1283,6 @@ class DeliveryOptimizer:
                                         weight=5,
                                         opacity=0.9,
                                         popup=folium.Popup(popup_html, max_width=280),
-                                        tooltip=folium.Tooltip(tooltip_html, sticky=False, direction='auto'),
                                         smooth_factor=2.0
                                     ).add_to(vehicle_group)
                             else:
