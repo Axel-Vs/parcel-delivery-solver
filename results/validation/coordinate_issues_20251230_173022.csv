@@ -1,0 +1,9 @@
+index,vendor_name,city,lat_raw,lon_raw,lat_parsed,lon_parsed,issues
+0, US Tech Innovators Inc.  ,,0.0,0.0,0.0,0.0,zero_zero_coordinate
+1, LaserCraft Industries     ,,0.0,0.0,0.0,0.0,zero_zero_coordinate
+2, Miami Shipping Co.        ,,0.0,0.0,0.0,0.0,zero_zero_coordinate
+3, Montreal Logistics Inc.   ,,0.0,0.0,0.0,0.0,zero_zero_coordinate
+4, Tijuana Express Freight   ,,0.0,0.0,0.0,0.0,zero_zero_coordinate
+5, Boston Harbor Logistics   ,,0.0,0.0,0.0,0.0,zero_zero_coordinate
+6, Empire State Shipping     ,,0.0,0.0,0.0,0.0,zero_zero_coordinate
+7, Halifax Maritime Freight  ,,0.0,0.0,0.0,0.0,zero_zero_coordinate

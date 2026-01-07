@@ -162,3 +162,20 @@ cython_debug/
 # macOS system files
 .DS_Store
 **/.DS_Store
+# Project-specific: Generated optimization results
+results/optimization/*.html
+results/runs/run_*/
+uploads/processed_*.csv
+uploads/vendors_*.csv
+uploads/temp_*.csv
+
+# Project-specific: Cache files
+cache/*.json
+
+# Project-specific: Flask logs
+/tmp/flask_app.log
+
+# Project-specific: Backup files (use git history instead)
+*.backup
+*_backup.*
+*_original_backup.*
