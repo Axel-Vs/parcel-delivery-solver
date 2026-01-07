@@ -1724,6 +1724,29 @@ class DeliveryOptimizer:
         '''
         m.get_root().html.add_child(folium.Element(excel_filter_html))
         
+        # Expose map and layer groups to window for external filter control
+        expose_layers_js = """
+        <script>
+            window.routeMap = map;
+            window.routeLayerGroups = {};
+            // Layer groups will be added as features are created by Folium
+            map.eachLayer(function(layer) {
+                if (layer._leaflet_id) {
+                    window.routeLayerGroups[layer.options.name || layer._leaflet_id] = layer;
+                }
+            });
+            
+            // Alternative: try to access layer control and extract from there
+            map.on('layeradd', function(e) {
+                var layer = e.layer;
+                if (layer.options && layer.options.name) {
+                    window.routeLayerGroups[layer.options.name] = layer;
+                }
+            });
+        </script>
+        """
+        m.get_root().html.add_child(folium.Element(expose_layers_js))
+        
         # Fit bounds to show all markers
         m.fit_bounds([[min(all_lats), min(all_lons)], [max(all_lats), max(all_lons)]])
         
