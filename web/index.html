@@ -1925,42 +1925,6 @@
             // Initialize filters
             initFilters(data.filter_metadata);
 
-            // Monitor map layer control for route visibility and add expand/collapse to base layers
-            mapFrame.onload = function() {
-                // Ensure map visibility reflects current filters once iframe is ready
-                try {
-                    if (typeof updateMapRouteVisibility === 'function' && activeRouteFilterSet) {
-                        updateMapRouteVisibility(activeRouteFilterSet);
-                    }
-                } catch (e) {}
-                let syncInitialized = false;
-                
-                function monitorCheckboxes() {
-                    // Route summary should not toggle when route layers are clicked; keep cards aligned to current filters only.
-                    const cards = document.querySelectorAll('[id^="route-card-"]');
-                    if (cards) {
-                        // If we have an active filter set, honor it; otherwise show all cards.
-                        const routesToShow = (activeRouteFilterSet && activeRouteFilterSet.size > 0)
-                            ? new Set(Array.from(activeRouteFilterSet).map(r => parseInt(r)))
-                            : null;
-                        updateRouteCardVisibility(routesToShow);
-                    }
-                    if (!syncInitialized) {
-                        syncInitialized = true;
-                    }
-                }
-                
-                let pollCount = 0;
-                const pollInterval = setInterval(() => {
-                    monitorCheckboxes();
-                    pollCount++;
-                    
-                    if (syncInitialized || pollCount > 50) {
-                        clearInterval(pollInterval);
-                    }
-                }, 200);
-            };
-
             // Route Summary
             const routeSummary = document.getElementById('routeSummary');
             routeSummary.innerHTML = `
