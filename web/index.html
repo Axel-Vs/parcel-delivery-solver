@@ -525,12 +525,118 @@
             border-radius: 10px;
             transition: all 0.3s ease;
             box-shadow: var(--shadow-soft);
+            cursor: pointer;
         }
 
         .route-card:hover {
             border-color: #000000;
             box-shadow: var(--shadow-medium);
             transform: translateY(-1px);
+        }
+
+        .route-segments {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid #eee;
+            display: none;
+        }
+
+        .route-segments.visible {
+            display: block;
+        }
+
+        .route-detail-popup {
+            position: fixed;
+            right: 10mm;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 320px;
+            max-height: 80vh;
+            overflow-y: auto;
+            background: white;
+            border: 2px solid #000;
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            padding: 20px;
+            z-index: 10000;
+            display: none;
+            font-family: 'Segoe UI', Arial, sans-serif;
+        }
+
+        .route-detail-popup.visible {
+            display: block;
+            animation: slideInRight 0.3s ease-out;
+        }
+
+        @keyframes slideInRight {
+            from {
+                transform: translateY(-50%) translateX(100px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(-50%) translateX(0);
+                opacity: 1;
+            }
+        }
+
+        .route-detail-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 2px solid #000;
+        }
+
+        .route-detail-title {
+            font-size: 18px;
+            font-weight: 700;
+            color: #000;
+        }
+
+        .route-detail-close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0;
+            width: 30px;
+            height: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            transition: background 0.2s;
+        }
+
+        .route-detail-close:hover {
+            background: #f0f0f0;
+        }
+
+        .route-detail-segment {
+            margin-bottom: 12px;
+            padding: 12px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #000;
+        }
+
+        .route-detail-segment-title {
+            font-weight: 600;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+
+        .route-detail-segment-info {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+            font-size: 12px;
+            color: #666;
+        }
+
+        .route-detail-segment-info .full-width {
+            grid-column: 1 / -1;
         }
 
         .route-header {
@@ -1854,6 +1960,9 @@
             // Store current solution
             currentSolutionData = data;
             
+            // Store optimization data globally for route detail popup
+            window.currentOptimizationData = data;
+            
             // Save initial state to history
             operationHistory = [JSON.parse(JSON.stringify(data))];
             historyIndex = 0;
@@ -1928,10 +2037,10 @@
             // Route Summary
             const routeSummary = document.getElementById('routeSummary');
             routeSummary.innerHTML = `
-                <div class="section-title">ROUTE BREAKDOWN</div>
+                <div class="section-title">ROUTE BREAKDOWN <span style="font-size: 11px; font-weight: 400; color: #666;">(Click card for details)</span></div>
                 <div class="route-grid">
                     ${data.routes.map(route => `
-                        <div id="route-card-${route.route_id}" class="route-card">
+                        <div id="route-card-${route.route_id}" class="route-card" onclick="toggleRouteSegments(${route.route_id})">
                             <div class="route-header">
                                 <div class="route-id">ROUTE ${route.route_id}</div>
                                 <div class="route-badge">${route.num_vendors} VENDORS</div>
@@ -1950,23 +2059,6 @@
                                     <span class="metric-value">${route.loading.toLocaleString()} m</span>
                                 </div>
                             </div>
-                            ${route.segments && route.segments.length > 0 ? `
-                                <div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid #eee;">
-                                    <div style="font-weight: 600; font-size: 11px; color: #666; margin-bottom: 8px;">ROUTE SEGMENTS</div>
-                                    ${route.segments.map((seg, idx) => `
-                                        <div style="margin-bottom: 8px; padding: 8px; background: #f8f9fa; border-radius: 4px; font-size: 12px;">
-                                            <div style="font-weight: 500; margin-bottom: 4px;">
-                                                🚚 ${seg.from} → ${seg.to}
-                                            </div>
-                                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; font-size: 11px; color: #666;">
-                                                <div>📏 ${seg.distance.toFixed(1)} km</div>
-                                                <div>⏱️ ${seg.duration.toFixed(2)} hrs</div>
-                                                <div style="grid-column: 1 / -1;">💨 ${seg.avg_speed.toFixed(0)} km/h</div>
-                                            </div>
-                                        </div>
-                                    `).join('')}
-                                </div>
-                            ` : ''}
                         </div>
                     `).join('')}
                 </div>
@@ -2131,6 +2223,65 @@
             });
         }
         
+        function toggleRouteSegments(routeId) {
+            // Find the route data
+            const route = window.currentOptimizationData?.routes?.find(r => r.route_id === routeId);
+            if (!route || !route.segments || route.segments.length === 0) return;
+
+            // Check if popup already exists
+            let popup = document.getElementById('routeDetailPopup');
+            
+            // If popup exists and shows same route, close it
+            if (popup && popup.dataset.routeId === String(routeId)) {
+                popup.classList.remove('visible');
+                setTimeout(() => popup.remove(), 300);
+                return;
+            }
+
+            // Remove existing popup if any
+            if (popup) {
+                popup.remove();
+            }
+
+            // Create new popup
+            popup = document.createElement('div');
+            popup.id = 'routeDetailPopup';
+            popup.className = 'route-detail-popup visible';
+            popup.dataset.routeId = routeId;
+
+            popup.innerHTML = `
+                <div class="route-detail-header">
+                    <div class="route-detail-title">🚚 Route ${routeId}</div>
+                    <button class="route-detail-close" onclick="closeRouteDetail()">✕</button>
+                </div>
+                <div style="margin-bottom: 16px;">
+                    <div style="font-weight: 600; font-size: 13px; color: #666; margin-bottom: 8px;">ROUTE SEGMENTS</div>
+                    ${route.segments.map((seg, idx) => `
+                        <div class="route-detail-segment">
+                            <div class="route-detail-segment-title">
+                                ${seg.from} → ${seg.to}
+                            </div>
+                            <div class="route-detail-segment-info">
+                                <div>📏 Distance: ${seg.distance.toFixed(1)} km</div>
+                                <div>⏱️ Duration: ${seg.duration.toFixed(2)} hrs</div>
+                                <div class="full-width">💨 Avg Speed: ${seg.avg_speed.toFixed(0)} km/h</div>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+
+            document.body.appendChild(popup);
+        }
+
+        function closeRouteDetail() {
+            const popup = document.getElementById('routeDetailPopup');
+            if (popup) {
+                popup.classList.remove('visible');
+                setTimeout(() => popup.remove(), 300);
+            }
+        }
+
         function updateMapRouteVisibility(routesToShow) {
             const mapFrame = document.getElementById('mapFrame');
             if (!mapFrame || !mapFrame.contentWindow) return;
