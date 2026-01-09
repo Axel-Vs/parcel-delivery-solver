@@ -1030,12 +1030,6 @@ class DeliveryOptimizer:
         # Fit map to show all points with extra padding for better overview
         m.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]], padding=[100, 100])
         
-        # Add different tile layers with aesthetic options (first one is default)
-        folium.TileLayer('OpenStreetMap', name='🗺️ Street Map', attr='OpenStreetMap').add_to(m)
-        folium.TileLayer('cartodbpositron', name='✨ Light Theme', attr='CartoDB', show=False).add_to(m)
-        folium.TileLayer('cartodbdark_matter', name='🌙 Dark Theme', attr='CartoDB', show=False).add_to(m)
-        folium.TileLayer('Stamen Terrain', name='🏔️ Terrain', attr='Stamen', show=False).add_to(m)
-        
         # Define aesthetic colors for each vehicle (modern, slightly darker palette)
         colors = ['#C0392B', '#2980B9', '#27AE60', '#8E44AD', '#D68910', '#16A085', '#CA6F1E', '#2C3E50']
         
@@ -1510,9 +1504,6 @@ class DeliveryOptimizer:
                     weight=2,
                     opacity=0.6
                 ).add_to(m)
-        
-        # Add layer control with modern styling
-        folium.LayerControl(collapsed=False, position='topright').add_to(m)
         
         # Add fullscreen button
         plugins.Fullscreen(position='topleft', title='Fullscreen', titleCancel='Exit Fullscreen').add_to(m)
