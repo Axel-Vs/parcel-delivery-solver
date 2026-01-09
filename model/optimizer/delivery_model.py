@@ -1280,16 +1280,8 @@ class DeliveryOptimizer:
                                 
                                 # Draw route line (or marker for same location)
                                 if is_same_location:
-                                    # For same location pickups, draw a small circular arrow indicator
-                                    folium.CircleMarker(
-                                        location=(lat_from, lon_from),
-                                        radius=8,
-                                        color=color,
-                                        fill=True,
-                                        fillColor=color,
-                                        fillOpacity=0.6,
-                                        popup=folium.Popup(popup_html, max_width=280)
-                                    ).add_to(vehicle_group)
+                                    # Same-location pickups: skip drawing vendor circles to avoid clutter
+                                    pass
                                 else:
                                     # Normal route with polyline
                                     folium.PolyLine(
