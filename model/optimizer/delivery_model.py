@@ -1486,10 +1486,12 @@ class DeliveryOptimizer:
                     popup=folium.Popup(popup_html, max_width=320),
                     tooltip=folium.Tooltip(f"<b style='font-size: 13px;'>📦 {info['name']}</b><br><span style='font-size: 11px;'>{info['city']}</span>", direction='auto'),
                     icon=folium.Icon(
-                        color=vendor_color,
+                        color='white',
                         icon='cube',
                         prefix='fa',
-                        icon_color='white'
+                        icon_color=vendor_color_hex,
+                        border_color=vendor_color_hex,
+                        border_width=2
                     )
                 ).add_to(m)
                 
