@@ -1764,16 +1764,31 @@ class DeliveryOptimizer:
         map_var = m.get_name()
         layer_map_lines = []
         for route_num, fg in route_feature_groups.items():
-            layer_map_lines.append(f"window.routeLayerGroups[{route_num}] = {fg.get_name()};")
+            layer_map_lines.append(f"            window.routeLayerGroups[{route_num}] = {fg.get_name()};")
 
         layer_map_js = "\n".join(layer_map_lines)
 
         expose_layers_js = f"""
         <script>
-            // Directly expose Folium map and route layers without relying on option names
-            window.routeMap = {map_var};
-            window.routeLayerGroups = {{}};
-            {layer_map_js}
+            // Directly expose Folium map and route layers - wait for map to be defined
+            function initRouteLayerExposure() {{
+                if (typeof {map_var} === 'undefined') {{
+                    setTimeout(initRouteLayerExposure, 100);
+                    return;
+                }}
+                
+                window.routeMap = {map_var};
+                window.routeLayerGroups = {{}};
+{layer_map_js}
+                
+                console.log('✓ Exposed', Object.keys(window.routeLayerGroups).length, 'route layers to window');
+            }}
+            
+            if (document.readyState === 'loading') {{
+                document.addEventListener('DOMContentLoaded', initRouteLayerExposure);
+            }} else {{
+                initRouteLayerExposure();
+            }}
         </script>
         """
         m.get_root().html.add_child(folium.Element(expose_layers_js))
