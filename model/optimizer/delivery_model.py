@@ -1388,9 +1388,7 @@ class DeliveryOptimizer:
                     location=[lat, lon],
                     radius=15,
                     color='#922B21',
-                    fill=True,
-                    fillColor='#E74C3C',
-                    fillOpacity=0.9,
+                    fill=False,
                     weight=3,
                     opacity=1.0,
                 ).add_to(m)
