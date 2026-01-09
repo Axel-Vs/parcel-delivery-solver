@@ -546,10 +546,12 @@
         }
 
         .route-detail-popup {
-            position: fixed;
-            right: 10mm;
-            top: 50%;
-            transform: translateY(-50%);
+            position: fixed !important;
+            right: 10mm !important;
+            top: 50% !important;
+            transform: translateY(-50%) !important;
+            left: auto !important;
+            bottom: auto !important;
             width: 320px;
             max-height: 80vh;
             overflow-y: auto;
@@ -570,11 +572,11 @@
 
         @keyframes slideInRight {
             from {
-                transform: translateY(-50%) translateX(100px);
+                transform: translateY(-50%) translateX(100px) !important;
                 opacity: 0;
             }
             to {
-                transform: translateY(-50%) translateX(0);
+                transform: translateY(-50%) translateX(0) !important;
                 opacity: 1;
             }
         }
@@ -2243,11 +2245,17 @@
                 popup.remove();
             }
 
-            // Create new popup
+            // Create new popup - ALWAYS append to body to ensure fixed positioning
             popup = document.createElement('div');
             popup.id = 'routeDetailPopup';
             popup.className = 'route-detail-popup visible';
             popup.dataset.routeId = routeId;
+            
+            // Clear any inline styles that might interfere
+            popup.style.position = 'fixed';
+            popup.style.right = '10mm';
+            popup.style.top = '50%';
+            popup.style.transform = 'translateY(-50%)';
 
             popup.innerHTML = `
                 <div class="route-detail-header">
@@ -2271,7 +2279,11 @@
                 </div>
             `;
 
+            // Always append directly to body, not any container
             document.body.appendChild(popup);
+            
+            // Force reflow to ensure positioning is applied
+            popup.offsetHeight;
         }
 
         function closeRouteDetail() {
