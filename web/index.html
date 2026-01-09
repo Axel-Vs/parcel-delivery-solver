@@ -1938,7 +1938,7 @@
                             </div>
                             <div class="route-metrics">
                                 <div class="metric-row">
-                                    <span class="metric-label">DISTANCE</span>
+                                    <span class="metric-label">TOTAL DISTANCE</span>
                                     <span class="metric-value">${route.distance.toLocaleString()} km</span>
                                 </div>
                                 <div class="metric-row">
@@ -1950,6 +1950,23 @@
                                     <span class="metric-value">${route.loading.toLocaleString()} m</span>
                                 </div>
                             </div>
+                            ${route.segments && route.segments.length > 0 ? `
+                                <div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid #eee;">
+                                    <div style="font-weight: 600; font-size: 11px; color: #666; margin-bottom: 8px;">ROUTE SEGMENTS</div>
+                                    ${route.segments.map((seg, idx) => `
+                                        <div style="margin-bottom: 8px; padding: 8px; background: #f8f9fa; border-radius: 4px; font-size: 12px;">
+                                            <div style="font-weight: 500; margin-bottom: 4px;">
+                                                🚚 ${seg.from} → ${seg.to}
+                                            </div>
+                                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; font-size: 11px; color: #666;">
+                                                <div>📏 ${seg.distance.toFixed(1)} km</div>
+                                                <div>⏱️ ${seg.duration.toFixed(2)} hrs</div>
+                                                <div style="grid-column: 1 / -1;">💨 ${seg.avg_speed.toFixed(0)} km/h</div>
+                                            </div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            ` : ''}
                         </div>
                     `).join('')}
                 </div>

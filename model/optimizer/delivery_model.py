@@ -1101,6 +1101,7 @@ class DeliveryOptimizer:
                 total_loading = 0
                 total_distance = 0
                 vendors_visited = []
+                segments = []  # Store segment details for route card display
                 
                 for i in range(len(route_path) - 1):
                     node_from = route_path[i]
@@ -1112,16 +1113,36 @@ class DeliveryOptimizer:
                         total_loading += self.loading_matrix[node_from]
                         vendors_visited.append(node_from)
                     
-                    # Add distance
+                    # Add distance and duration for this segment
                     if node_from in range(len(self.distance_matrix)) and node_to in range(len(self.distance_matrix)):
-                        total_distance += self.distance_matrix[node_from][node_to]
+                        seg_distance = self.distance_matrix[node_from][node_to]
+                        total_distance += seg_distance
+                        
+                        # Get duration from time matrix (convert seconds to hours)
+                        seg_duration = 0
+                        if hasattr(self, 'time_distance_matrix') and self.time_distance_matrix is not None:
+                            if node_from < len(self.time_distance_matrix) and node_to < len(self.time_distance_matrix[node_from]):
+                                seg_duration = self.time_distance_matrix[node_from][node_to] / 3600.0  # seconds to hours
+                        
+                        # Calculate average speed
+                        avg_speed = seg_distance / seg_duration if seg_duration > 0 else 0
+                        
+                        # Store segment details
+                        segments.append({
+                            'from_id': node_from,
+                            'to_id': node_to,
+                            'distance': seg_distance,
+                            'duration': seg_duration,
+                            'avg_speed': avg_speed
+                        })
                 
                 route_stats[k] = {
                     'total_cargo': total_cargo,
                     'total_loading': total_loading,
                     'total_distance': total_distance,
                     'num_vendors': len(set(vendors_visited)),
-                    'vendors': vendors_visited
+                    'vendors': vendors_visited,
+                    'segments': segments  # Add segment details
                 }
         
         print('🗺️  Generating route visualization with actual road routing...')

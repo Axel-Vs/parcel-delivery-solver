@@ -552,21 +552,51 @@ def optimize_routes():
         print(f"Total volume (included vendors only): {total_volume:.1f} m³")
         print(f"[DEBUG] Stats being sent - total_cargo value: {float(round(total_cargo_tons, 3))}")
         
+        # Build vendor name map first (needed for route summaries)
+        vendor_name_map = {}
+        vendor_date_map = {}
+        for idx, row in vendors_df.iterrows():
+            vendor_id = int(idx + 1)
+            vendor_name_map[vendor_id] = str(row.get('vendor Name', row.get('Vendor Name', f'Vendor {vendor_id}')))
+            
+            raw_date = row.get('Requested Delivery', row.get('Requested Delivery Date', ''))
+            parsed_date = pd.to_datetime(raw_date, errors='coerce')
+            if pd.notna(parsed_date):
+                vendor_date_map[vendor_id] = parsed_date.strftime('%Y-%m-%d')
+        
         # Create detailed route summaries from statistics
         route_summaries = []
         for vehicle_id in sorted(route_stats.keys()):
             stats = route_stats[vehicle_id]
+            
+            # Add vendor names to segments
+            segments_with_names = []
+            for seg in stats.get('segments', []):
+                from_id = seg['from_id']
+                to_id = seg['to_id']
+                
+                # Get vendor names (0 = Depot)
+                from_name = 'Depot' if from_id == 0 else vendor_name_map.get(from_id, f'Vendor {from_id}')
+                to_name = 'Depot' if to_id == 0 else vendor_name_map.get(to_id, f'Vendor {to_id}')
+                
+                segments_with_names.append({
+                    'from': from_name,
+                    'to': to_name,
+                    'distance': float(round(seg['distance'], 1)),
+                    'duration': float(round(seg['duration'], 2)),
+                    'avg_speed': float(round(seg['avg_speed'], 0))
+                })
+            
             route_summaries.append({
                 'route_id': int(vehicle_id + 1),
                 'num_vendors': int(stats['num_vendors']),
                 'distance': float(round(stats['total_distance'], 1)),
                 'cargo': float(round(stats['total_cargo'] / 1000.0, 3)),  # tons
-                'loading': float(round(stats['total_loading'], 2))
+                'loading': float(round(stats['total_loading'], 2)),
+                'segments': segments_with_names  # Add segment details with names
             })
 
         # Build filter metadata (vendor names, delivery dates, route-vendor mappings, week options)
-        vendor_name_map = {}
-        vendor_date_map = {}
         vendor_routes_map = {}
         route_vendors_map = {}
         week_options = []
