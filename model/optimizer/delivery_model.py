@@ -1761,58 +1761,19 @@ class DeliveryOptimizer:
             # Store the feature group with the route number as key
             route_groups_json[str(route_num)] = f"window.routeLayerGroups[{route_num}]"
         
-        expose_layers_js = r"""
+        map_var = m.get_name()
+        layer_map_lines = []
+        for route_num, fg in route_feature_groups.items():
+            layer_map_lines.append(f"window.routeLayerGroups[{route_num}] = {fg.get_name()};")
+
+        layer_map_js = "\n".join(layer_map_lines)
+
+        expose_layers_js = f"""
         <script>
-            // Locate the Folium-created Leaflet map safely (variable name is dynamic like map_xxx)
-            function findFoliumMap() {
-                for (var key in window) {
-                    if (key.startsWith('map_')) {
-                        var candidate = window[key];
-                        if (candidate && typeof candidate.eachLayer === 'function') {
-                            return candidate;
-                        }
-                    }
-                }
-                return null;
-            }
-
-            function initRouteLayerExposure() {
-                var mapObj = findFoliumMap();
-                if (!mapObj) {
-                    setTimeout(initRouteLayerExposure, 150);
-                    return;
-                }
-
-                window.routeMap = mapObj;
-                window.routeLayerGroups = {};
-
-                var populateLayers = function() {
-                    var found = 0;
-                    mapObj.eachLayer(function(layer) {
-                        if (layer.options && layer.options.name) {
-                            var match = layer.options.name.match(/Route (\d+)/);
-                            if (match) {
-                                var routeNum = parseInt(match[1]);
-                                window.routeLayerGroups[routeNum] = layer;
-                                found++;
-                            }
-                        }
-                    });
-
-                    if (found === 0) {
-                        setTimeout(populateLayers, 150);
-                    }
-                };
-
-                setTimeout(populateLayers, 200);
-            }
-
-            // Kick off after DOM ready
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', initRouteLayerExposure);
-            } else {
-                initRouteLayerExposure();
-            }
+            // Directly expose Folium map and route layers without relying on option names
+            window.routeMap = {map_var};
+            window.routeLayerGroups = {{}};
+            {layer_map_js}
         </script>
         """
         m.get_root().html.add_child(folium.Element(expose_layers_js))
