@@ -2294,26 +2294,44 @@
             }
         }
 
+        function findIframeMap(mapWin) {
+            // Look for Folium map variables (map_xxx) in the iframe
+            for (const key in mapWin) {
+                if (key.startsWith('map_')) {
+                    const candidate = mapWin[key];
+                    if (candidate && typeof candidate.eachLayer === 'function') {
+                        return candidate;
+                    }
+                }
+            }
+            return null;
+        }
+
         function updateMapRouteVisibility(routesToShow, attempt = 0) {
             const mapFrame = document.getElementById('mapFrame');
             if (!mapFrame || !mapFrame.contentWindow) return;
 
             try {
                 const mapWin = mapFrame.contentWindow;
-                const map = mapWin.routeMap;
+                let map = mapWin.routeMap || findIframeMap(mapWin);
                 const layerGroups = mapWin.routeLayerGroups;
                 
                 if (!map) {
                     console.warn('Map not ready yet');
-                    if (attempt < 20) {
+                    if (attempt < 40) {
                         setTimeout(() => updateMapRouteVisibility(routesToShow, attempt + 1), 200);
                     }
                     return;
                 }
 
+                // Cache back if we discovered it
+                if (!mapWin.routeMap) {
+                    mapWin.routeMap = map;
+                }
+
                 // Wait a bit if layer groups aren't ready yet
                 if (!layerGroups || Object.keys(layerGroups).length === 0) {
-                    if (attempt < 20) {
+                    if (attempt < 40) {
                         setTimeout(() => updateMapRouteVisibility(routesToShow, attempt + 1), 200);
                     }
                     return;
@@ -2340,6 +2358,16 @@
                 console.warn('Cannot access map iframe:', e);
             }
         }
+
+        // Kick off visibility sync after iframe loads
+        document.addEventListener('DOMContentLoaded', () => {
+            const mapFrame = document.getElementById('mapFrame');
+            if (mapFrame) {
+                mapFrame.addEventListener('load', () => {
+                    setTimeout(() => updateMapRouteVisibility(activeRouteFilterSet || new Set()), 300);
+                });
+            }
+        });
 
         // Dynamically constrain filter options based on current selection
         function updateLinkedFilterOptions(metadata, routesToShow, selectionCtx) {
