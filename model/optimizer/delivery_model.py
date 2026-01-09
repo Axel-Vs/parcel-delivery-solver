@@ -1501,16 +1501,14 @@ class DeliveryOptimizer:
                     )
                 ).add_to(m)
                 
-                # Add small circle around vendor
+                # Add small circle around vendor (unfilled)
                 folium.CircleMarker(
                     location=[lat, lon],
                     radius=12,
                     color=vendor_color_hex,
-                    fill=True,
-                    fillColor=vendor_color_hex,
-                    fillOpacity=0.15,
+                    fill=False,
                     weight=2,
-                    opacity=0.4
+                    opacity=0.6
                 ).add_to(m)
         
         # Add layer control with modern styling
