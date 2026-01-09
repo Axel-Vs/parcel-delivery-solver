@@ -1481,18 +1481,34 @@ class DeliveryOptimizer:
                 vendor_colors = ['blue', 'green', 'purple', 'orange', 'cadetblue', 'darkgreen']
                 vendor_color = vendor_colors[(node_id - 1) % len(vendor_colors)]
                 
+                # Custom div icon with transparent background and colored border
+                vendor_icon_html = f"""
+                <div style="
+                    width: 32px;
+                    height: 41px;
+                    background: transparent;
+                    border: 2px solid {vendor_color_hex};
+                    border-radius: 50% 50% 50% 0;
+                    transform: rotate(-45deg);
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    position: relative;
+                    box-sizing: border-box;
+                ">
+                    <div style="
+                        transform: rotate(45deg);
+                        font-size: 18px;
+                        color: {vendor_color_hex};
+                    ">📦</div>
+                </div>
+                """
+                
                 folium.Marker(
                     location=[lat, lon],
                     popup=folium.Popup(popup_html, max_width=320),
                     tooltip=folium.Tooltip(f"<b style='font-size: 13px;'>📦 {info['name']}</b><br><span style='font-size: 11px;'>{info['city']}</span>", direction='auto'),
-                    icon=folium.Icon(
-                        color='white',
-                        icon='cube',
-                        prefix='fa',
-                        icon_color=vendor_color_hex,
-                        border_color=vendor_color_hex,
-                        border_width=2
-                    )
+                    icon=folium.DivIcon(html=vendor_icon_html)
                 ).add_to(m)
                 
         
