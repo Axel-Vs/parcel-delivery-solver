@@ -1357,41 +1357,35 @@ class DeliveryOptimizer:
                 </div>
                 """
                 # Concentric red circles for depot (no pin marker)
-                # Outer circle
+                # Outer circle (unfilled)
                 folium.Circle(
                     location=[lat, lon],
                     radius=15000,
                     color='#E74C3C',
-                    fill=True,
-                    fillColor='#E74C3C',
-                    fillOpacity=0.12,
+                    fill=False,
                     weight=3,
-                    opacity=0.6,
+                    opacity=0.8,
                     popup=folium.Popup(popup_html, max_width=300),
                     tooltip=folium.Tooltip('<b style="font-size: 14px;">🏭 Distribution Center</b>', direction='auto')
                 ).add_to(m)
                 
-                # Middle circle
+                # Middle circle (unfilled)
                 folium.Circle(
                     location=[lat, lon],
                     radius=8000,
                     color='#C0392B',
-                    fill=True,
-                    fillColor='#C0392B',
-                    fillOpacity=0.2,
-                    weight=2,
-                    opacity=0.7,
+                    fill=False,
+                    weight=3,
+                    opacity=0.9,
                 ).add_to(m)
                 
-                # Inner circle (center point)
+                # Inner circle (unfilled)
                 folium.CircleMarker(
                     location=[lat, lon],
                     radius=15,
                     color='#922B21',
-                    fill=True,
-                    fillColor='#E74C3C',
-                    fillOpacity=0.9,
-                    weight=3,
+                    fill=False,
+                    weight=4,
                     opacity=1.0,
                 ).add_to(m)
                 
