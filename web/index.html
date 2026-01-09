@@ -2294,7 +2294,7 @@
             }
         }
 
-        function updateMapRouteVisibility(routesToShow) {
+        function updateMapRouteVisibility(routesToShow, attempt = 0) {
             const mapFrame = document.getElementById('mapFrame');
             if (!mapFrame || !mapFrame.contentWindow) return;
 
@@ -2305,12 +2305,17 @@
                 
                 if (!map) {
                     console.warn('Map not ready yet');
+                    if (attempt < 20) {
+                        setTimeout(() => updateMapRouteVisibility(routesToShow, attempt + 1), 200);
+                    }
                     return;
                 }
 
                 // Wait a bit if layer groups aren't ready yet
                 if (!layerGroups || Object.keys(layerGroups).length === 0) {
-                    setTimeout(() => updateMapRouteVisibility(routesToShow), 200);
+                    if (attempt < 20) {
+                        setTimeout(() => updateMapRouteVisibility(routesToShow, attempt + 1), 200);
+                    }
                     return;
                 }
 
