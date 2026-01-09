@@ -2317,9 +2317,11 @@
                 const layerGroups = mapWin.routeLayerGroups;
                 
                 if (!map) {
-                    console.warn('Map not ready yet');
-                    if (attempt < 40) {
-                        setTimeout(() => updateMapRouteVisibility(routesToShow, attempt + 1), 200);
+                    if (attempt === 0 || attempt % 10 === 0) {
+                        console.warn('Map not ready yet');
+                    }
+                    if (attempt < 100) {
+                        setTimeout(() => updateMapRouteVisibility(routesToShow, attempt + 1), 300);
                     }
                     return;
                 }
@@ -2331,8 +2333,11 @@
 
                 // Wait a bit if layer groups aren't ready yet
                 if (!layerGroups || Object.keys(layerGroups).length === 0) {
-                    if (attempt < 40) {
-                        setTimeout(() => updateMapRouteVisibility(routesToShow, attempt + 1), 200);
+                    if (attempt === 0 || attempt % 10 === 0) {
+                        console.warn('Route layers not ready yet');
+                    }
+                    if (attempt < 100) {
+                        setTimeout(() => updateMapRouteVisibility(routesToShow, attempt + 1), 300);
                     }
                     return;
                 }
@@ -2364,7 +2369,7 @@
             const mapFrame = document.getElementById('mapFrame');
             if (mapFrame) {
                 mapFrame.addEventListener('load', () => {
-                    setTimeout(() => updateMapRouteVisibility(activeRouteFilterSet || new Set()), 300);
+                    setTimeout(() => updateMapRouteVisibility(activeRouteFilterSet || new Set()), 800);
                 });
             }
         });
