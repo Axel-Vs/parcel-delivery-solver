@@ -1763,32 +1763,56 @@ class DeliveryOptimizer:
         
         expose_layers_js = r"""
         <script>
-            window.routeMap = map;
-            window.routeLayerGroups = {};
-            
-            // Wait for all layers to be added to the map
-            var populateLayers = function() {
-                var found = 0;
-                map.eachLayer(function(layer) {
-                    if (layer.options && layer.options.name) {
-                        // Extract route number from name like "🚚 Route 3"
-                        var match = layer.options.name.match(/Route (\d+)/);
-                        if (match) {
-                            var routeNum = parseInt(match[1]);
-                            window.routeLayerGroups[routeNum] = layer;
-                            found++;
+            // Locate the Folium-created Leaflet map safely (variable name is dynamic like map_xxx)
+            function findFoliumMap() {
+                for (var key in window) {
+                    if (key.startsWith('map_')) {
+                        var candidate = window[key];
+                        if (candidate && typeof candidate.eachLayer === 'function') {
+                            return candidate;
                         }
                     }
-                });
-                
-                // If we didn't find all expected routes yet, try again
-                if (found === 0) {
-                    setTimeout(populateLayers, 100);
                 }
-            };
-            
-            // Delay slightly to ensure all layers are added
-            setTimeout(populateLayers, 200);
+                return null;
+            }
+
+            function initRouteLayerExposure() {
+                var mapObj = findFoliumMap();
+                if (!mapObj) {
+                    setTimeout(initRouteLayerExposure, 150);
+                    return;
+                }
+
+                window.routeMap = mapObj;
+                window.routeLayerGroups = {};
+
+                var populateLayers = function() {
+                    var found = 0;
+                    mapObj.eachLayer(function(layer) {
+                        if (layer.options && layer.options.name) {
+                            var match = layer.options.name.match(/Route (\d+)/);
+                            if (match) {
+                                var routeNum = parseInt(match[1]);
+                                window.routeLayerGroups[routeNum] = layer;
+                                found++;
+                            }
+                        }
+                    });
+
+                    if (found === 0) {
+                        setTimeout(populateLayers, 150);
+                    }
+                };
+
+                setTimeout(populateLayers, 200);
+            }
+
+            // Kick off after DOM ready
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', initRouteLayerExposure);
+            } else {
+                initRouteLayerExposure();
+            }
         </script>
         """
         m.get_root().html.add_child(folium.Element(expose_layers_js))
