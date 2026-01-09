@@ -1356,29 +1356,55 @@ class DeliveryOptimizer:
                     </div>
                 </div>
                 """
-                folium.Marker(
-                    location=[lat, lon],
-                    popup=folium.Popup(popup_html, max_width=300),
-                    tooltip=folium.Tooltip('<b style="font-size: 14px;">🏭 Distribution Center</b>', direction='auto'),
-                    icon=folium.Icon(
-                        color='red', 
-                        icon='warehouse',
-                        prefix='fa',
-                        icon_color='white'
-                    )
-                ).add_to(m)
-                
-                # Add an elegant pulse circle around depot
+                # Concentric red circles for depot (no pin marker)
+                # Outer circle
                 folium.Circle(
                     location=[lat, lon],
                     radius=15000,
                     color='#E74C3C',
                     fill=True,
                     fillColor='#E74C3C',
-                    fillOpacity=0.08,
+                    fillOpacity=0.12,
+                    weight=3,
+                    opacity=0.6,
+                    popup=folium.Popup(popup_html, max_width=300),
+                    tooltip=folium.Tooltip('<b style="font-size: 14px;">🏭 Distribution Center</b>', direction='auto')
+                ).add_to(m)
+                
+                # Middle circle
+                folium.Circle(
+                    location=[lat, lon],
+                    radius=8000,
+                    color='#C0392B',
+                    fill=True,
+                    fillColor='#C0392B',
+                    fillOpacity=0.2,
                     weight=2,
-                    opacity=0.4,
-                    popup='Distribution Center Service Area (15km radius)'
+                    opacity=0.7,
+                ).add_to(m)
+                
+                # Inner circle (center point)
+                folium.CircleMarker(
+                    location=[lat, lon],
+                    radius=15,
+                    color='#922B21',
+                    fill=True,
+                    fillColor='#E74C3C',
+                    fillOpacity=0.9,
+                    weight=3,
+                    opacity=1.0,
+                ).add_to(m)
+                
+                # Inner circle (center point)
+                folium.CircleMarker(
+                    location=[lat, lon],
+                    radius=15,
+                    color='#922B21',
+                    fill=True,
+                    fillColor='#E74C3C',
+                    fillOpacity=0.9,
+                    weight=3,
+                    opacity=1.0,
                 ).add_to(m)
                 
             else:
@@ -1472,10 +1498,10 @@ class DeliveryOptimizer:
                 folium.Marker(
                     location=[lat, lon],
                     popup=folium.Popup(popup_html, max_width=320),
-                    tooltip=folium.Tooltip(f"<b style='font-size: 13px;'>🏭 {info['name']}</b><br><span style='font-size: 11px;'>{info['city']}</span>", direction='auto'),
+                    tooltip=folium.Tooltip(f"<b style='font-size: 13px;'>📦 {info['name']}</b><br><span style='font-size: 11px;'>{info['city']}</span>", direction='auto'),
                     icon=folium.Icon(
                         color=vendor_color,
-                        icon='industry',
+                        icon='cube',
                         prefix='fa',
                         icon_color='white'
                     )
