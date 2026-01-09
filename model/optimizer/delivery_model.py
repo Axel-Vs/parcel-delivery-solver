@@ -1493,15 +1493,6 @@ class DeliveryOptimizer:
                     )
                 ).add_to(m)
                 
-                # Add small circle around vendor (unfilled)
-                folium.CircleMarker(
-                    location=[lat, lon],
-                    radius=12,
-                    color=vendor_color_hex,
-                    fill=False,
-                    weight=2,
-                    opacity=0.6
-                ).add_to(m)
         
         # Add fullscreen button
         plugins.Fullscreen(position='topleft', title='Fullscreen', titleCancel='Exit Fullscreen').add_to(m)
