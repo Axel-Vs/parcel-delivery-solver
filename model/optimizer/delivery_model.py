@@ -1019,7 +1019,7 @@ class DeliveryOptimizer:
         # Create folium map with automatic centering
         m = folium.Map(
             location=[center_lat, center_lon],
-            tiles=None,
+            tiles='OpenStreetMap',
             control_scale=True,
             zoom_control=True,
             scrollWheelZoom=True,
