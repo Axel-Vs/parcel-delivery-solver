@@ -35,10 +35,12 @@ An elegant, enterprise-grade AI-powered route optimization platform for vehicle 
 
 ### 🗺️ Interactive Visualization
 - **Beautiful Map Interface** - Folium-based maps with real road routing via OSRM
-- **Multiple Tile Layers** - Street, Light, Dark, and Terrain views with layer control
-- **Route Visibility Control** - Individual route toggles with Select All/Deselect All
-- **Transparent Panel Design** - Excel-style collapsible filters with smart transparency
-- **Detailed Tooltips** - Hover information showing cargo, distance, duration, and capacity utilization
+- **Clean Single Layer** - OpenStreetMap base (no tile/layer control for minimalist design)
+- **Professional Vendor Pins** - Elegant blue gradient teardrop markers, perfectly anchored at exact coordinates
+- **Depot Highlights** - Unfilled concentric red circles marking distribution center
+- **Route Visualization** - Color-coded polylines with real road geometry
+- **Route Visibility Control** - Excel-style filter: Select All/Deselect All from results panel
+- **Segment Details** - Click routes for right-side popup with distance, duration, speed metrics
 
 ### 📊 Comprehensive Analytics
 - **Route Statistics** - Total routes, vendors, distance, cargo weight, loading volume
@@ -74,26 +76,16 @@ Comprehensive route details with 14 columns per stop:
 - Vehicle count optimization
 
 ### Visualization
-- **Interactive Maps** with multiple tile layers (Street, Light, Dark, Terrain)
+- **Interactive Maps** - Single OpenStreetMap base layer for clean, focused display
 - **Excel-Style Route Filter**:
-  - Collapsible dropdown with transparent background
-  - Select All/Deselect All functionality
+  - Collapsible filter panel with transparent styling
+  - Select All/Deselect All for quick toggling
   - Individual route visibility controls
-  - Real-time route toggling
-- **Route Tooltips** showing:
-  - Step-by-step segment information
-  - Cargo and loading pickup details
-  - Distance, duration, and average speed
-  - Complete route summaries with all vendors
-  - Capacity utilization percentages
-- **Vendor Markers** displaying:
-  - Cargo to pickup (weight and volume)
-  - Assigned vehicle and stop number
-  - Location details
-- **Same-Location Handling**:
-  - Circular markers for multiple vendors at same address
-  - Special visual indicators for co-located pickups
-
+  - Real-time map layer synchronization
+- **Professional Markers**:
+  - **Depot**: Unfilled concentric red circles (three rings) marking distribution hub
+  - **Vendors**: Elegant blue gradient pins with precise coordinate anchoring
+- **Segment Details**: Click any route to display metrics (distance, duration, speed) in right-side popup
 ### Data Processing
 - CSV-based vendor and parcel data
 - Geocoding with persistent cache
@@ -379,11 +371,32 @@ Distance reduction achieved: 24.03%
 - 📍 Mouse position coordinates
 - 👁️ Individual route visibility toggles
 
+#### Route Highlighting and Developer Logs
+
+- Click any route polyline to highlight it in yellow with a soft glow.
+- Clicking a different route will automatically clear the previous highlight (exclusive highlighting).
+- Clicking the same route again toggles the highlight off.
+- Open your browser’s DevTools Console to see detailed logs under the tag "[ROUTE HIGHLIGHT]" (initialization, layer scanning, handler attachment, and click events).
+- The script is resilient to load timing and re-attaches handlers when layers change.
+
 ### Saved Files
 - `results/optimization/routes_[date]_metaheuristic.html` - Interactive map (ALNS solver)
 - `results/optimization/routes_[date].html` - Interactive map (CBC solver)
 - `results/optimization/solution[N]_[date].npy` - Numpy arrays with decision variables
 - `data/geocode_cache.csv` - Cached geocoding results
+
+## 🧹 Maintenance & Cleanup
+
+To reduce confusion and keep the workspace clean, you can safely remove ephemeral artifacts:
+
+- Clear distance matrix caches: `cache/*.json` (will be regenerated on next run)
+- Remove old optimization maps: keep only the most recent file under `results/optimization/`
+- Clear temporary uploads: `uploads/*.csv` (inputs can be re-uploaded as needed)
+- Remove Python bytecode caches: `**/__pycache__/`
+
+Important: Do not delete `data/geocode_cache.csv`. This file persists geocoding results and avoids rate limits and repeated geocoding.
+
+After cleanup, the app will regenerate the necessary matrices and outputs on demand.
 
 ## 🔧 Project Architecture
 

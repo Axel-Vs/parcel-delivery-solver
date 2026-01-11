@@ -1747,7 +1747,19 @@ class DeliveryOptimizer:
                 window.routeLayerGroups = {{}};
 {layer_map_js}
                 
+                console.groupCollapsed('[ROUTE HIGHLIGHT] Layer Exposure');
                 console.log('✓ Exposed', Object.keys(window.routeLayerGroups).length, 'route layers to window');
+                console.log('Map variable:', '{map_var}');
+                try {{
+                    Object.keys(window.routeLayerGroups).forEach(function(key) {{
+                        var fg = window.routeLayerGroups[key];
+                        var layerCount = (fg && typeof fg.getLayers === 'function') ? fg.getLayers().length : 'N/A';
+                        console.log('  Route ' + key + ' FeatureGroup: ' + layerCount + ' layers');
+                    }});
+                }} catch(e) {{
+                    console.warn('  Error enumerating FeatureGroups:', e);
+                }}
+                console.groupEnd();
             }}
             
             if (document.readyState === 'loading') {{
@@ -1758,6 +1770,198 @@ class DeliveryOptimizer:
         </script>
         """
         m.get_root().html.add_child(folium.Element(expose_layers_js))
+        
+        # Add comprehensive route highlighting JavaScript handler
+        route_highlight_js = f"""
+        <script>
+        (function() {{
+            console.log('%c[ROUTE HIGHLIGHT] INITIALIZING', 'color: #FFD700; font-weight: bold; font-size: 14px;');
+            console.log('Waiting for window.routeMap...');
+            
+            var maxWait = 0;
+            
+            function initHighlight() {{
+                maxWait++;
+                console.log('[ROUTE HIGHLIGHT] Init attempt ' + maxWait);
+                
+                var map = window.routeMap;
+                if (!map) {{
+                    console.log('[ROUTE HIGHLIGHT] ⏳ window.routeMap not ready yet, retrying...');
+                    if (maxWait < 50) {{
+                        setTimeout(initHighlight, 100);
+                    }} else {{
+                        console.error('[ROUTE HIGHLIGHT] ERROR: window.routeMap never became available after ' + (maxWait * 100) + 'ms');
+                    }}
+                    return;
+                }}
+                
+                console.log('%c[ROUTE HIGHLIGHT] ✓ window.routeMap available', 'color: #4CAF50; font-weight: bold;');
+                
+                var attached = false;
+                var attempts = 0;
+                
+                function attachHandlers() {{
+                    if (attached) {{
+                        console.log('[ROUTE HIGHLIGHT] Handlers already attached');
+                        return;
+                    }}
+                    attempts++;
+                    console.group('[ROUTE HIGHLIGHT] Attachment Attempt #' + attempts);
+                    
+                    var polylines = [];
+                    var layerTypes = {{}};
+                    
+                    // Scan map._layers for polylines
+                    try {{
+                        for (var id in map._layers) {{
+                            var layer = map._layers[id];
+                            if (!layer) continue;
+                            var typeName = layer.constructor ? layer.constructor.name : 'unknown';
+                            layerTypes[typeName] = (layerTypes[typeName] || 0) + 1;
+                            
+                            if (layer instanceof L.Polyline && !(layer instanceof L.Marker)) {{
+                                polylines.push(layer);
+                            }}
+                        }}
+                    }} catch(e) {{
+                        console.error('Error scanning map._layers:', e);
+                    }}
+                    
+                    console.log('Layer types found:', layerTypes);
+                    console.log('Polylines in map._layers:', polylines.length);
+                    
+                    // Also scan FeatureGroups
+                    try {{
+                        var idsSeen = {{}};
+                        polylines.forEach(function(l) {{ idsSeen[l._leaflet_id] = true; }});
+                        
+                        (window.routeLayerGroups || {{}});
+                        Object.keys(window.routeLayerGroups || {{}}).forEach(function(key) {{
+                            var fg = window.routeLayerGroups[key];
+                            if (fg && typeof fg.getLayers === 'function') {{
+                                var fgLayers = fg.getLayers();
+                                var polyCount = 0;
+                                fgLayers.forEach(function(l) {{
+                                    if (l instanceof L.Polyline && !(l instanceof L.Marker)) {{
+                                        polyCount++;
+                                        if (!idsSeen[l._leaflet_id]) {{
+                                            idsSeen[l._leaflet_id] = true;
+                                            polylines.push(l);
+                                        }}
+                                    }}
+                                }});
+                                console.log('Route ' + key + ' FeatureGroup: ' + fgLayers.length + ' total layers, ' + polyCount + ' polylines (added ' + (polyCount > 0 && !idsSeen[fgLayers[0]._leaflet_id] ? polyCount : 0) + ' new)');
+                            }}
+                        }});
+                    }} catch(e) {{
+                        console.warn('Error scanning FeatureGroups:', e);
+                    }}
+                    
+                    console.log('Total polylines found after scanning:', polylines.length);
+                    
+                    if (polylines.length === 0 && attempts < 30) {{
+                        console.warn('⏳ No polylines yet, retrying in 200ms...');
+                        console.groupEnd();
+                        setTimeout(attachHandlers, 200);
+                        return;
+                    }}
+                    
+                    if (polylines.length === 0) {{
+                        console.error('❌ No polylines found after ' + attempts + ' attempts. Check HTML structure.');
+                        console.groupEnd();
+                        return;
+                    }}
+                    
+                    console.log('%c🖱️ ATTACHING CLICK HANDLERS TO ' + polylines.length + ' POLYLINES', 'color: #2196F3; font-weight: bold; font-size: 13px;');
+                    
+                    // Track currently highlighted polyline for exclusive highlighting
+                    var currentlyHighlighted = null;
+                    
+                    var handlerCount = 0;
+                    polylines.forEach(function(layer, idx) {{
+                        if (layer._routeHighlightAttached) {{
+                            console.log('  Polyline [' + idx + '] (id ' + (layer._leaflet_id || 'n/a') + '): handler already attached, skipping');
+                            return;
+                        }}
+                        
+                        layer._originalColor = (layer.options && layer.options.color) || '#000000';
+                        layer._originalWeight = (layer.options && layer.options.weight) || 5;
+                        layer._originalOpacity = (layer.options && layer.options.opacity) || 0.9;
+                        
+                        if (layer._path) {{
+                            layer._path.style.cursor = 'pointer';
+                            layer._path.style.transition = 'stroke 0.2s ease, filter 0.2s ease';
+                        }}
+                        
+                        (function(poly, index) {{
+                            poly.on('click', function(e) {{
+                                L.DomEvent.stop(e);
+                                console.log('%c🖱️ CLICK on polyline [' + index + ']', 'color: #FF9800; font-weight: bold;');
+                                
+                                // Clear previously highlighted route if different
+                                if (currentlyHighlighted && currentlyHighlighted !== poly) {{
+                                    console.log('  Clearing previous highlight');
+                                    currentlyHighlighted.setStyle({{ 
+                                        color: currentlyHighlighted._originalColor, 
+                                        weight: currentlyHighlighted._originalWeight, 
+                                        opacity: currentlyHighlighted._originalOpacity 
+                                    }});
+                                    if (currentlyHighlighted._path) {{
+                                        currentlyHighlighted._path.style.filter = 'none';
+                                    }}
+                                    currentlyHighlighted._highlighted = false;
+                                }}
+                                
+                                if (!poly._highlighted) {{
+                                    console.log('%c🟡 HIGHLIGHTING - Setting color to #FFD700 (was ' + poly._originalColor + ')', 'color: #FFD700; font-weight: bold; font-size: 12px;');
+                                    poly.setStyle({{ color: '#FFD700', weight: poly._originalWeight + 3, opacity: 1 }});
+                                    if (poly._path) {{ 
+                                        poly._path.style.filter = 'drop-shadow(0 0 8px rgba(255, 215, 0, 0.8))';
+                                    }}
+                                    poly._highlighted = true;
+                                    currentlyHighlighted = poly;
+                                }} else {{
+                                    console.log('%c⚪ RESTORING - Back to ' + poly._originalColor, 'color: #2196F3; font-weight: bold; font-size: 12px;');
+                                    poly.setStyle({{ color: poly._originalColor, weight: poly._originalWeight, opacity: poly._originalOpacity }});
+                                    if (poly._path) {{ 
+                                        poly._path.style.filter = 'none';
+                                    }}
+                                    poly._highlighted = false;
+                                    currentlyHighlighted = null;
+                                }}
+                            }});
+                        }})(layer, idx);
+                        
+                        layer._routeHighlightAttached = true;
+                        handlerCount++;
+                        console.log('  ✓ Polyline [' + idx + '] (id ' + (layer._leaflet_id || 'n/a') + ') handler attached');
+                    }});
+                    
+                    console.log('%c✅ SUCCESS - ' + handlerCount + ' handlers attached', 'color: #4CAF50; font-weight: bold; font-size: 12px;');
+                    attached = true;
+                    console.groupEnd();
+                }}
+                
+                console.log('[ROUTE HIGHLIGHT] Scheduling first attachment in 100ms');
+                setTimeout(attachHandlers, 100);
+                
+                // Retry after page load
+                if (document.readyState === 'loading') {{
+                    window.addEventListener('load', function() {{ 
+                        console.log('[ROUTE HIGHLIGHT] Page load detected, retrying attachment in 500ms');
+                        setTimeout(attachHandlers, 500); 
+                    }});
+                }} else {{
+                    console.log('[ROUTE HIGHLIGHT] Page already loaded, scheduling retry in 500ms');
+                    setTimeout(attachHandlers, 500);
+                }}
+            }}
+            
+            initHighlight();
+        }})();
+        </script>
+        """
+        m.get_root().html.add_child(folium.Element(route_highlight_js))
         
         # Fit bounds to show all markers
         m.fit_bounds([[min(all_lats), min(all_lons)], [max(all_lats), max(all_lons)]])
