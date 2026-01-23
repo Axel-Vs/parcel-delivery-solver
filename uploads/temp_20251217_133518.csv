@@ -1,9 +1,0 @@
-city,delivery_date,id,latitude,longitude,name,volume,weight
- San Francisco ,,1,0,0,Vendor 1,0,0
- Houston       ,,2,0,0,Vendor 2,0,0
- Miami         ,,3,0,0,Vendor 3,0,0
- Montreal      ,,4,0,0,Vendor 4,0,0
- Tijuana       ,,5,0,0,Vendor 5,0,0
- Boston        ,,6,0,0,Vendor 6,0,0
- New York      ,,7,0,0,Vendor 7,0,0
- Halifax       ,,8,0,0,Vendor 8,0,0

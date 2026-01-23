@@ -1,9 +1,0 @@
-vendor_latitude,vendor_longitude,recipient_latitude,recipient_longitude,vendor Name,Vendor City,Vendor Postcode,Total Shipment Weight (kg),Total Volume (cbm),Requested Delivery
-0,0,47.6062,-122.3321,Vendor 1, San Francisco ,,0,0,
-0,0,47.6062,-122.3321,Vendor 2, Houston       ,,0,0,
-0,0,47.6062,-122.3321,Vendor 3, Miami         ,,0,0,
-0,0,47.6062,-122.3321,Vendor 4, Montreal      ,,0,0,
-0,0,47.6062,-122.3321,Vendor 5, Tijuana       ,,0,0,
-0,0,47.6062,-122.3321,Vendor 6, Boston        ,,0,0,
-0,0,47.6062,-122.3321,Vendor 7, New York      ,,0,0,
-0,0,47.6062,-122.3321,Vendor 8, Halifax       ,,0,0,

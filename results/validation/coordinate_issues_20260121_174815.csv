@@ -1,0 +1,59 @@
+index,vendor_name,city,lat_raw,lon_raw,lat_parsed,lon_parsed,issues
+0, US Tech Innovators Inc.  , San Francisco ,0,0,0.0,0.0,zero_zero_coordinate
+1, American Power Systems   , Chicago       ,0,0,0.0,0.0,zero_zero_coordinate
+2, LaserCraft Industries     , Houston       ,0,0,0.0,0.0,zero_zero_coordinate
+3, USA Metalworks Inc.      , Los Angeles   ,0,0,0.0,0.0,zero_zero_coordinate
+4, Frindt Manufacturing Co.  , New York      ,0,0,0.0,0.0,zero_zero_coordinate
+5, US Plastic Solutions     , Miami         ,0,0,0.0,0.0,zero_zero_coordinate
+6, Mexico Tech Innovators   , Mexico City   ,0,0,0.0,0.0,zero_zero_coordinate
+7, Mexican Power Systems    , Guadalajara   ,0,0,0.0,0.0,zero_zero_coordinate
+8, MexiCraft Industries      , Monterrey     ,0,0,0.0,0.0,zero_zero_coordinate
+9, Canada Metalworks Inc.   , Vancouver     ,0,0,0.0,0.0,zero_zero_coordinate
+10, Canadian Manufacturing Co., Toronto       ,0,0,0.0,0.0,zero_zero_coordinate
+11, Canada Plastic Solutions , Montreal      ,0,0,0.0,0.0,zero_zero_coordinate
+12, US Tech Innovators Inc.  , San Francisco ,0,0,0.0,0.0,zero_zero_coordinate
+13, American Power Systems   , Chicago       ,0,0,0.0,0.0,zero_zero_coordinate
+14, LaserCraft Industries     , Houston       ,0,0,0.0,0.0,zero_zero_coordinate
+15, USA Metalworks Inc.      , Los Angeles   ,0,0,0.0,0.0,zero_zero_coordinate
+16, Frindt Manufacturing Co.  , New York      ,0,0,0.0,0.0,zero_zero_coordinate
+17, US Plastic Solutions     , Miami         ,0,0,0.0,0.0,zero_zero_coordinate
+18, Mexico Tech Innovators   , Mexico City   ,0,0,0.0,0.0,zero_zero_coordinate
+19, Mexican Power Systems    , Guadalajara   ,0,0,0.0,0.0,zero_zero_coordinate
+20, MexiCraft Industries      , Monterrey     ,0,0,0.0,0.0,zero_zero_coordinate
+21, Canada Metalworks Inc.   , Vancouver     ,0,0,0.0,0.0,zero_zero_coordinate
+22, Canadian Manufacturing Co., Toronto       ,0,0,0.0,0.0,zero_zero_coordinate
+23, Canada Plastic Solutions , Montreal      ,0,0,0.0,0.0,zero_zero_coordinate
+24, US Tech Innovators Inc.  , San Francisco ,0,0,0.0,0.0,zero_zero_coordinate
+25, American Power Systems   , Chicago       ,0,0,0.0,0.0,zero_zero_coordinate
+26, LaserCraft Industries     , Houston       ,0,0,0.0,0.0,zero_zero_coordinate
+27, USA Metalworks Inc.      , Los Angeles   ,0,0,0.0,0.0,zero_zero_coordinate
+28, Frindt Manufacturing Co.  , New York      ,0,0,0.0,0.0,zero_zero_coordinate
+29, US Plastic Solutions     , Miami         ,0,0,0.0,0.0,zero_zero_coordinate
+30, Mexico Tech Innovators   , Mexico City   ,0,0,0.0,0.0,zero_zero_coordinate
+31, Mexican Power Systems    , Guadalajara   ,0,0,0.0,0.0,zero_zero_coordinate
+32, MexiCraft Industries      , Monterrey     ,0,0,0.0,0.0,zero_zero_coordinate
+33, Canada Metalworks Inc.   , Vancouver     ,0,0,0.0,0.0,zero_zero_coordinate
+34, Canadian Manufacturing Co., Toronto       ,0,0,0.0,0.0,zero_zero_coordinate
+35, Canada Plastic Solutions , Montreal      ,0,0,0.0,0.0,zero_zero_coordinate
+36, US Tech Innovators Inc.  , San Francisco ,0,0,0.0,0.0,zero_zero_coordinate
+37, American Power Systems   , Chicago       ,0,0,0.0,0.0,zero_zero_coordinate
+38, LaserCraft Industries     , Houston       ,0,0,0.0,0.0,zero_zero_coordinate
+39, USA Metalworks Inc.      , Los Angeles   ,0,0,0.0,0.0,zero_zero_coordinate
+40, Frindt Manufacturing Co.  , New York      ,0,0,0.0,0.0,zero_zero_coordinate
+41, US Plastic Solutions     , Miami         ,0,0,0.0,0.0,zero_zero_coordinate
+42, Mexico Tech Innovators   , Mexico City   ,0,0,0.0,0.0,zero_zero_coordinate
+43, Mexican Power Systems    , Guadalajara   ,0,0,0.0,0.0,zero_zero_coordinate
+44, MexiCraft Industries      , Monterrey     ,0,0,0.0,0.0,zero_zero_coordinate
+45, Canada Metalworks Inc.   , Vancouver     ,0,0,0.0,0.0,zero_zero_coordinate
+46, Canadian Manufacturing Co., Toronto       ,0,0,0.0,0.0,zero_zero_coordinate
+47, Canada Plastic Solutions , Montreal      ,0,0,0.0,0.0,zero_zero_coordinate
+48, US Tech Innovators Inc.  , San Francisco ,0,0,0.0,0.0,zero_zero_coordinate
+49, American Power Systems   , Chicago       ,0,0,0.0,0.0,zero_zero_coordinate
+50, USA Tech Innovators Inc. , New York      ,0,0,0.0,0.0,zero_zero_coordinate
+51, American Power Systems   , Los Angeles   ,0,0,0.0,0.0,zero_zero_coordinate
+52, LaserTech Industries     , Chicago       ,0,0,0.0,0.0,zero_zero_coordinate
+53, US Metalworks Inc.       , Miami         ,0,0,0.0,0.0,zero_zero_coordinate
+54, Frindt Manufacturing Co.  , Houston       ,0,0,0.0,0.0,zero_zero_coordinate
+55, US Plastic Solutions     , New York      ,0,0,0.0,0.0,zero_zero_coordinate
+56, Mexico Tech Innovators   , Mexico City   ,0,0,0.0,0.0,zero_zero_coordinate
+57, Mexican Power Systems    , Guadalajara   ,0,0,0.0,0.0,zero_zero_coordinate

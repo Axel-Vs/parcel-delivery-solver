@@ -387,8 +387,8 @@ def info_matrix_definition(coordinates, source_node, shape, client, provider='or
                                 if element['status'] == 'OK':
                                     # Distance in meters, convert to km
                                     distance_mtrx[global_row][global_col] = element['distance']['value'] / 1000.0
-                                    # Duration in seconds, convert to hours
-                                    time_mtrx[global_row][global_col] = element['duration']['value'] / 3600.0
+                                    # Duration in seconds (keep consistent with OSRM)
+                                    time_mtrx[global_row][global_col] = element['duration']['value']
                 
                 log.info('Google Maps distance calculation completed')
                 

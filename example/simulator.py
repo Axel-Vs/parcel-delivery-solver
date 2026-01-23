@@ -41,7 +41,11 @@ if 'Vendor Name' in df.columns:
 # Map gross weight / loading meters
 if 'Vendor Gross Weight' in df.columns:
     df['Total Gross Weight'] = df['Vendor Gross Weight']
-if 'Vendor Loading Meters' in df.columns:
+if 'Vendor Volume in m3' in df.columns:
+    df['Calculated Loading Meters'] = df['Vendor Volume in m3']
+elif 'Vendor Linear Length' in df.columns:
+    df['Calculated Loading Meters'] = df['Vendor Linear Length']
+elif 'Vendor Loading Meters' in df.columns:
     df['Calculated Loading Meters'] = df['Vendor Loading Meters']
 elif 'Vendor Dimensions in m3' in df.columns:
     # fallback: use dimensions as a proxy
@@ -291,7 +295,8 @@ for w in [0.5]:
                     capacity_matrix=capacity_matrix,
                     loading_matrix=loading_matrix,
                     max_capacity=network_params['max_weight'],
-                    max_ldms=network_params['max_ldms'],
+                    max_volume=network_params.get('max_volume', 90),
+                    max_linear_length=network_params.get('max_linear_length', 16.1),
                     max_driving=network_params['max_driving'],
                     is_gap=model_params.get('gap', False),
                     mip_gap=model_params.get('gap_value', 0.05),

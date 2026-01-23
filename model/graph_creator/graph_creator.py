@@ -58,10 +58,9 @@ class Graph:
         self.earl_arv = params['earl_arv']   # Earliest arrival to vendor (days) 
         self.late_arv = params['late_arv']   # Latest arrival to vendor (days)
         self.max_driving = params['max_driving']
-        self.driving_starts = params['driving_starts']
-        self.driving_stop = params['driving_stop']
         self.max_weight = params['max_weight']
-        self.max_ldms = params['max_ldms']
+        self.max_volume = params.get('max_volume', 90)
+        self.max_linear_length = params.get('max_linear_length', 16.1)
         self.plot_centered_coordinates = params['plot_centered_coordinates']
         
         # Arc pruning parameters for optimization
@@ -103,10 +102,9 @@ class Graph:
             'pickup_end_hr':self.pickup_end_hr,
             'loading':self.loading,
             'max_driving':self.max_driving,
-            'driving_starts':self.driving_starts,
-            'driving_stop':self.driving_stop,
             'max_weight':self.max_weight,
-            'max_ldms':self.max_ldms,
+            'max_volume':self.max_volume,
+            'max_linear_length':self.max_linear_length,
             'germany_coordinates':self.germany_coordinates
         }
         with open(path+'params.csv', 'w') as f:
@@ -175,7 +173,7 @@ class Graph:
         df_coord = filter_geocoded[['vendor_longitude', 'vendor_latitude']]
         vendor_coordinates = df_coord.apply(list, axis=1)       # just coordinates 
 
-        vendors_df = filter_geocoded[['vendor Name', 'vendor_longitude', 'vendor_latitude', 'Calculated Loading Meters', 'Total Gross Weight',  'Requested Loading', 'Requested Delivery', 'Vendor City', 'Vendor Postcode']]
+        vendors_df = filter_geocoded[['vendor Name', 'vendor_longitude', 'vendor_latitude', 'Calculated Loading Meters', 'Total Gross Weight',  'Requested Loading', 'Requested Delivery', 'Vendor City', 'Vendor Postcode', 'Vendor Country Name', 'Recipient City', 'Recipient Country Name']]
         vendors_df.index = vendors_df.index + 1
         vendors_df = vendors_df
         if len(vendors_df) !=0:
@@ -296,11 +294,6 @@ class Graph:
         non_open_depot_index = list(non_open_depot_index[0])
         non_open_supp_index = list(non_open_supp_index[0])
 
-        non_driving_index=np.where((np.array(self.Tau_hours)>self.driving_stop) | (np.array(self.Tau_hours)<self.driving_starts))
-        non_driving_index=list(non_driving_index[0])
-        # night_size = len(consecutive(non_driving_index)[0])
-        night_size = max(list(map(len, consecutive(non_driving_index))))
-
         days_req = pd.to_datetime(vendors_df['Requested Loading'], format= '%Y-%m-%d %H:%M:%S').dt.day
         if self.late_arv <= 6:
             e = {}
@@ -363,7 +356,6 @@ class Graph:
         
         # OPTIMIZATION 1: Pre-compute sets for faster lookup
         non_open_supp_set = set(non_open_supp_index)
-        non_driving_set = set(non_driving_index)
         non_open_depot_set = set(non_open_depot_index)
         max_tau = max(Tau_index)
         
@@ -389,10 +381,7 @@ class Graph:
                     elif j == 0:
                         # Vendor to depot arcs
                         for m in time_windows[i]:                                     
-                            t_e = m + self.disc_loading + self.disc_time_distance_matrix[i][j]                                                        
-                            
-                            if t_e in non_driving_set: 
-                                t_e = t_e + night_size            
+                            t_e = m + self.disc_loading + self.disc_time_distance_matrix[i][j]
 
                             if (t_e not in non_open_depot_set) & (t_e <= max_tau):                                    
                                 if m not in non_open_supp_set:
@@ -422,9 +411,6 @@ class Graph:
                                 t_e = m + (self.disc_loading - math.floor( self.disc_loading/2 )) + self.disc_time_distance_matrix[i][j]        
                             else:
                                 t_e = m + self.disc_loading + self.disc_time_distance_matrix[i][j]
-                                
-                            if t_e in non_driving_set:                               
-                                t_e = t_e + night_size
                             
                             # OPTIMIZATION 6: Early exit if time constraints violated
                             if t_e > max_tau:

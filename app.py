@@ -11,7 +11,7 @@ import os
 import sys
 import logging
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 
 # Add project root to path
@@ -98,16 +98,108 @@ def upload_csv():
                 'recipient_latitude': float(row.get('recipient_latitude', 0)),
                 'recipient_longitude': float(row.get('recipient_longitude', 0)),
                 'weight': float(row.get('Total Gross Weight', row.get('Vendor Gross Weight', 0))),
-                'volume': float(row.get('Calculated Loading Meters', row.get('Vendor Loading Meters', row.get('Vendor Dimensions in m3', 0)))),
+                'volume': float(row.get('Vendor Volume in m3', row.get('Vendor Linear Length', row.get('Calculated Loading Meters', row.get('Vendor Loading Meters', row.get('Vendor Dimensions in m3', 0)))))),
                 'delivery_date': str(row.get('Requested Delivery', row.get('Requested Delivery Date', '')))
             })
         
-        return jsonify({
+        # Calculate dynamic parameters based on data
+        calculated_max_driving = None
+        calculated_max_weight = None
+        calculated_max_volume = None
+        calculated_max_linear_length = None
+        
+        try:
+            # Estimate based on vendor count and geographic spread
+            vendor_count = len(df)
+            if vendor_count > 0:
+                # Trivial solution: one vehicle per vendor
+                # Each vehicle: depot → vendor (one-way) + service time
+                # Max driving time = max(depot_to_vendor_distance) + service_time + buffer
+                # This is the MINIMUM guaranteed max_driving needed for ANY solution
+                
+                service_time_per_stop = 2.0  # hours
+                
+                # Geographic estimates based on vendor count/spread (one-way distance)
+                # Assumption: more vendors = larger geographic area
+                if vendor_count <= 5:
+                    # Local area - farthest vendor maybe 30-60 min away (one-way)
+                    estimated_max_travel = 1.0  # hours
+                elif vendor_count <= 10:
+                    # Regional - farthest vendor maybe 2-4 hours away (one-way)
+                    estimated_max_travel = 4.0  # hours
+                elif vendor_count <= 20:
+                    # Multi-city - farthest vendor maybe 8-12 hours away (one-way)
+                    estimated_max_travel = 12.0  # hours
+                elif vendor_count <= 50:
+                    # Multi-state - farthest vendor maybe 20-30 hours away (one-way, e.g. Seattle to Chicago)
+                    estimated_max_travel = 30.0  # hours
+                else:
+                    # Cross-country - farthest vendor ~60-65 hours away (one-way, e.g. Seattle to Miami)
+                    estimated_max_travel = 65.0  # hours
+                
+                # Calculate minimum max_driving needed for trivial solution:
+                # = one-way travel to farthest vendor + service_time + buffer
+                calculated_max_driving = estimated_max_travel + service_time_per_stop + 2.0
+                print(f"✅ Estimated min max_driving: {calculated_max_driving:.1f}h for {vendor_count} vendors (trivial solution: travel {estimated_max_travel:.1f}h + service {service_time_per_stop:.1f}h + 2h buffer)")
+                
+                # Calculate max_weight based on heaviest vendor (with 20% safety margin)
+                weight_col = None
+                for col in ['Total Gross Weight', 'Vendor Gross Weight', 'weight']:
+                    if col in df.columns:
+                        weight_col = col
+                        break
+                
+                if weight_col:
+                    max_vendor_weight_kg = df[weight_col].fillna(0).max()
+                    calculated_max_weight = max(30, max_vendor_weight_kg * 1.2)  # Min 30kg, plus 20% buffer
+                    print(f"✅ Calculated max_weight: {calculated_max_weight:.0f}kg (max vendor: {max_vendor_weight_kg:.0f}kg + 20%)")
+                
+                # Calculate max_volume based on largest vendor volume (with 20% safety margin)
+                ldms_col = None
+                for col in ['Vendor Volume in m3', 'Vendor Linear Length', 'Calculated Loading Meters', 'Vendor Loading Meters', 'Vendor Dimensions in m3', 'volume']:
+                    if col in df.columns:
+                        ldms_col = col
+                        break
+                
+                if ldms_col:
+                    max_vendor_ldms = df[ldms_col].fillna(0).max()
+                    calculated_max_volume = max(90, max_vendor_ldms * 1.2)  # Min 90m³, plus 20% buffer
+                    print(f"✅ Calculated max_volume: {calculated_max_volume:.1f}m³ (max vendor: {max_vendor_ldms:.1f}m³ + 20%)")
+                
+                # Calculate max_linear_length based on largest vendor linear length (with 20% safety margin)
+                linear_col = None
+                for col in ['Vendor Linear Length', 'volume']:
+                    if col in df.columns:
+                        linear_col = col
+                        break
+                
+                if linear_col:
+                    max_vendor_linear = df[linear_col].fillna(0).max()
+                    calculated_max_linear_length = max(16.1, max_vendor_linear * 1.2)  # Min 16.1m, plus 20% buffer
+                    print(f"✅ Calculated max_linear_length: {calculated_max_linear_length:.1f}m (max vendor: {max_vendor_linear:.1f}m + 20%)")
+        
+        except Exception as e:
+            print(f"⚠️ Could not estimate parameters: {e}")
+            # Continue without calculation - optimizer will use defaults
+        
+        response_data = {
             'success': True,
             'vendors': vendors,
             'count': len(vendors),
             'filepath': filepath
-        })
+        }
+        
+        # Include calculated parameters if available
+        if calculated_max_driving is not None:
+            response_data['calculated_max_driving'] = round(calculated_max_driving, 1)
+        if calculated_max_weight is not None:
+            response_data['calculated_max_weight'] = round(calculated_max_weight, 0)
+        if calculated_max_volume is not None:
+            response_data['calculated_max_volume'] = round(calculated_max_volume, 1)
+        if calculated_max_linear_length is not None:
+            response_data['calculated_max_linear_length'] = round(calculated_max_linear_length, 1)
+        
+        return jsonify(response_data)
     
     except Exception as e:
         import traceback
@@ -138,7 +230,8 @@ def optimize_routes():
             return jsonify({'error': 'No vendor data or csv_filepath provided'}), 400
         
         # Get other parameters
-        use_metaheuristic = params.get('use_metaheuristic', True)
+        # Allow auto-selection of solver based on vendor count if not explicitly provided
+        use_metaheuristic = params.get('use_metaheuristic', None)
         max_vehicles = len(vendors_data)  # Always use all vendors as max vehicles
         period = None  # Initialize period at top of function
         
@@ -147,35 +240,42 @@ def optimize_routes():
             print(f"Using CSV file: {csv_filepath}")
             df_raw = pd.read_csv(csv_filepath)
             
-            # Calculate period from RAW dates spanning earliest loading to latest delivery
+            # Calculate period from RAW dates with CORRECT 12-hour buffers
+            # Period Start = MIN(Requested Loading Date) - 12 hours
+            # Period End = MAX(Requested Delivery Date) + 12 hours
             period = None
-            min_date = None
-            max_date = None
+            loading_min = None
+            delivery_max = None
             
-            # Get earliest loading date
+            # Get earliest loading date (when vendors have packages ready)
             if 'Requested Loading Date' in df_raw.columns:
                 loading_dates = pd.to_datetime(df_raw['Requested Loading Date'], errors='coerce').dropna()
                 if len(loading_dates) > 0:
-                    min_date = loading_dates.min()
-                    max_date = loading_dates.max()
+                    loading_min = loading_dates.min()
             
-            # Get latest delivery date and expand range
+            # Get latest delivery date (when packages must reach depot)
             if 'Requested Delivery Date' in df_raw.columns:
                 delivery_dates = pd.to_datetime(df_raw['Requested Delivery Date'], errors='coerce').dropna()
                 if len(delivery_dates) > 0:
-                    if min_date is None:
-                        min_date = delivery_dates.min()
-                    else:
-                        min_date = min(min_date, delivery_dates.min())
-                    
-                    if max_date is None:
-                        max_date = delivery_dates.max()
-                    else:
-                        max_date = max(max_date, delivery_dates.max())
+                    delivery_max = delivery_dates.max()
             
-            if min_date is not None and max_date is not None:
-                period = [min_date, max_date]
-                print(f"📅 Tour period: {min_date} to {max_date}")
+            if loading_min is not None and delivery_max is not None:
+                # Apply 12-hour buffers (vendor must have time to prepare, depot must have time to receive)
+                period_start = loading_min - timedelta(hours=12)
+                period_end = delivery_max + timedelta(hours=12)
+                period = [period_start, period_end]
+                print(f"📅 Correct Tour Period (with ±12h buffers):")
+                print(f"   MIN(Requested Loading Date) - 12h = {period_start}")
+                print(f"   MAX(Requested Delivery Date) + 12h = {period_end}")
+                print(f"   Period: {period_start} to {period_end}")
+            
+                # Analyze the date distribution for debugging time window issues
+                print(f"\n📊 DATE ANALYSIS FOR TIME WINDOW DEBUGGING:")
+                print(f"   - Loading period: {loading_min} to {pd.to_datetime(df_raw['Requested Loading Date'], errors='coerce').dropna().max()}")
+                print(f"   - Delivery period: {pd.to_datetime(df_raw['Requested Delivery Date'], errors='coerce').dropna().min()} to {delivery_max}")
+                print(f"   - Total routing span: {(delivery_max - loading_min).days} days")
+                print(f"   - With buffers: {(period_end - period_start).days} days")
+            
             
             # Prepare dataframe similar to simulator.py preprocessing
             df = df_raw.copy()
@@ -187,7 +287,11 @@ def optimize_routes():
             # Map weights and loading
             if 'Vendor Gross Weight' in df.columns:
                 df['Total Gross Weight'] = df['Vendor Gross Weight']
-            if 'Vendor Loading Meters' in df.columns:
+            if 'Vendor Volume in m3' in df.columns:
+                df['Calculated Loading Meters'] = df['Vendor Volume in m3']
+            elif 'Vendor Linear Length' in df.columns:
+                df['Calculated Loading Meters'] = df['Vendor Linear Length']
+            elif 'Vendor Loading Meters' in df.columns:
                 df['Calculated Loading Meters'] = df['Vendor Loading Meters']
             elif 'Vendor Dimensions in m3' in df.columns:
                 df['Calculated Loading Meters'] = df['Vendor Dimensions in m3']
@@ -379,21 +483,20 @@ def optimize_routes():
         depot_lat = df['recipient_latitude'].iloc[0] if 'recipient_latitude' in df.columns else 47.6062
         depot_lon = df['recipient_longitude'].iloc[0] if 'recipient_longitude' in df.columns else -122.3321
         
-        # Create network parameters
+        # Create network parameters (max_driving will be calculated dynamically later)
         network_params = {
             'discretization_constant': 4,
-            'starting_depot': params.get('starting_depot', 8),
-            'closing_depot': params.get('closing_depot', 18),
-            'vendor_start_hr': params.get('vendor_start_hr', 6),
-            'pickup_end_hr': params.get('pickup_end_hr', 14),
+            'starting_depot': params.get('starting_depot', 0),
+            'closing_depot': params.get('closing_depot', 24),
+            'vendor_start_hr': params.get('vendor_start_hr', 0),
+            'pickup_end_hr': params.get('pickup_end_hr', 24),
             'loading': params.get('loading', 2),
             'earl_arv': params.get('earl_arv', 24),
             'late_arv': params.get('late_arv', 24),
-            'max_driving': params.get('max_driving', 15),
-            'driving_starts': params.get('driving_starts', 6),
-            'driving_stop': params.get('driving_stop', 21),
+            'max_driving': 50,  # Placeholder - will be recalculated dynamically
             'max_weight': params.get('max_weight', 30),
-            'max_ldms': params.get('max_ldms', 70),
+            'max_volume': params.get('max_volume', 90),
+            'max_linear_length': params.get('max_linear_length', 16.1),
             'plot_centered_coordinates': [depot_lat, depot_lon],
             'max_feasible_distance': 3000,
             'time_window_sampling_threshold': 20,
@@ -428,7 +531,39 @@ def optimize_routes():
         except Exception as e:
             return jsonify({'error': f'Failed to read vendor data: {str(e)}'}), 500
         
-        print(f"Successfully loaded {len(vendors_df)} vendors")
+        vendor_count = len(vendors_df)
+        print(f"Successfully loaded {vendor_count} vendors")
+
+
+        # Load model-level parameters (for gap/time/thresholds)
+        model_params_path = os.path.join('model', 'config', 'model_params.txt')
+        model_params = {}
+        try:
+            if os.path.exists(model_params_path):
+                import json
+                with open(model_params_path, 'r') as f:
+                    model_params = json.loads(f.read())
+        except Exception as e:
+            print(f"⚠️ Could not read model_params.txt: {e}")
+
+        # Allow request to override model parameters (live configuration)
+        # Priority: request params > model_params.txt > hardcoded defaults
+        mip_time_limit = int(params.get('mip_time', model_params.get('max_time', 20)))
+        alns_time_limit = int(params.get('alns_time', model_params.get('alns_time', 10)))
+        mip_gap_value = float(params.get('gap_value', model_params.get('gap_value', 0.05)))
+        vendor_threshold = int(params.get('vendor_threshold', model_params.get('vendor_threshold', 20)))
+        max_iterations_alns = int(params.get('alns_iterations', model_params.get('alns_max_iterations', 2500)))
+        
+        print(f"📋 Configuration (request overrides model_params.txt):")
+        print(f"   MIP time: {mip_time_limit} min (from: {'request' if 'mip_time' in params else 'model_params.txt' if 'max_time' in model_params else 'default'})")
+        print(f"   ALNS time: {alns_time_limit} min (from: {'request' if 'alns_time' in params else 'model_params.txt' if 'alns_time' in model_params else 'default'})")
+        print(f"   MIP gap: {mip_gap_value} (from: {'request' if 'gap_value' in params else 'model_params.txt' if 'gap_value' in model_params else 'default'})")
+        print(f"   Solver threshold: {vendor_threshold} vendors (from: {'request' if 'vendor_threshold' in params else 'model_params.txt' if 'vendor_threshold' in model_params else 'default'})")
+
+        # Auto-select solver if not specified in request
+        if use_metaheuristic is None:
+            use_metaheuristic = vendor_count >= vendor_threshold
+            print(f"Solver auto-selected: {'ALNS' if use_metaheuristic else 'MIP'} (threshold={vendor_threshold})")
         
         # Create network
         net.create_network(complete_coordinates, vendors_df)
@@ -436,9 +571,58 @@ def optimize_routes():
         # Discretize the network (creates disc_time_distance_matrix)
         net.discretize()
         
+        # Calculate dynamic max_driving based on actual travel times
+        # Always calculate, then decide whether to use it
+        calculated_max_driving = None
+        if net.time_distance_matrix is not None and len(net.time_distance_matrix) > 1:
+            # Get max time from any vendor to depot (depot is node 0) - vendor-to-depot travel time ONLY
+            # time_distance_matrix is in seconds from OSRM routing
+            vendor_to_depot_times = [net.time_distance_matrix[i][0] for i in range(1, len(net.time_distance_matrix))]
+            if vendor_to_depot_times:
+                max_vendor_depot_time_hours = max(vendor_to_depot_times) / 3600.0
+                # Add service time per stop + safety buffer
+                service_time_hours = (params.get('service_time_minutes', 120)) / 60.0
+                calculated_max_driving = max_vendor_depot_time_hours + service_time_hours + 2.0
+                
+                # Use calculated value (user can still override by changing the form from default 67)
+                user_max_driving = params.get('max_driving', None)
+                
+                # Hard minimum validation - reject if below calculated minimum
+                if user_max_driving is not None and user_max_driving < calculated_max_driving:
+                    return jsonify({
+                        'success': False,
+                        'error': f'max_driving ({user_max_driving:.1f}h) is below the minimum required ({calculated_max_driving:.1f}h). '
+                                f'The farthest vendor-to-depot requires {max_vendor_depot_time_hours:.1f}h travel. '
+                                f'Please set max_driving to at least {calculated_max_driving:.1f}h.'
+                    }), 400
+                
+                if user_max_driving is None or user_max_driving == 67:  # 67 is the new UI default
+                    network_params['max_driving'] = calculated_max_driving
+                    print(f"✅ Max driving time set: {calculated_max_driving:.1f}h (farthest vendor: {max_vendor_depot_time_hours:.1f}h travel + {service_time_hours:.1f}h service + 2h buffer)")
+                else:
+                    network_params['max_driving'] = user_max_driving
+                    print(f"📋 Using user-specified max driving: {user_max_driving:.1f}h (calculated minimum: {calculated_max_driving:.1f}h)")
+        
         # Extract matrices and parameters
-        capacity_matrix = vendors_df['Total Gross Weight'].to_numpy()
-        loading_matrix = vendors_df['Calculated Loading Meters'].to_numpy()
+        # Prepend 0 for depot (node 0) to align array indices with node IDs
+        capacity_matrix = np.concatenate([[0], vendors_df['Total Gross Weight'].to_numpy()])
+        loading_matrix = np.concatenate([[0], vendors_df['Calculated Loading Meters'].to_numpy()])
+        
+        # Service time: configurable per request, default 2 hours per stop (120 minutes)
+        # This is added to travel time; total_time = travel_time + (num_stops × service_time)
+        # max_driving enforces: total_time ≤ max_driving_hours
+        DEFAULT_SERVICE_TIME_MINUTES = 2 * 60  # 2 hours × 60 = 120 minutes per stop
+        service_time_minutes = params.get('service_time_minutes', DEFAULT_SERVICE_TIME_MINUTES)
+        service_time_matrix = np.zeros(len(capacity_matrix))
+        service_time_matrix[1:] = service_time_minutes  # Apply to all vendors (depot at index 0 already has 0)
+        print(f"⏱️  Service time per stop: {service_time_minutes:.0f} minutes ({service_time_minutes/60:.1f} hours)")
+        print(f"📊 Max driving (total): {network_params['max_driving']:.1f} hours (travel + service combined)")
+        
+        # Debug: Check sample time values from matrix (after it's created)
+        if net.time_distance_matrix is not None and len(net.time_distance_matrix) > 2:
+            sample_time_sec = net.time_distance_matrix[1][2] if len(net.time_distance_matrix[1]) > 2 else 0
+            sample_time_hr = sample_time_sec / 3600.0
+            print(f"🔍 Debug: Sample time matrix value [1][2] = {sample_time_sec:.1f}s ({sample_time_hr:.2f}h)")
         
         # Prepare network data based on solver type (following simulator.py pattern)
         if use_metaheuristic:
@@ -454,6 +638,10 @@ def optimize_routes():
             time_expanded_network, complete_time_index, time_expanded_network_index = net.create_time_network(
                 vendors_df, period_str[0], period_str[1]
             )
+            print(f"✅ Time-expanded network: {len(time_expanded_network)} arcs")
+            
+            if len(time_expanded_network) == 0:
+                return jsonify({'error': 'No feasible arcs in time-expanded network. This usually means time windows are too restrictive or there are no valid routes between vendors.'}), 500
         
         # Create optimizer (same for both solver types)
         optimizer = DeliveryOptimizer(
@@ -467,24 +655,45 @@ def optimize_routes():
             disc_time_distance_matrix=net.disc_time_distance_matrix,
             capacity_matrix=capacity_matrix,
             loading_matrix=loading_matrix,
+            service_time_matrix=service_time_matrix,
             max_capacity=network_params['max_weight'],
-            max_ldms=network_params['max_ldms'],
+            max_volume=network_params['max_volume'],
+            max_linear_length=network_params['max_linear_length'],
             max_driving=network_params['max_driving'],
             is_gap=not use_metaheuristic,
-            mip_gap=0.05,
-            maximum_minutes=360 if not use_metaheuristic else 60,
+            # MIP gap: use live parameter (request > model_params > default)
+            mip_gap=(
+                0.01 if vendor_count <= 8 else
+                0.03 if vendor_count <= 15 else
+                mip_gap_value  # ← NOW LIVE FROM REQUEST
+            ),
+            # Time limit: use live parameters (request > model_params > default)
+            maximum_minutes=mip_time_limit if not use_metaheuristic else alns_time_limit,
             vendors_df=vendors_df
         )
         optimizer.min_date = net.min_date
+        print(f"📅 DEBUG: optimizer.min_date = {optimizer.min_date} (type: {type(optimizer.min_date).__name__})")
         
         # Run optimization with selected solver
         print(f"Starting optimization...")
         start_time = datetime.now()
         
         if use_metaheuristic:
+            # Determine iteration budget based on problem size if not provided
+            default_iters = (
+                1200 if vendor_count < 20 else
+                2000 if vendor_count < 30 else
+                2500 if vendor_count < 60 else
+                4000
+            )
+            # Allow override from request params or use model_params, else use default_iters
+            alns_iterations = int(params.get('alns_iterations', 
+                                   model_params.get('alns_max_iterations', default_iters)))
+            print(f"🔄 ALNS iterations: {alns_iterations} (from: {'request' if 'alns_iterations' in params else 'model_params.txt' if 'alns_max_iterations' in model_params else 'default'})")
+            
             status, x, y = optimizer.solve_with_metaheuristic(
                 w=0.5,
-                max_iterations=params.get('iterations', 2000),
+                max_iterations=alns_iterations,
                 verbose=True
             )
             solver_type = "ALNS Metaheuristic"
@@ -492,17 +701,40 @@ def optimize_routes():
             optimizer.create_model(w=0.5)
             status, x, y = optimizer.solve_model()
             solver_type = "CBC MIP"
+
+            # Auto-fallback: if the exact MIP is infeasible, switch to ALNS to try finding a feasible solution
+            if status == 2:
+                print("MIP solver reported infeasible (status=2). Falling back to ALNS metaheuristic...")
+                default_iters = (
+                    1200 if vendor_count < 20 else
+                    2000 if vendor_count < 30 else
+                    2500 if vendor_count < 60 else
+                    4000
+                )
+                alns_iterations = int(params.get('alns_iterations', 
+                                       model_params.get('alns_max_iterations', default_iters)))
+                status, x, y = optimizer.solve_with_metaheuristic(
+                    w=0.5,
+                    max_iterations=alns_iterations,
+                    verbose=True
+                )
+                solver_type = "ALNS Metaheuristic (fallback after MIP infeasible)"
         
         solving_time = (datetime.now() - start_time).total_seconds()
         
         # Check if solution was found
-        if status != 0:
+        if status not in (0, 1):
             return jsonify({'error': f'Optimization failed with status {status} (0=optimal, 1=feasible, 2=infeasible)'}), 500
+        if status == 1:
+            logging.info('⚠️ Optimization returned feasible (status=1); proceeding with best found solution')
         
         # Generate map
         map_filename = f'routes_{datetime.now().strftime("%Y%m%d_%H%M%S")}.html'
         map_path = os.path.join('results/optimization', map_filename)
         os.makedirs('results/optimization', exist_ok=True)
+        
+        # Log before suppressing stdout
+        logging.info(f'🗺️  Starting map generation via plot_routes at {map_path}...')
         
         # Plot routes using the optimizer's built-in method
         # Suppress stdout to prevent BrokenPipeError from excessive printing
@@ -512,8 +744,12 @@ def optimize_routes():
         sys.stdout = StringIO()  # Redirect stdout
         try:
             _, route_stats = optimizer.plot_routes(x, y, show_plot=False, save_path=map_path)
+        except Exception as e:
+            logging.error(f'❌ Error during plot_routes: {e}', exc_info=True)
+            raise
         finally:
             sys.stdout = old_stdout  # Restore stdout
+            logging.info(f'✅ Map generated successfully at {map_path}')
         
         # Store map_path in APP_STATE for manual saves
         APP_STATE['map_path'] = map_path
@@ -530,6 +766,16 @@ def optimize_routes():
         for vehicle_id in sorted(route_stats.keys()):
             vendors_seq = route_stats[vehicle_id].get('vendors', [])
             included_vendor_ids.update([int(v) for v in vendors_seq])
+        
+        # DEBUG: Log segment data from first route
+        if route_stats and len(route_stats) > 0:
+            first_route = route_stats[0]
+            if 'segments' in first_route and len(first_route['segments']) > 0:
+                first_seg = first_route['segments'][0]
+                print(f"🔍 DEBUG: First segment from route 0:")
+                print(f"   from_id: {first_seg.get('from_id')}, to_id: {first_seg.get('to_id')}")
+                print(f"   arrival_hours: {first_seg.get('arrival_hours')}")
+                print(f"   arrival_time: {first_seg.get('arrival_time')}")
         
         # Total volume (m³) - only for INCLUDED vendors
         volume_series = None
@@ -552,12 +798,60 @@ def optimize_routes():
         print(f"Total volume (included vendors only): {total_volume:.1f} m³")
         print(f"[DEBUG] Stats being sent - total_cargo value: {float(round(total_cargo_tons, 3))}")
         
-        # Build vendor name map first (needed for route summaries)
+        # Build vendor name, city and country maps (needed for route summaries)
         vendor_name_map = {}
+        vendor_city_map = {}
+        vendor_country_map = {}
         vendor_date_map = {}
+        depot_city = 'Depot City'  # Default depot city
+        depot_country = 'USA'  # Default depot country
+        
+        # Extract actual depot location from any vendor's recipient info (all vendors go to same depot)
+        print("\n🔍 DEBUG: Starting depot location extraction")
+        print(f"   Initial depot_city: {depot_city}, depot_country: {depot_country}")
+        print(f"   vendors_df has {len(vendors_df)} rows")
+        
+        for idx, row in vendors_df.iterrows():
+            # Try to get recipient city
+            if depot_city == 'Depot City':
+                recipient_city_val = row.get('Recipient City', None)
+                print(f"   Row {idx}: Recipient City raw value = {repr(recipient_city_val)}")
+                if recipient_city_val is not None and pd.notna(recipient_city_val):
+                    city_str = str(recipient_city_val).strip()
+                    print(f"   Row {idx}: After strip = {repr(city_str)}")
+                    if city_str and city_str.lower() != 'depot city':  # Ensure non-empty and not default
+                        depot_city = city_str
+                        print(f"   ✓ Set depot_city to: {depot_city}")
+            
+            # Try to get recipient country
+            if depot_country == 'USA':
+                recipient_country_val = row.get('Recipient Country Name', None)
+                print(f"   Row {idx}: Recipient Country Name raw value = {repr(recipient_country_val)}")
+                if recipient_country_val is not None and pd.notna(recipient_country_val):
+                    country_str = str(recipient_country_val).strip()
+                    print(f"   Row {idx}: After strip = {repr(country_str)}")
+                    if country_str:  # Ensure non-empty
+                        depot_country = country_str
+                        print(f"   ✓ Set depot_country to: {depot_country}")
+            
+            # Stop if we found both
+            if depot_city != 'Depot City' and depot_country != 'USA':
+                print(f"   ✓ Found both depot_city and depot_country, breaking")
+                break
+        
+        print(f"✅ Final depot location: {depot_city}, {depot_country}\n")
+        
         for idx, row in vendors_df.iterrows():
             vendor_id = int(idx + 1)
-            vendor_name_map[vendor_id] = str(row.get('vendor Name', row.get('Vendor Name', f'Vendor {vendor_id}')))
+            vendor_name_map[vendor_id] = str(row.get('vendor Name', row.get('Vendor Name', f'Vendor {vendor_id}'))).strip()
+            
+            # Extract city information
+            city = str(row.get('Vendor City', 'Unknown')).strip() if pd.notna(row.get('Vendor City')) else 'Unknown'
+            vendor_city_map[vendor_id] = city
+            
+            # Extract country information
+            country = str(row.get('Vendor Country Name', 'USA')).strip() if pd.notna(row.get('Vendor Country Name')) else 'USA'
+            vendor_country_map[vendor_id] = country
             
             raw_date = row.get('Requested Delivery', row.get('Requested Delivery Date', ''))
             parsed_date = pd.to_datetime(raw_date, errors='coerce')
@@ -566,35 +860,249 @@ def optimize_routes():
         
         # Create detailed route summaries from statistics
         route_summaries = []
-        for vehicle_id in sorted(route_stats.keys()):
+        print(f"\n📊 DEBUG: Building route summaries from {len(route_stats)} routes")
+        print(f"📊 DEBUG: route_stats keys (vehicle_ids): {sorted(route_stats.keys())}")
+        
+        # Validate route_stats for duplicates
+        vehicle_ids_sorted = sorted(route_stats.keys())
+        if len(vehicle_ids_sorted) != len(set(vehicle_ids_sorted)):
+            print(f"⚠️ WARNING: Duplicate vehicle IDs detected in route_stats!")
+        
+        for route_seq_num, vehicle_id in enumerate(vehicle_ids_sorted, start=1):
             stats = route_stats[vehicle_id]
+            num_vendors = len(stats.get('vendors', []))
+            total_dist = stats.get('total_distance', 0)
+            num_segments = len(stats.get('segments', []))
             
-            # Add vendor names to segments
+            print(f"📊 DEBUG: Route {route_seq_num} (vehicle_id {vehicle_id}): {num_vendors} vendors, {total_dist:.0f} km, {num_segments} segments")
+            if num_segments > 0:
+                first_seg = stats.get('segments', [])[0]
+                print(f"         First segment: {first_seg.get('from_id')} → {first_seg.get('to_id')}, distance={first_seg.get('distance', 0):.0f}km")
+            
+            # Add vendor names, cities and countries to segments
             segments_with_names = []
-            for seg in stats.get('segments', []):
+            raw_segments = stats.get('segments', [])
+            print(f"📊 DEBUG: Processing {len(raw_segments)} raw segments for route {route_seq_num}")
+            
+            # Track cumulative cargo - what's currently on the truck
+            cumulative_weight = 0.0
+            cumulative_volume = 0.0
+            
+            for seg_idx, seg in enumerate(raw_segments):
                 from_id = seg['from_id']
                 to_id = seg['to_id']
                 
-                # Get vendor names (0 = Depot)
+                # Get vendor names, cities and countries (0 = Depot)
                 from_name = 'Depot' if from_id == 0 else vendor_name_map.get(from_id, f'Vendor {from_id}')
-                to_name = 'Depot' if to_id == 0 else vendor_name_map.get(to_id, f'Vendor {to_id}')
+                from_city = depot_city if from_id == 0 else vendor_city_map.get(from_id, 'Unknown')
+                from_country = depot_country if from_id == 0 else vendor_country_map.get(from_id, 'USA')
                 
-                segments_with_names.append({
-                    'from': from_name,
-                    'to': to_name,
+                to_name = 'Depot' if to_id == 0 else vendor_name_map.get(to_id, f'Vendor {to_id}')
+                to_city = depot_city if to_id == 0 else vendor_city_map.get(to_id, 'Unknown')
+                to_country = depot_country if to_id == 0 else vendor_country_map.get(to_id, 'USA')
+                
+                # Format with city and country: "Vendor Name, City, Country → Destination, City, Country"
+                from_display = f"{from_name}, {from_city}, {from_country}"
+                to_display = f"{to_name}, {to_city}, {to_country}"
+                
+                # Check for duplicate vendor coordinates (0 distance between different vendors)
+                segment_warning = None
+                if seg['distance'] == 0 and seg['from_id'] != seg['to_id']:
+                    segment_warning = "ℹ️ Multiple cargo pickups at same address"
+                
+                # Add per-segment service time at the destination vendor (skip depot)
+                per_stop_service_hours = (service_time_minutes / 60.0) if to_id != 0 else 0.0
+                
+                # Cargo on this segment = what's currently on the truck BEFORE arriving at destination
+                # Since segments shown always start from vendors (not depot), we track cumulative cargo
+                if from_id != 0:
+                    # Leaving a vendor - pick up their cargo first if not already added
+                    if cumulative_weight == 0.0 or (seg_idx > 0 and raw_segments[seg_idx-1]['to_id'] != from_id):
+                        # First pickup OR this is a new vendor we're leaving from
+                        cumulative_weight += float(capacity_matrix[from_id])
+                        cumulative_volume += float(loading_matrix[from_id])
+                
+                # Show cumulative cargo being carried on this segment
+                vendor_weight_kg = cumulative_weight
+                vendor_volume_m3 = cumulative_volume
+                
+                # If arriving at a vendor (not depot), we'll pick up their cargo after this segment
+                if to_id != 0:
+                    # Arriving at next vendor - will pick up their cargo for subsequent segments
+                    cumulative_weight += float(capacity_matrix[to_id])
+                    cumulative_volume += float(loading_matrix[to_id])
+
+                # Distinguish between vendor pickup and depot delivery
+                # For Vendor → Vendor: show vendor requested pickup time
+                # For Vendor → Depot: show depot requested delivery time
+                pickup_date = None
+                requested_vendor_pickup = None
+                requested_depot_delivery = None
+                
+                if to_id != 0:
+                    # Going TO a vendor - show vendor's requested pickup/loading time
+                    try:
+                        vendor_row = vendors_df.iloc[to_id - 1]
+                        raw_pickup_candidates = [
+                            vendor_row.get('Requested Loading', ''),
+                            vendor_row.get('Requested Loading Date', ''),
+                            vendor_row.get('Requested Delivery', ''),
+                            vendor_row.get('Requested Delivery Date', ''),
+                        ]
+                        for raw_pickup in raw_pickup_candidates:
+                            parsed_pickup = pd.to_datetime(raw_pickup, errors='coerce')
+                            if pd.notna(parsed_pickup):
+                                pickup_date = parsed_pickup.strftime('%Y-%m-%d')
+                                requested_vendor_pickup = parsed_pickup.strftime('%Y-%m-%d %H:%M:%S')
+                                break
+                    except Exception:
+                        pass
+                else:
+                    # Going TO depot - show depot's requested delivery time
+                    try:
+                        vendor_row = vendors_df.iloc[from_id - 1]
+                        raw_delivery_candidates = [
+                            vendor_row.get('Depot Requested Delivery', ''),
+                            vendor_row.get('Depot Requested Delivery Date', ''),
+                            vendor_row.get('Requested Delivery', ''),
+                            vendor_row.get('Requested Delivery Date', ''),
+                        ]
+                        for raw_delivery in raw_delivery_candidates:
+                            parsed_delivery = pd.to_datetime(raw_delivery, errors='coerce')
+                            if pd.notna(parsed_delivery):
+                                pickup_date = parsed_delivery.strftime('%Y-%m-%d')
+                                requested_depot_delivery = parsed_delivery.strftime('%Y-%m-%d %H:%M:%S')
+                                break
+                    except Exception:
+                        pass
+
+                seg_data = {
+                    'from': from_display,
+                    'to': to_display,
                     'distance': float(round(seg['distance'], 1)),
                     'duration': float(round(seg['duration'], 2)),
-                    'avg_speed': float(round(seg['avg_speed'], 0))
-                })
+                    'duration_including_service': float(round(seg['duration'] + per_stop_service_hours, 2)),
+                    'service_time_hours': float(round(per_stop_service_hours, 2)),
+                    'cargo_kg': float(round(vendor_weight_kg, 2)),
+                    'volume_m3': float(round(vendor_volume_m3, 2)),
+                    'is_depot_destination': to_id == 0,  # Flag to indicate if going to depot
+                }
+                if segment_warning:
+                    seg_data['warning'] = segment_warning
+                if pickup_date:
+                    seg_data['pickup_date'] = pickup_date
+                if requested_vendor_pickup:
+                    seg_data['requested_vendor_pickup'] = requested_vendor_pickup
+                if requested_depot_delivery:
+                    seg_data['requested_depot_delivery'] = requested_depot_delivery
+                if 'arrival_time' in seg and seg.get('arrival_time'):
+                    seg_data['expected_arrival'] = seg.get('arrival_time')
+                if 'arrival_hours' in seg and seg.get('arrival_hours') is not None:
+                    seg_data['expected_arrival_hours'] = float(round(seg.get('arrival_hours'), 2))
+                
+                segments_with_names.append(seg_data)
+
+            # Group segments by location to detect multi-pickups at same address
+            grouped_segments = []
+            skip_indices = set()
+            for i, seg in enumerate(segments_with_names):
+                if i in skip_indices:
+                    continue
+                
+                # Check if next segment is at the same location (zero or near-zero distance)
+                same_location_pickups = [seg]
+                j = i + 1
+                while j < len(segments_with_names):
+                    next_seg = segments_with_names[j]
+                    # Detect same location: distance < 0.1 km
+                    if next_seg['distance'] < 0.1:
+                        same_location_pickups.append(next_seg)
+                        skip_indices.add(j)
+                        j += 1
+                    else:
+                        break
+                
+                # If multiple pickups at same location, create a summarized segment
+                if len(same_location_pickups) > 1:
+                    # Combine into one summary segment
+                    # IMPORTANT: cargo/volume should reflect the truck's final cumulative
+                    # after all pickups at the same location, not the sum of cumulatives
+                    # across sub-segments (which double-counts). Use the last subsegment
+                    # values for cargo and volume.
+                    combined_seg = {
+                        'from': same_location_pickups[0]['from'],
+                        'to': f"{same_location_pickups[0]['to']} (+{len(same_location_pickups) - 1} more at same location)",
+                        'distance': same_location_pickups[0]['distance'],
+                        'duration': same_location_pickups[0]['duration'],
+                        'duration_including_service': sum(s.get('duration_including_service', 0) for s in same_location_pickups),
+                        'service_time_hours': sum(s.get('service_time_hours', 0) for s in same_location_pickups),
+                        'cargo_kg': same_location_pickups[-1].get('cargo_kg', 0),
+                        'volume_m3': same_location_pickups[-1].get('volume_m3', 0),
+                    }
+                    # Preserve optional fields from first segment
+                    if 'warning' in same_location_pickups[0]:
+                        combined_seg['warning'] = same_location_pickups[0]['warning']
+                    if 'pickup_date' in same_location_pickups[0]:
+                        combined_seg['pickup_date'] = same_location_pickups[0]['pickup_date']
+                    if 'is_depot_destination' in same_location_pickups[0]:
+                        combined_seg['is_depot_destination'] = same_location_pickups[0]['is_depot_destination']
+                    if 'requested_vendor_pickup' in same_location_pickups[0]:
+                        combined_seg['requested_vendor_pickup'] = same_location_pickups[0]['requested_vendor_pickup']
+                    if 'requested_depot_delivery' in same_location_pickups[0]:
+                        combined_seg['requested_depot_delivery'] = same_location_pickups[0]['requested_depot_delivery']
+                    if 'expected_arrival' in same_location_pickups[0]:
+                        combined_seg['expected_arrival'] = same_location_pickups[0]['expected_arrival']
+                    if 'expected_arrival_hours' in same_location_pickups[0]:
+                        combined_seg['expected_arrival_hours'] = same_location_pickups[0]['expected_arrival_hours']
+                    grouped_segments.append(combined_seg)
+                else:
+                    grouped_segments.append(seg)
             
-            route_summaries.append({
-                'route_id': int(vehicle_id + 1),
+            segments_with_names = grouped_segments
+
+            travel_time_hours = sum(seg['duration'] for seg in stats.get('segments', []))
+            service_time_hours = stats['num_vendors'] * (service_time_minutes / 60.0)
+            total_time_hours = travel_time_hours + service_time_hours
+
+            print(f'   Route {route_seq_num}: {stats["num_vendors"]} vendors, {stats["total_distance"]:.0f} km, {total_time_hours:.1f} hours (travel: {travel_time_hours:.1f}h + service: {service_time_hours:.1f}h)')
+            print(f'   Route {route_seq_num}: segments_with_names has {len(segments_with_names)} items (after grouping same-location pickups)')
+
+            # Calculate capacity utilization percentages
+            max_weight_kg = float(network_params.get('max_weight', 5000)) * 1000.0  # Convert tons to kg
+            max_volume_m3 = float(network_params.get('max_volume', 90))
+            max_linear_length_m = float(network_params.get('max_linear_length', 16.1))
+            max_driving_hours = float(network_params.get('max_driving', 69))
+            
+            weight_utilization = (stats['total_cargo'] / max_weight_kg * 100.0) if max_weight_kg > 0 else 0.0
+            volume_utilization = (stats['total_loading'] / max_volume_m3 * 100.0) if max_volume_m3 > 0 else 0.0
+            # Linear length - estimate based on volume (rough approximation: 1 m³ ≈ 0.2m length)
+            estimated_linear_length = stats['total_loading'] * 0.18  # More conservative estimate
+            linear_length_utilization = (estimated_linear_length / max_linear_length_m * 100.0) if max_linear_length_m > 0 else 0.0
+            time_utilization = (total_time_hours / max_driving_hours * 100.0) if max_driving_hours > 0 else 0.0
+
+            # Create new dict with fresh data (never reuse references)
+            route_summary_dict = {
+                'route_id': int(route_seq_num),
                 'num_vendors': int(stats['num_vendors']),
                 'distance': float(round(stats['total_distance'], 1)),
                 'cargo': float(round(stats['total_cargo'] / 1000.0, 3)),  # tons
                 'loading': float(round(stats['total_loading'], 2)),
-                'segments': segments_with_names  # Add segment details with names
-            })
+                'total_time_hours': float(round(total_time_hours, 2)),
+                'segments': list(segments_with_names),  # Make explicit copy
+                # Utilization metrics
+                'weight_utilization': float(round(weight_utilization, 1)),
+                'volume_utilization': float(round(volume_utilization, 1)),
+                'linear_length_utilization': float(round(linear_length_utilization, 1)),
+                'time_utilization': float(round(time_utilization, 1)),
+                'max_weight_kg': float(round(max_weight_kg, 1)),
+                'max_volume_m3': float(round(max_volume_m3, 1)),
+                'max_linear_length_m': float(round(max_linear_length_m, 1)),
+                'max_driving_hours': float(round(max_driving_hours, 1)),
+            }
+
+            print(f'   Route {route_seq_num}: route_summary has {len(route_summary_dict["segments"])} segments')
+
+            route_summaries.append(route_summary_dict)
 
         # Build filter metadata (vendor names, delivery dates, route-vendor mappings, week options)
         vendor_routes_map = {}
@@ -613,9 +1121,9 @@ def optimize_routes():
                     vendor_date_map[vendor_id] = parsed_date.strftime('%Y-%m-%d')
 
             # Map routes to vendors (and vendors to routes for fast lookup)
-            for vehicle_id in sorted(route_stats.keys()):
+            for route_seq_num, vehicle_id in enumerate(sorted(route_stats.keys()), start=1):
                 vendors_seq = route_stats[vehicle_id].get('vendors', [])
-                route_number = int(vehicle_id + 1)
+                route_number = int(route_seq_num)
                 route_vendors_map[route_number] = [int(v) for v in vendors_seq]
 
                 for v in vendors_seq:
@@ -675,9 +1183,9 @@ def optimize_routes():
                     loading_meters = float(vendor_row[ldm_col])
                     break
             
-            max_ldms = network_params['max_ldms']
-            if loading_meters > max_ldms:
-                reasons.append(f'Loading exceeds capacity ({loading_meters:.1f} m > {max_ldms:.1f} m)')
+            max_volume = network_params['max_volume']
+            if loading_meters > max_volume:
+                reasons.append(f'Volume exceeds capacity ({loading_meters:.1f} m³ > {max_volume:.1f} m³)')
             
             # Check geocoding failure
             vendor_lat = vendor_row.get('vendor_latitude', 0)
@@ -728,7 +1236,8 @@ def optimize_routes():
             APP_STATE['time_matrix'] = net.time_distance_matrix.tolist() if hasattr(net.time_distance_matrix, 'tolist') else net.time_distance_matrix
             # Store capacities
             APP_STATE['max_capacity_kg'] = float(network_params['max_weight'] * 1000.0)
-            APP_STATE['max_ldms_vc'] = float(network_params['max_ldms'])
+            APP_STATE['max_volume'] = float(network_params['max_volume'])
+            APP_STATE['max_linear_length'] = float(network_params['max_linear_length'])
             # Store simple time windows based on requested delivery ±12h
             APP_STATE['min_date'] = str(net.min_date) if hasattr(net, 'min_date') else str(period[0])
             # Build earliest/latest arrays aligned to node index (0=depot placeholder)
@@ -844,7 +1353,8 @@ def add_stop_to_plan():
     - capacity_matrix: list of weights per node
     - loading_matrix: list of volumes per node
     - max_capacity_kg: vehicle capacity (kg)
-    - max_ldms_vc: vehicle volume capacity
+    - max_volume: vehicle volume capacity (m³)
+    - max_linear_length: vehicle linear length capacity (m)
     - frozen_prefix (optional): list of ints per route indicating immutable prefix length
     - allow_new_route (optional): bool
     """
@@ -852,7 +1362,7 @@ def add_stop_to_plan():
         payload = request.get_json(force=True, silent=False) or {}
         required = [
             'routes', 'new_stop', 'distance_matrix', 'capacity_matrix',
-            'loading_matrix', 'max_capacity_kg', 'max_ldms_vc'
+            'loading_matrix', 'max_capacity_kg', 'max_volume', 'max_linear_length'
         ]
         missing = [k for k in required if k not in payload]
         if missing:
@@ -864,7 +1374,8 @@ def add_stop_to_plan():
         capacity_matrix = payload['capacity_matrix']
         loading_matrix = payload['loading_matrix']
         max_capacity_kg = float(payload['max_capacity_kg'])
-        max_ldms_vc = float(payload['max_ldms_vc'])
+        max_volume = float(payload['max_volume'])
+        max_linear_length = float(payload['max_linear_length'])
         frozen_prefix = payload.get('frozen_prefix')
         allow_new_route = bool(payload.get('allow_new_route', True))
 
@@ -875,7 +1386,8 @@ def add_stop_to_plan():
             capacity_matrix=capacity_matrix,
             loading_matrix=loading_matrix,
             max_capacity_kg=max_capacity_kg,
-            max_ldms_vc=max_ldms_vc,
+            max_volume=max_volume,
+            max_linear_length=max_linear_length,
             frozen_prefix=frozen_prefix,
             allow_new_route=allow_new_route,
         )
@@ -940,7 +1452,8 @@ def add_stop_using_state():
             capacity_matrix=APP_STATE['capacity_matrix'],
             loading_matrix=APP_STATE['loading_matrix'],
             max_capacity_kg=APP_STATE.get('max_capacity_kg', 0.0),
-            max_ldms_vc=APP_STATE.get('max_ldms_vc', 0.0),
+            max_volume=APP_STATE.get('max_volume', 90.0),
+            max_linear_length=APP_STATE.get('max_linear_length', 16.1),
             frozen_prefix=frozen_prefix,
             allow_new_route=allow_new_route,
             time_matrix=APP_STATE.get('time_matrix'),
@@ -1234,4 +1747,5 @@ if __name__ == '__main__':
     print("🚀 Starting Parcel Delivery Optimizer Server...")
     print("📍 Open http://localhost:8080 in your browser")
     # Disable debug reloader for stable single-process listening
-    app.run(debug=False, use_reloader=False, host='0.0.0.0', port=8080, threaded=True)
+    # Bind to localhost to support both IPv4 (127.0.0.1) and IPv6 (::1)
+    app.run(debug=False, use_reloader=False, host='localhost', port=8080, threaded=True)

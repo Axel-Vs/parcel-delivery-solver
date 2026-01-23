@@ -552,7 +552,7 @@
             transform: translateY(-50%) !important;
             left: auto !important;
             bottom: auto !important;
-            width: 320px;
+            width: 400px;
             max-height: 80vh;
             overflow-y: auto;
             background: white;
@@ -1136,19 +1136,11 @@
                         </div>
 
                         <div class="param-group">
-                            <label class="param-label">Max Driving <span style="color: #9A9892;">Hours</span><span class="tooltip">ⓘ<span class="tooltiptext">Maximum continuous driving time per vehicle per day</span></span></label>
-                            <input type="number" class="param-input" id="maxDriving" value="15" min="1">
+                            <label class="param-label">Max Driving <span style="color: #9A9892;">Hours</span><span class="tooltip">ⓘ<span class="tooltiptext">Maximum driving time per vehicle (travel + service)</span></span></label>
+                            <input type="number" class="param-input" id="maxDriving" value="67" min="1">
                         </div>
 
-                        <div class="param-group">
-                            <label class="param-label">Driving Start <span style="color: #9A9892;">Hour</span></label>
-                            <input type="number" class="param-input" id="drivingStarts" value="6" min="0" max="23">
-                        </div>
 
-                        <div class="param-group">
-                            <label class="param-label">Driving Stop <span style="color: #9A9892;">Hour</span></label>
-                            <input type="number" class="param-input" id="drivingStop" value="21" min="0" max="23">
-                        </div>
 
                         <div class="param-group">
                             <label class="param-label">Max Weight <span style="color: #9A9892;">kg</span><span class="tooltip">ⓘ<span class="tooltiptext">Maximum cargo weight capacity per vehicle</span></span></label>
@@ -1156,8 +1148,13 @@
                         </div>
 
                         <div class="param-group">
-                            <label class="param-label">Max Loading Meters <span style="color: #9A9892;">m<sup style="font-size: 7px;">3</sup></span></label>
-                            <input type="number" class="param-input" id="maxLdms" value="70" min="1">
+                            <label class="param-label">Max Volume <span style="color: #9A9892;">m<sup style="font-size: 7px;">3</sup></span><span class="tooltip">ⓘ<span class="tooltiptext">Maximum cargo volume capacity per vehicle</span></span></label>
+                            <input type="number" class="param-input" id="maxVolume" value="90" min="1" step="0.1">
+                        </div>
+
+                        <div class="param-group">
+                            <label class="param-label">Max Linear Length <span style="color: #9A9892;">m</span><span class="tooltip">ⓘ<span class="tooltiptext">Maximum linear dimension per vehicle</span></span></label>
+                            <input type="number" class="param-input" id="maxLinearLength" value="16.1" min="1" step="0.1">
                         </div>
                     </div>
 
@@ -1374,6 +1371,38 @@
         </div>
     </div>
 
+    <!-- Max Driving Information Modal -->
+    <div class="modal" id="maxDrivingInfoModal">
+        <div class="modal-content" style="max-width: 500px;">
+            <div class="modal-title" style="color: #B39A7C; font-size: 16px;">⚠️ Max Driving Time Requirement</div>
+            <div style="color: var(--text-secondary); line-height: 1.8; font-size: 13px; margin-bottom: 16px;">
+                <p style="margin-bottom: 12px;">
+                    <strong>Your dataset requires a minimum max driving time of:</strong>
+                </p>
+                <div style="background: #FFF8F0; padding: 12px; border-radius: 8px; border-left: 4px solid #B39A7C; margin-bottom: 12px;">
+                    <div style="font-size: 16px; font-weight: 700; color: #9A6A68;" id="minDrivingValue">67 hours</div>
+                </div>
+                <p style="margin-bottom: 12px;">
+                    <strong>Why?</strong><br>
+                    The farthest vendor requires approximately <span id="travelTimeValue">65</span> hours one-way travel + 2 hours service time.
+                </p>
+                <p style="margin-bottom: 12px;">
+                    <strong>What happens if I set it lower?</strong><br>
+                    The optimization will fail because no vehicle can complete even a single delivery to the farthest vendor within the time constraint.
+                </p>
+                <p>
+                    <strong>Recommendation:</strong><br>
+                    Keep the default value of 67 hours or increase it for better route consolidation.
+                </p>
+            </div>
+            <div class="modal-buttons">
+                <button class="btn btn-primary" onclick="closeMaxDrivingInfo()" style="padding: 8px 16px; font-size: 11px;">
+                    I Understand
+                </button>
+            </div>
+        </div>
+    </div>
+
     <!-- Loading Overlay -->
     <div class="loading-overlay" id="loadingOverlay">
         <div class="loading-content">
@@ -1388,6 +1417,17 @@
         let csvFilepath = null;
         const API_BASE = window.location.origin;
         let activeRouteFilterSet = null;
+        let mapFrameReady = false;
+        let pendingRouteVisibility = null;
+        
+        // Helper: format hours (float) into "Xh Ym"
+        function formatHours(hours) {
+            if (hours === null || hours === undefined || isNaN(hours)) return '0h 0m';
+            const totalMinutes = Math.round(Number(hours) * 60);
+            const h = Math.floor(totalMinutes / 60);
+            const m = totalMinutes % 60;
+            return `${h}h ${m}m`;
+        }
         
         // Debug logging
         const debugLogs = [];
@@ -1503,6 +1543,37 @@
                     uploadLabel.textContent = '✓ File Uploaded';
                     uploadHint.textContent = file.name;
                     uploadLabel.style.color = 'var(--accent-success)';
+                    
+                    // Update optimization parameters based on data
+                    let paramUpdates = [];
+                    
+                    if (data.calculated_max_driving) {
+                        const maxDrivingInput = document.getElementById('maxDriving');
+                        maxDrivingInput.value = data.calculated_max_driving;
+                        paramUpdates.push(`max driving: ${data.calculated_max_driving}h`);
+                    }
+                    
+                    if (data.calculated_max_weight) {
+                        const maxWeightInput = document.getElementById('maxWeight');
+                        maxWeightInput.value = data.calculated_max_weight;
+                        paramUpdates.push(`max weight: ${data.calculated_max_weight}kg`);
+                    }
+                    
+                    if (data.calculated_max_volume) {
+                        const maxVolumeInput = document.getElementById('maxVolume');
+                        maxVolumeInput.value = data.calculated_max_volume;
+                        paramUpdates.push(`max volume: ${data.calculated_max_volume}m³`);
+                    }
+                    
+                    if (data.calculated_max_linear_length) {
+                        const maxLinearLengthInput = document.getElementById('maxLinearLength');
+                        maxLinearLengthInput.value = data.calculated_max_linear_length;
+                        paramUpdates.push(`max linear length: ${data.calculated_max_linear_length}m`);
+                    }
+                    
+                    if (paramUpdates.length > 0) {
+                        console.log(`✅ Updated parameters based on vendor data: ${paramUpdates.join(', ')}`);
+                    }
                     
                     // Update data summary
                     updateDataSummary();
@@ -1897,6 +1968,16 @@
                 return;
             }
 
+            // Check max_driving threshold
+            const maxDrivingValue = parseInt(document.getElementById('maxDriving').value);
+            if (maxDrivingValue < 69) {
+                // Show warning popup and update values
+                document.getElementById('travelTimeValue').textContent = Math.max(65, maxDrivingValue - 4);
+                document.getElementById('minDrivingValue').textContent = '69 hours';
+                showMaxDrivingInfo();
+                return;  // Don't proceed with optimization
+            }
+
             if (!validateParameters()) {
                 alert('Please fix parameter errors before optimizing');
                 return;
@@ -1924,10 +2005,9 @@
                             late_arv: parseInt(document.getElementById('lateArv').value),
                             loading: parseFloat(document.getElementById('loading').value),
                             max_driving: parseInt(document.getElementById('maxDriving').value),
-                            driving_starts: parseInt(document.getElementById('drivingStarts').value),
-                            driving_stop: parseInt(document.getElementById('drivingStop').value),
                             max_weight: parseInt(document.getElementById('maxWeight').value),
-                            max_ldms: parseInt(document.getElementById('maxLdms').value)
+                            max_volume: parseFloat(document.getElementById('maxVolume').value),
+                            max_linear_length: parseFloat(document.getElementById('maxLinearLength').value)
                         }
                     })
                 });
@@ -2002,6 +2082,10 @@
 
             // Statistics
             const stats = data.statistics;
+            
+            // Calculate total time across all routes
+            const totalTime = (data.routes || []).reduce((sum, route) => sum + (route.total_time_hours || 0), 0);
+            
             document.getElementById('statsGrid').innerHTML = `
                 <div class="stat-card">
                     <div class="stat-label">ROUTES</div>
@@ -2014,6 +2098,10 @@
                 <div class="stat-card">
                     <div class="stat-label">TOTAL DISTANCE</div>
                     <div class="stat-value">${stats.total_distance.toLocaleString()}<span class="stat-unit">km</span></div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">TOTAL TIME</div>
+                    <div class="stat-value">${formatHours(totalTime)}</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">TOTAL CARGO</div>
@@ -2031,6 +2119,8 @@
 
             // Map
             const mapFrame = document.getElementById('mapFrame');
+            mapFrameReady = false;
+            pendingRouteVisibility = null;
             mapFrame.src = data.map_url;
 
             // Initialize filters
@@ -2049,16 +2139,24 @@
                             </div>
                             <div class="route-metrics">
                                 <div class="metric-row">
-                                    <span class="metric-label">TOTAL DISTANCE</span>
+                                    <span class="metric-label">VENDORS</span>
+                                    <span class="metric-value">${route.num_vendors}</span>
+                                </div>
+                                <div class="metric-row">
+                                    <span class="metric-label">DISTANCE</span>
                                     <span class="metric-value">${route.distance.toLocaleString()} km</span>
+                                </div>
+                                <div class="metric-row">
+                                    <span class="metric-label">TIME</span>
+                                    <span class="metric-value">${formatHours(route.total_time_hours)}</span>
                                 </div>
                                 <div class="metric-row">
                                     <span class="metric-label">CARGO</span>
                                     <span class="metric-value">${route.cargo.toLocaleString()} kg</span>
                                 </div>
                                 <div class="metric-row">
-                                    <span class="metric-label">LOADING</span>
-                                    <span class="metric-value">${route.loading.toLocaleString()} m</span>
+                                    <span class="metric-label">VOLUME</span>
+                                    <span class="metric-value">${route.loading.toLocaleString()} m³</span>
                                 </div>
                             </div>
                         </div>
@@ -2201,7 +2299,12 @@
             updateRouteCardVisibility(routesToShow);
             
             // Update map route visibility
-            updateMapRouteVisibility(routesToShow);
+            if (!mapFrameReady) {
+                // Defer map updates until iframe finishes loading
+                pendingRouteVisibility = new Set(routesToShow);
+            } else {
+                updateMapRouteVisibility(routesToShow);
+            }
 
             // Update linked filter options so selections are related
             updateLinkedFilterOptions(metadata, routesToShow, { weekValue, vendorValue, routeValue });
@@ -2226,9 +2329,22 @@
         }
         
         function toggleRouteSegments(routeId) {
+            console.log('=== ROUTE CLICK DEBUG ===');
+            console.log('Route ID clicked:', routeId);
+            console.log('Window data available:', !!window.currentOptimizationData);
+            console.log('Routes array:', window.currentOptimizationData?.routes);
+            
             // Find the route data
             const route = window.currentOptimizationData?.routes?.find(r => r.route_id === routeId);
-            if (!route || !route.segments || route.segments.length === 0) return;
+            console.log('Route found:', route);
+            console.log('Route properties:', route ? Object.keys(route) : 'NO ROUTE');
+            console.log('Route total_time_hours:', route?.total_time_hours);
+            console.log('Route segments:', route?.segments);
+            
+            if (!route || !route.segments || route.segments.length === 0) {
+                console.log('EXIT: No route or segments');
+                return;
+            }
 
             // Check if popup already exists
             let popup = document.getElementById('routeDetailPopup');
@@ -2237,6 +2353,8 @@
             if (popup && popup.dataset.routeId === String(routeId)) {
                 popup.classList.remove('visible');
                 setTimeout(() => popup.remove(), 300);
+                // Clear highlighting on map
+                highlightRouteOnMap(routeId, false);
                 return;
             }
 
@@ -2244,6 +2362,9 @@
             if (popup) {
                 popup.remove();
             }
+            
+            // Highlight this route on the map
+            highlightRouteOnMap(routeId, true);
 
             // Create new popup - ALWAYS append to body to ensure fixed positioning
             popup = document.createElement('div');
@@ -2257,10 +2378,51 @@
             popup.style.top = '50%';
             popup.style.transform = 'translateY(-50%)';
 
+            // Helper function to get utilization color indicator
+            function getUtilizationIndicator(percentage) {
+                if (percentage < 80) return '🟢';
+                if (percentage >= 80 && percentage <= 95) return '🟡';
+                return '🔴';
+            }
+
             popup.innerHTML = `
                 <div class="route-detail-header">
                     <div class="route-detail-title">🚚 Route ${routeId}</div>
                     <button class="route-detail-close" onclick="closeRouteDetail()">✕</button>
+                </div>
+                <div style="margin-bottom: 16px; padding: 12px; background: rgba(0,0,0,0.02); border-radius: 8px;">
+                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; font-size: 12px;">
+                        <div><strong>Vendors:</strong> ${route.num_vendors}</div>
+                        <div><strong>Distance:</strong> ${route.distance.toLocaleString()} km</div>
+                        <div><strong>Time:</strong> ${formatHours(route.total_time_hours)}</div>
+                        <div><strong>Cargo:</strong> ${route.cargo.toLocaleString()} kg</div>
+                        <div><strong>Volume:</strong> ${route.loading.toLocaleString()} m³</div>
+                    </div>
+                </div>
+                <div style="margin-bottom: 16px; padding: 12px; background: rgba(179, 154, 124, 0.08); border-radius: 8px; border-left: 3px solid #B39A7C;">
+                    <div style="font-weight: 600; font-size: 12px; color: #666; margin-bottom: 8px;">📊 CAPACITY UTILIZATION</div>
+                    <div style="display: grid; grid-template-columns: 1fr; gap: 6px; font-size: 11px;">
+                        <div style="display: flex; justify-content: space-between;">
+                            <span>Weight:</span>
+                            <span><strong>${getUtilizationIndicator(route.weight_utilization || 0)} ${(route.weight_utilization || 0).toFixed(1)}%</strong> (${route.cargo.toLocaleString()} / ${(route.max_weight_kg/1000).toFixed(1)} t)</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between;">
+                            <span>Volume:</span>
+                            <span><strong>${getUtilizationIndicator(route.volume_utilization || 0)} ${(route.volume_utilization || 0).toFixed(1)}%</strong> (${route.loading.toFixed(1)} / ${route.max_volume_m3 || 90} m³)</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between;">
+                            <span>Linear length:</span>
+                            <span><strong>${getUtilizationIndicator(route.linear_length_utilization || 0)} ${(route.linear_length_utilization || 0).toFixed(1)}%</strong> (est. ${(route.loading * 0.18).toFixed(1)} / ${route.max_linear_length_m || 16.1} m)</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between;">
+                            <span>Driving hours:</span>
+                            <span><strong>${getUtilizationIndicator(route.time_utilization || 0)} ${(route.time_utilization || 0).toFixed(1)}%</strong> (${formatHours(route.total_time_hours)} / ${formatHours(route.max_driving_hours || 69)})</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; padding-top: 4px; border-top: 1px solid rgba(0,0,0,0.1);">
+                            <span>Stops:</span>
+                            <span><strong>${route.num_vendors}</strong></span>
+                        </div>
+                    </div>
                 </div>
                 <div style="margin-bottom: 16px;">
                     <div style="font-weight: 600; font-size: 13px; color: #666; margin-bottom: 8px;">ROUTE SEGMENTS</div>
@@ -2268,16 +2430,28 @@
                         <div class="route-detail-segment">
                             <div class="route-detail-segment-title">
                                 ${seg.from} → ${seg.to}
+                                ${seg.warning ? `<div style="color: #B39A7C; font-size: 10px; margin-top: 4px;">${seg.warning}</div>` : ''}
                             </div>
                             <div class="route-detail-segment-info">
-                                <div>📏 Distance: ${seg.distance.toFixed(1)} km</div>
-                                <div>⏱️ Duration: ${seg.duration.toFixed(2)} hrs</div>
-                                <div class="full-width">💨 Avg Speed: ${seg.avg_speed.toFixed(0)} km/h</div>
+                                ${seg.distance > 0 ? `<div>📏 Distance: ${seg.distance.toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1})} km</div>` : ''}
+                                ${seg.duration > 0 ? `<div>⏱️ Duration: ${seg.duration.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} hrs</div>` : ''}
+                                ${seg.service_time_hours > 0 ? `<div>🛠️ Loading: ${seg.service_time_hours.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} hrs</div>` : ''}
+                                <div>📦 Cargo: ${seg.cargo_kg ? seg.cargo_kg.toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1}) : '0.0'} kg</div>
+                                <div>📐 Volume: ${seg.volume_m3 ? seg.volume_m3.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '0.00'} m³</div>
+                                ${seg.is_depot_destination ? 
+                                    `<div class="full-width">📅 Requested delivery (depot): ${seg.requested_depot_delivery || 'N/A'}</div>
+                                     <div class="full-width">⏱️ Expected arrival (depot): ${seg.expected_arrival || 'N/A'}</div>` :
+                                    `<div class="full-width">📅 Requested pickup (vendor): ${seg.requested_vendor_pickup || seg.pickup_date || 'N/A'}</div>
+                                     <div class="full-width">⏱️ Expected arrival (vendor): ${seg.expected_arrival || 'N/A'}</div>`
+                                }
                             </div>
                         </div>
                     `).join('')}
                 </div>
             `;
+            
+            console.log('Popup HTML created with time:', formatHours(route.total_time_hours));
+            console.log('=== END ROUTE CLICK DEBUG ===');
 
             // Always append directly to body, not any container
             document.body.appendChild(popup);
@@ -2291,6 +2465,59 @@
             if (popup) {
                 popup.classList.remove('visible');
                 setTimeout(() => popup.remove(), 300);
+            }
+        }
+
+        function highlightRouteOnMap(routeId, shouldHighlight) {
+            const mapFrame = document.getElementById('mapFrame');
+            if (!mapFrame || !mapFrame.contentWindow) {
+                console.warn('Map frame not available');
+                return;
+            }
+
+            try {
+                const mapWin = mapFrame.contentWindow;
+                const map = mapWin.routeMap || findIframeMap(mapWin);
+                
+                if (!map) {
+                    console.warn('Map not found in iframe');
+                    return;
+                }
+
+                console.log(`${shouldHighlight ? 'Highlighting' : 'Unhighlighting'} route ${routeId} on map`);
+                
+                // Find all polylines with this route ID and click the first one to trigger highlighting
+                let targetPolyline = null;
+                map.eachLayer(function(layer) {
+                    if (layer instanceof L.Polyline && layer._routeId && layer._routeId === String(routeId)) {
+                        targetPolyline = layer;
+                        return false; // Stop searching once we find one
+                    }
+                });
+                
+                if (targetPolyline) {
+                    if (shouldHighlight) {
+                        // Simulate a click on this polyline to trigger the highlighting logic
+                        targetPolyline.fire('click', {
+                            latlng: targetPolyline.getLatLngs()[0],
+                            target: targetPolyline
+                        });
+                        console.log(`✓ Triggered click on route ${routeId} polyline`);
+                    } else {
+                        // Click again to deselect
+                        if (targetPolyline._highlighted) {
+                            targetPolyline.fire('click', {
+                                latlng: targetPolyline.getLatLngs()[0],
+                                target: targetPolyline
+                            });
+                            console.log(`✓ Deselected route ${routeId}`);
+                        }
+                    }
+                } else {
+                    console.warn(`No polylines found for route ${routeId}`);
+                }
+            } catch (e) {
+                console.warn('Error highlighting route on map:', e);
             }
         }
 
@@ -2369,7 +2596,10 @@
             const mapFrame = document.getElementById('mapFrame');
             if (mapFrame) {
                 mapFrame.addEventListener('load', () => {
-                    setTimeout(() => updateMapRouteVisibility(activeRouteFilterSet || new Set()), 800);
+                    mapFrameReady = true;
+                    const targetVisibility = pendingRouteVisibility || activeRouteFilterSet || new Set();
+                    pendingRouteVisibility = null;
+                    setTimeout(() => updateMapRouteVisibility(targetVisibility), 800);
                 });
             }
         });
@@ -2716,6 +2946,7 @@
                     <div style="font-weight: 600; margin-bottom: 8px;">Route ${routeData.route_id}</div>
                     <div style="font-size: 11px; color: var(--text-muted);">
                         Distance: ${routeData.distance} km | 
+                        Time: ${formatHours(routeData.total_time_hours)} | 
                         Cargo: ${routeData.cargo} kg | 
                         Stops: ${routeData.stops || 0}
                     </div>
@@ -2735,6 +2966,14 @@
 
         function closeRouteDetails() {
             document.getElementById('routeDetailsModal').classList.remove('show');
+        }
+
+        function showMaxDrivingInfo() {
+            document.getElementById('maxDrivingInfoModal').classList.add('show');
+        }
+
+        function closeMaxDrivingInfo() {
+            document.getElementById('maxDrivingInfoModal').classList.remove('show');
         }
 
         // Undo/Redo Functions

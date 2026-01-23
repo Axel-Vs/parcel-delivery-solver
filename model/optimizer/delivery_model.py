@@ -2,6 +2,8 @@
 import os
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta
+import pandas as pd
 
 # Determine the project root directory
 project_root = Path(__file__).resolve().parent.parent
@@ -10,7 +12,6 @@ sys.path.append(str(project_root))
 # Import required modules
 from utils.project_utils import *
 from ortools.linear_solver import pywraplp
-from pyqubo import Array, Constraint, Placeholder
 
 # Import metaheuristic solvers
 try:
@@ -25,7 +26,8 @@ except ImportError:
 class DeliveryOptimizer:
     def __init__(self, evaluation_period, discretization_constant, time_expanded_network, time_expanded_network_index,
                  Tau_hours, distance_matrix, time_distance_matrix, disc_time_distance_matrix, capacity_matrix, loading_matrix,
-                 max_capacity, max_ldms, max_driving, is_gap, mip_gap, maximum_minutes, vendors_df=None):
+                 max_capacity, max_volume, max_linear_length, max_driving, is_gap, mip_gap, maximum_minutes,
+                 service_time_matrix=None, vendors_df=None):
         # Log information about the MIP model setup
         log.info('Defining MIP model... ')
 
@@ -40,9 +42,11 @@ class DeliveryOptimizer:
         self.disc_time_distance_matrix = disc_time_distance_matrix
         self.capacity_matrix = capacity_matrix
         self.loading_matrix = loading_matrix
+        self.service_time_matrix = service_time_matrix if service_time_matrix is not None else np.zeros(len(distance_matrix))
         self.vendors_df = vendors_df
 
         # Calculate derived attributes
+        self.max_driving_hours = max_driving
         self.des_max_driving = max_driving / discretization_constant
         self.length = len(self.distance_matrix)
         self.max_num_vehicles = self.length - 1
@@ -54,8 +58,17 @@ class DeliveryOptimizer:
         # Set maximum capacity and load limits for vehicles
         self.max_capacity = max_capacity
         self.max_capacity_kg = [max_capacity * 1000] * self.max_num_vehicles
-        self.max_ldms = max_ldms
-        self.max_ldms_vc = [max_ldms] * self.max_num_vehicles
+        self.max_volume = max_volume
+        self.max_volume_vc = [max_volume] * self.max_num_vehicles
+        self.max_linear_length = max_linear_length
+        self.max_linear_length_vc = [max_linear_length] * self.max_num_vehicles
+        
+        # Service time per stop in hours (for time calculations)
+        # If service_time_matrix is provided, extract the service time per stop in minutes (excluding depot at index 0)
+        if self.service_time_matrix is not None and len(self.service_time_matrix) > 1:
+            self.service_time_hours_per_stop = self.service_time_matrix[1] / 60.0  # Convert minutes to hours
+        else:
+            self.service_time_hours_per_stop = 0
 
         # Initialize solution containers
         self.connections_solution = None
@@ -95,7 +108,8 @@ class DeliveryOptimizer:
                 self.max_num_vehicles += 2
 
                 self.max_capacity_kg = [self.max_capacity*1000] * self.max_num_vehicles
-                self.max_ldms_vc = [self.max_ldms] * self.max_num_vehicles
+                self.max_volume_vc = [self.max_volume] * self.max_num_vehicles
+                self.max_linear_length_vc = [self.max_linear_length] * self.max_num_vehicles
             else:    
                 print('No solution found, last num. vehicles considered:', self.max_num_vehicles)
                 break
@@ -129,13 +143,31 @@ class DeliveryOptimizer:
             print('\n🚀 Using ALNS metaheuristic solver (fast mode)')
             print(f'   - Network size: {len(self.time_expanded_network)} arcs, {self.length} nodes')
         
-        # Create ALNS solver with balanced parameters
+        # Create ALNS solver with dynamically tuned parameters based on problem size
+        vendors = max(0, self.length - 1)
+        if vendors >= 60:
+            min_removal, max_removal = 0.25, 0.55
+            initial_T, cooling = 2500, 0.998
+            ls_iters = 500
+        elif vendors >= 30:
+            min_removal, max_removal = 0.20, 0.50
+            initial_T, cooling = 2000, 0.9975
+            ls_iters = 350
+        elif vendors >= 20:
+            min_removal, max_removal = 0.15, 0.45
+            initial_T, cooling = 1500, 0.997
+            ls_iters = 250
+        else:
+            min_removal, max_removal = 0.12, 0.40
+            initial_T, cooling = 1200, 0.996
+            ls_iters = 200
+
         alns_config = {
             'max_iterations': max_iterations,
-            'min_removal_size': 0.15,
-            'max_removal_size': 0.45,
-            'initial_temperature': 1500,
-            'cooling_rate': 0.997
+            'min_removal_size': min_removal,
+            'max_removal_size': max_removal,
+            'initial_temperature': initial_T,
+            'cooling_rate': cooling
         }
         
         alns = ALNSSolver(
@@ -144,11 +176,15 @@ class DeliveryOptimizer:
             time_matrix=self.time_distance_matrix,
             capacity_matrix=self.capacity_matrix,
             loading_matrix=self.loading_matrix,
+            service_time_matrix=self.service_time_matrix,
             max_capacity_kg=self.max_capacity_kg,
-            max_ldms_vc=self.max_ldms_vc,
+            max_volume=self.max_volume_vc,
+            max_linear_length=self.max_linear_length_vc,
             discretization_constant=self.discretization_constant,
             min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
-            config=alns_config
+            max_driving_hours=self.max_driving_hours,
+            config=alns_config,
+            evaluation_period=self.evaluation_period
         )
         
         # Solve with ALNS
@@ -157,7 +193,7 @@ class DeliveryOptimizer:
         # Apply local search improvement
         if verbose:
             print('   - Applying local search improvement...')
-        solution = LocalSearchOperators.improve_solution(solution, max_iterations=100)
+        solution = LocalSearchOperators.improve_solution(solution, max_iterations=ls_iters)
         
         # Check feasibility
         is_feasible = solution.is_feasible(check_all=True)
@@ -170,6 +206,56 @@ class DeliveryOptimizer:
                 print(f'   ✗ Solution infeasible: {len(solution._constraint_violations)} violations')
                 for violation in solution._constraint_violations[:5]:
                     print(f'     - {violation}')
+                
+                # Smart fallback: Split only violated routes, keep feasible ones
+                print(f'   🔧 Fixing {len(solution._constraint_violations)} violated routes...')
+                violated_route_ids = set()
+                for violation in solution._constraint_violations:
+                    # Extract route number from violation message
+                    if 'Route' in violation:
+                        try:
+                            route_id = int(violation.split('Route')[1].split(':')[0].strip())
+                            violated_route_ids.add(route_id)
+                        except:
+                            pass
+                
+                # Rebuild solution: keep good routes, split violated ones
+                new_routes = []
+                for route_idx, route in enumerate(solution.routes):
+                    if route_idx in violated_route_ids:
+                        # Split violated route into single-vendor routes
+                        vendors_in_route = [v for v in route if v != 0]
+                        for vendor in vendors_in_route:
+                            new_routes.append([0, vendor, 0])
+                        if verbose:
+                            print(f'      → Split Route {route_idx}: {len(vendors_in_route)} vendors → {len(vendors_in_route)} routes')
+                    else:
+                        # Keep feasible route as is
+                        new_routes.append(route)
+                
+                solution = RouteSolution(
+                    routes=new_routes,
+                    vendors_df=self.vendors_df,
+                    distance_matrix=self.distance_matrix,
+                    time_matrix=self.time_distance_matrix,
+                    capacity_matrix=self.capacity_matrix,
+                    loading_matrix=self.loading_matrix,
+                    service_time_matrix=self.service_time_matrix,
+                    max_capacity_kg=self.max_capacity_kg,
+                    max_volume=self.max_volume_vc,
+                    max_linear_length=self.max_linear_length_vc,
+                    discretization_constant=self.discretization_constant,
+                    min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
+                    max_driving_hours=self.max_driving_hours,
+                    evaluation_period=self.evaluation_period
+                )
+                is_feasible = solution.is_feasible(check_all=True)
+                if is_feasible:
+                    status = 0
+                    print(f'   ✓ Fixed solution: {solution.get_num_routes()} routes (kept {len(solution.routes) - len(violated_route_ids) * 10} good routes)')
+                else:
+                    status = 2
+                    print(f'   ✗ Still infeasible after fix!')
         
         # Convert route solution to MIP-style x and y matrices for compatibility
         x, y = self._convert_routes_to_mip_format(solution)
@@ -290,6 +376,22 @@ class DeliveryOptimizer:
         for k in range(self.max_num_vehicles):
             self.model.Add( sum( self.x[k][ j[0][0] ][ j[0][1] ][ j[1][0] ][ j[1][1] ] for j in index_zero_ins ) == self.y[k] )  # every vehicle has to be used and return to 0
             self.model.Add( sum( self.capacity_matrix[self.time_expanded_network[j][0][0]] * self.x[k][ self.time_expanded_network[j][0][0] ][ self.time_expanded_network[j][0][1] ][ self.time_expanded_network[j][1][0] ][ self.time_expanded_network[j][1][1] ] for j in range(0, len(self.time_expanded_network))) <= self.y[k] * self.max_capacity_kg[k] ) 
+            
+            # Driving time cap (hours) per vehicle
+            # Exclude depot→vendor edges (source node = 0) to only count return travel + inter-vendor
+            # Add service time: count non-depot nodes visited
+            travel_time = sum( 
+                ( self.time_distance_matrix[self.time_expanded_network[j][0][0]][self.time_expanded_network[j][1][0]] / 3600.0 ) * 
+                self.x[k][ self.time_expanded_network[j][0][0] ][ self.time_expanded_network[j][0][1] ][ self.time_expanded_network[j][1][0] ][ self.time_expanded_network[j][1][1] ] 
+                for j in range(0, len(self.time_expanded_network)) 
+                if self.time_expanded_network[j][0][0] != 0  # Skip depot→vendor edges
+            )
+            service_time = sum(
+                self.service_time_hours_per_stop * self.x[k][ self.time_expanded_network[j][0][0] ][ self.time_expanded_network[j][0][1] ][ self.time_expanded_network[j][1][0] ][ self.time_expanded_network[j][1][1] ]
+                for j in range(0, len(self.time_expanded_network))
+                if self.time_expanded_network[j][0][0] != 0  # Service time only for non-depot sources
+            )
+            self.model.Add( travel_time + service_time <= self.y[k] * self.max_driving_hours )
             for vals in all_duples:
                 if vals[0] != 0:
                     self.model.Add( sum( self.x[k][ self.time_expanded_network[j][0][0] ][ self.time_expanded_network[j][0][1] ][ self.time_expanded_network[j][1][0] ][ self.time_expanded_network[j][1][1] ] for j in index_out[vals]) - sum( self.x[k][ self.time_expanded_network[j][0][0] ][self.time_expanded_network[j][0][1]][self.time_expanded_network[j][1][0]][self.time_expanded_network[j][1][1]] for j in index_ins[vals]) == 0 )                
@@ -982,8 +1084,9 @@ class DeliveryOptimizer:
             node_info[0] = {'name': 'Depot (Seattle)', 'type': 'depot'}
             print(f'📍 Depot coordinates: {depot_lat}, {depot_lon}')
         
-        # Vendors are nodes 1, 2, 3, ... (node_id = dataframe_index)
-        for node_id, row in self.vendors_df.iterrows():
+        # Vendors are nodes 1, 2, 3, ... (node_id = dataframe_index + 1, since depot is node 0)
+        for df_idx, row in self.vendors_df.iterrows():
+            node_id = df_idx + 1  # Shift by 1 since depot is node 0
             vendor_lat = row.get('vendor_latitude', None)
             vendor_lon = row.get('vendor_longitude', None)
             vendor_name = row.get('vendor Name', f'Vendor {node_id}')
@@ -1030,8 +1133,29 @@ class DeliveryOptimizer:
         # Fit map to show all points with extra padding for better overview
         m.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]], padding=[100, 100])
         
-        # Define aesthetic colors for each vehicle (modern, slightly darker palette)
-        colors = ['#C0392B', '#2980B9', '#27AE60', '#8E44AD', '#D68910', '#16A085', '#CA6F1E', '#2C3E50']
+        # Define elegant color palette for routes (high saturation, distinct hues)
+        colors = [
+            '#E74C3C',  # Vibrant Red
+            '#3498DB',  # Bright Blue
+            '#2ECC71',  # Emerald Green
+            '#F39C12',  # Golden Orange
+            '#9B59B6',  # Purple
+            '#1ABC9C',  # Turquoise
+            '#E67E22',  # Dark Orange
+            '#34495E',  # Slate Blue
+            '#C0392B',  # Dark Red
+            '#16A085',  # Sea Green
+            '#D35400',  # Burnt Orange
+            '#8E44AD',  # Vivid Purple
+            '#2980B9',  # Ocean Blue
+            '#27AE60',  # Green
+            '#D68910',  # Brown Orange
+            '#CA6F1E',  # Tan Orange
+            '#C70039',  # Crimson
+            '#0099CC',  # Cyber Blue
+            '#33CC33',  # Lime Green
+            '#FF9900',  # Web Orange
+        ]
         
         # Extract routes for each vehicle (excluding depot→vendor arcs) and calculate stats
         routes = {}
@@ -1088,6 +1212,14 @@ class DeliveryOptimizer:
                 seen = set()
                 route_path = [x for x in route_path if not (x in seen or seen.add(x))]
                 
+                # Additional pass: remove consecutive duplicates (shouldn't happen but failsafe)
+                if route_path:
+                    cleaned_route = [route_path[0]]
+                    for i in range(1, len(route_path)):
+                        if route_path[i] != route_path[i-1]:
+                            cleaned_route.append(route_path[i])
+                    route_path = cleaned_route
+                
                 routes[k] = route_path
                 
                 # Calculate vehicle statistics
@@ -1097,9 +1229,14 @@ class DeliveryOptimizer:
                 vendors_visited = []
                 segments = []  # Store segment details for route card display
                 
+                cumulative_time_hours = 0.0
                 for i in range(len(route_path) - 1):
                     node_from = route_path[i]
                     node_to = route_path[i + 1]
+                    
+                    # Skip invalid segments (same node to itself)
+                    if node_from == node_to:
+                        continue
                     
                     # Add cargo and loading from vendor nodes
                     if node_from != 0:
@@ -1120,15 +1257,95 @@ class DeliveryOptimizer:
                         
                         # Calculate average speed
                         avg_speed = seg_distance / seg_duration if seg_duration > 0 else 0
-                        
-                        # Store segment details
+
+                        # Expected arrival time at destination (hours since route start)
+                        arrival_hours = cumulative_time_hours + seg_duration
+                        arrival_iso = None
+                        base_dt = None
+                        min_dt = getattr(self, 'min_date', None)
+
+                        # Parse the optimizer's min_date once (fallback baseline)
+                        if min_dt is not None:
+                            # First try pandas Timestamp
+                            if hasattr(min_dt, 'to_pydatetime'):
+                                try:
+                                    base_dt = min_dt.to_pydatetime()
+                                except Exception as e:
+                                    print(f"⚠️ Warning: to_pydatetime failed: {e}")
+                                    base_dt = None
+
+                            # Second try: string formats
+                            if base_dt is None and isinstance(min_dt, str):
+                                for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d', '%Y-%m-%dT%H:%M:%S'):
+                                    try:
+                                        base_dt = datetime.strptime(min_dt, fmt)
+                                        break
+                                    except ValueError:
+                                        continue
+                                if base_dt is None:
+                                    try:
+                                        base_dt = datetime.fromisoformat(min_dt)
+                                    except (ValueError, AttributeError):
+                                        pass
+
+                        # Optional: try to align arrival to the vendor's requested pickup/delivery window
+                        vendor_dt = None
+                        if node_to != 0 and self.vendors_df is not None:
+                            try:
+                                vendor_row = self.vendors_df.iloc[int(node_to) - 1]
+                                raw_candidates = [
+                                    vendor_row.get('Requested Loading', None),
+                                    vendor_row.get('Requested Loading Date', None),
+                                    vendor_row.get('Requested Delivery', None),
+                                    vendor_row.get('Requested Delivery Date', None),
+                                ]
+                                for raw_dt in raw_candidates:
+                                    parsed = pd.to_datetime(raw_dt, errors='coerce')
+                                    if pd.notna(parsed):
+                                        vendor_dt = parsed.to_pydatetime()
+                                        break
+                            except Exception:
+                                vendor_dt = None
+
+                        # Compute candidate arrival time
+                        candidate_dt = None
+                        if base_dt is not None:
+                            candidate_dt = base_dt + timedelta(hours=arrival_hours)
+                        elif vendor_dt is not None:
+                            # Fall back to vendor requested time if base is unavailable
+                            candidate_dt = vendor_dt
+
+                        # Enforce a not-earlier-than window of 24h before requested time (if available)
+                        if vendor_dt is not None and candidate_dt is not None:
+                            earliest_allowed = vendor_dt - timedelta(hours=24)
+                            candidate_dt = max(candidate_dt, earliest_allowed)
+
+                        if candidate_dt is not None:
+                            arrival_iso = candidate_dt.strftime('%Y-%m-%d %H:%M:%S')
+                        elif min_dt is not None:
+                            # Debug: min_dt exists but base_dt is None - conversion failed
+                            print(f"⚠️ Warning: Could not convert min_date to datetime. min_date={min_dt} (type: {type(min_dt).__name__})")
+
+
+                        # Service time at destination (hours)
+                        service_time_hours_node = 0.0
+                        if hasattr(self, 'service_time_matrix') and self.service_time_matrix is not None:
+                            if node_to < len(self.service_time_matrix):
+                                service_time_hours_node = self.service_time_matrix[node_to] / 60.0
+
+                        # Store segment details (only valid segments with different nodes)
                         segments.append({
                             'from_id': node_from,
                             'to_id': node_to,
                             'distance': seg_distance,
                             'duration': seg_duration,
-                            'avg_speed': avg_speed
+                            'avg_speed': avg_speed,
+                            'arrival_hours': arrival_hours,
+                            'arrival_time': arrival_iso
                         })
+
+                        # Advance cumulative time (travel + service at destination)
+                        cumulative_time_hours = arrival_hours + service_time_hours_node
                 
                 route_stats[k] = {
                     'total_cargo': total_cargo,
@@ -1289,8 +1506,8 @@ class DeliveryOptimizer:
                                         color=color,
                                         weight=5,
                                         opacity=0.9,
-                                        popup=folium.Popup(popup_html, max_width=280),
-                                        smooth_factor=2.0
+                                        smooth_factor=2.0,
+                                        class_name=f'route-{route_number}'
                                     ).add_to(vehicle_group)
                             else:
                                 raise Exception("No route found")
@@ -1306,14 +1523,16 @@ class DeliveryOptimizer:
                             weight=3,
                             opacity=0.4,
                             dash_array='10, 10',
-                            popup=f'Route {route_number}: {node_info[node_from]["name"]} → {node_info[node_to]["name"]} (Direct line - routing unavailable)',
-                            tooltip=f'V{vehicle_id}: Direct line'
+                            tooltip=f'V{vehicle_id}: Direct line',
+                            class_name=f'route-{route_number}'
                         ).add_to(vehicle_group)
             
             # Add route group to map
             vehicle_group.add_to(m)
         
         # Add markers for all nodes with clear differentiation
+        log.info(f'📍 Starting to add node markers... Total nodes to process: {len(coords)}')
+        vendor_markers_added = 0
         for node_id, (lat, lon) in coords.items():
             info = node_info[node_id]
             
@@ -1351,7 +1570,6 @@ class DeliveryOptimizer:
                     fill=False,
                     weight=3,
                     opacity=0.8,
-                    popup=folium.Popup(popup_html, max_width=300),
                     tooltip=folium.Tooltip('<b style="font-size: 14px;">🏭 Distribution Center</b>', direction='auto')
                 ).add_to(m)
                 
@@ -1390,6 +1608,8 @@ class DeliveryOptimizer:
                 vendor_colors_hex = ['#2980B9', '#27AE60', '#8E44AD', '#D68910', '#16A085', '#CA6F1E']
                 vendor_color_hex = vendor_colors_hex[(node_id - 1) % len(vendor_colors_hex)]
                 
+                log.info(f'🏭 Processing vendor marker for node_id={node_id}, lat={lat}, lon={lon}, name={info["name"]}')
+                
                 # Get cargo and loading for this vendor
                 vendor_cargo = self.capacity_matrix[node_id] if node_id < len(self.capacity_matrix) else 0
                 vendor_loading = self.loading_matrix[node_id] if node_id < len(self.loading_matrix) else 0
@@ -1398,78 +1618,26 @@ class DeliveryOptimizer:
                 visit_info = vendor_visits.get(node_id, {})
                 assigned_vehicle = visit_info.get('vehicle', 'N/A')
                 assigned_route = visit_info.get('route_number', 'N/A')
-                visit_step = visit_info.get('step', 'N/A')
-                total_vendor_stops = visit_info.get('total_steps', 'N/A')
-                
-                popup_html = f"""
-                <div style="font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; width: 300px;">
-                    <div style="background: {vendor_color_hex}; 
-                                color: white; padding: 20px; border-radius: 12px 12px 0 0; 
-                                margin: -15px -15px 15px -15px;">
-                        <div style="display: flex; align-items: center; gap: 14px;">
-                            <div style="background: rgba(255,255,255,0.15); padding: 11px; border-radius: 10px; 
-                                        font-size: 22px; width: 48px; height: 48px; display: flex; 
-                                        align-items: center; justify-content: center; backdrop-filter: blur(4px);">
-                                🏭
-                            </div>
-                            <div>
-                                <div style="font-size: 11px; opacity: 0.85; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">VENDOR {node_id}</div>
-                                <h4 style="margin: 5px 0 0 0; font-size: 15px; font-weight: 600; letter-spacing: -0.01em;">{info['name']}</h4>
-                            </div>
-                        </div>
-                    </div>
-                    <div style="padding: 16px;">
-                        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px; 
-                                    padding: 10px; background: #f8f9fa; border-radius: 8px;">
-                            <span style="font-size: 20px;">📍</span>
-                            <div>
-                                <div style="font-size: 14px; font-weight: 600; color: #2c3e50;">{info['city']}</div>
-                                <div style="font-size: 12px; color: #7f8c8d;">ZIP: {info['plz']}</div>
-                            </div>
-                        </div>
-                        <div style="background: #F8F7F4; padding: 12px 14px; border-radius: 10px; margin-bottom: 14px; border: 1px solid #E8E6E0;">
-                            <div style="font-size: 11px; color: #5A7A65; font-weight: 600; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px;">
-                                📦 CARGO TO PICKUP
-                            </div>
-                            <div style="display: flex; justify-content: space-between; align-items: center;">
-                                <div style="flex: 1;">
-                                    <div style="font-size: 12px; color: #9A9892; margin-bottom: 4px; font-weight: 500;">Weight:</div>
-                                    <div style="font-size: 17px; font-weight: 600; color: #2C2B28;">{vendor_cargo:,.0f} kg</div>
-                                </div>
-                                <div style="width: 1px; height: 32px; background: #E8E6E0; margin: 0 12px;"></div>
-                                <div style="flex: 1;">
-                                    <div style="font-size: 12px; color: #9A9892; margin-bottom: 4px; font-weight: 500;">Volume:</div>
-                                    <div style="font-size: 17px; font-weight: 600; color: #2C2B28;">{vendor_loading:,.1f} m³</div>
-                                </div>
-                            </div>
-                        </div>
-                        <div style="background: linear-gradient(90deg, {vendor_color_hex}20 0%, {vendor_color_hex}05 100%); 
-                                    padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; border: 1px solid {vendor_color_hex}40;">
-                            <div style="font-size: 11px; color: {vendor_color_hex}; font-weight: 600; margin-bottom: 6px;">
-                                🚚 SOLUTION STAGE
-                            </div>
-                            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #2c3e50;">
-                                <div>
-                                    <span style="color: #777;">Assigned to:</span>
-                                    <b style="margin-left: 4px;">Route {assigned_route}</b>
-                                </div>
-                                <div style="background: {vendor_color_hex}; color: white; padding: 4px 10px; 
-                                            border-radius: 12px; font-weight: 600; font-size: 11px;">
-                                    Stop {visit_step}/{total_vendor_stops}
-                                </div>
-                            </div>
-                        </div>
-                        <div style="background: linear-gradient(90deg, {vendor_color_hex}15 0%, transparent 100%); 
-                                    padding: 8px 12px; border-left: 3px solid {vendor_color_hex}; border-radius: 4px;">
-                            <p style="margin: 0; font-size: 12px; color: #555;">
-                                <b>Pickup Location</b> • Active Route
-                            </p>
-                        </div>
-                    </div>
+                # Create vendor marker with blue teardrop pin
+                pin_html = '''
+                <div style="position: relative; width: 20px; height: 28px;">
+                    <svg width="20" height="28" viewBox="0 0 30 40" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M15,0 C8.373,0 3,5.373 3,12 C3,20.25 15,40 15,40 C15,40 27,20.25 27,12 C27,5.373 21.627,0 15,0 Z" 
+                              fill="#1976D2" stroke="#1565C0" stroke-width="1"/>
+                        <circle cx="15" cy="12" r="6" fill="white"/>
+                    </svg>
                 </div>
-                """
+                '''
+                folium.Marker(
+                    location=[lat, lon],
+                    tooltip=folium.Tooltip(f'<b>{info["name"]}</b><br>{info["city"]}', direction='top'),
+                    icon=folium.DivIcon(html=pin_html, icon_size=(20, 28), icon_anchor=(10, 28))
+                ).add_to(m)
                 
-                
+                log.info(f'✅ Vendor marker added to map: {info["name"]} at ({lat}, {lon})')
+                vendor_markers_added += 1
+        
+        log.info(f'✅ COMPLETE: All node markers processed (1 depot + {vendor_markers_added} vendors added)')
         
         # Add fullscreen button
         plugins.Fullscreen(position='topleft', title='Fullscreen', titleCancel='Exit Fullscreen').add_to(m)
@@ -1491,6 +1659,8 @@ class DeliveryOptimizer:
         ).add_to(m)
         
         # Mini map removed per user request
+        
+        log.info(f'✅ COMPLETE: All node markers added to map (1 depot + {num_vendors} vendors)')
         
         # Calculate total distance across all routes
         total_distance = sum(stats['total_distance'] for stats in route_stats.values())
@@ -1772,13 +1942,14 @@ class DeliveryOptimizer:
         m.get_root().html.add_child(folium.Element(expose_layers_js))
         
         # Add comprehensive route highlighting JavaScript handler
-        route_highlight_js = f"""
+        route_highlight_js = rf"""
         <script>
         (function() {{
             console.log('%c[ROUTE HIGHLIGHT] INITIALIZING', 'color: #FFD700; font-weight: bold; font-size: 14px;');
             console.log('Waiting for window.routeMap...');
             
             var maxWait = 0;
+            var currentlyHighlighted = null;  // Track globally so map click handler can access it
             
             function initHighlight() {{
                 maxWait++;
@@ -1874,9 +2045,6 @@ class DeliveryOptimizer:
                     
                     console.log('%c🖱️ ATTACHING CLICK HANDLERS TO ' + polylines.length + ' POLYLINES', 'color: #2196F3; font-weight: bold; font-size: 13px;');
                     
-                    // Track currently highlighted polyline for exclusive highlighting
-                    var currentlyHighlighted = null;
-                    
                     var handlerCount = 0;
                     polylines.forEach(function(layer, idx) {{
                         if (layer._routeHighlightAttached) {{
@@ -1887,6 +2055,15 @@ class DeliveryOptimizer:
                         layer._originalColor = (layer.options && layer.options.color) || '#000000';
                         layer._originalWeight = (layer.options && layer.options.weight) || 5;
                         layer._originalOpacity = (layer.options && layer.options.opacity) || 0.9;
+                        // Extract route ID from className
+                        layer._routeId = null;
+                        if (layer.options && layer.options.className) {{
+                            var match = layer.options.className.match(/route-(\d+)/);
+                            if (match) {{
+                                layer._routeId = match[1];
+                                console.log('  Extracted routeId: ' + layer._routeId + ' from className: ' + layer.options.className);
+                            }}
+                        }}
                         
                         if (layer._path) {{
                             layer._path.style.cursor = 'pointer';
@@ -1896,39 +2073,205 @@ class DeliveryOptimizer:
                         (function(poly, index) {{
                             poly.on('click', function(e) {{
                                 L.DomEvent.stop(e);
-                                console.log('%c🖱️ CLICK on polyline [' + index + ']', 'color: #FF9800; font-weight: bold;');
+                                var startTime = performance.now();
+                                
+                                console.log('%c╔═══════════════════════════════════════════════════════╗', 'color: #666; font-weight: bold;');
+                                console.log('%c║  🖱️  ROUTE POLYLINE CLICK EVENT', 'color: #FF9800; font-weight: bold; font-size: 15px; background: #FFF3E0; padding: 4px;');
+                                console.log('%c╠═══════════════════════════════════════════════════════╣', 'color: #666;');
+                                console.groupCollapsed('%c📍 Click Details', 'color: #2196F3; font-weight: bold;');
+                                console.log('Polyline Index:', index);
+                                console.log('Route ID:', poly._routeId);
+                                console.log('Click Coordinates:', {{
+                                    lat: e.latlng.lat.toFixed(6),
+                                    lng: e.latlng.lng.toFixed(6),
+                                    formatted: e.latlng.lat.toFixed(6) + '°N, ' + e.latlng.lng.toFixed(6) + '°W'
+                                }});
+                                console.log('Polyline State:', {{
+                                    originalColor: poly._originalColor,
+                                    originalWeight: poly._originalWeight,
+                                    currentlyHighlighted: !!poly._highlighted,
+                                    leafletId: poly._leaflet_id
+                                }});
+                                console.groupEnd();
+                                
+                                // Safety check: only proceed if we have a valid route ID
+                                if (!poly._routeId) {{
+                                    console.error('%c⚠️ CRITICAL ERROR: No route ID found for polyline', 'color: #F44336; font-weight: bold; font-size: 14px; background: #FFEBEE; padding: 4px;');
+                                    console.log('%c╚═══════════════════════════════════════════════════════╝', 'color: #666;');
+                                    return;
+                                }}
+                                
+                                // Find all polylines with the same route ID
+                                var segmentSearchStart = performance.now();
+                                var routePolylines = [];
+                                map.eachLayer(function(lyr) {{
+                                    if (lyr instanceof L.Polyline && lyr._routeId && lyr._routeId === poly._routeId) {{
+                                        routePolylines.push(lyr);
+                                    }}
+                                }});
+                                var segmentSearchTime = (performance.now() - segmentSearchStart).toFixed(2);
+                                console.log('%c📊 Route Segment Discovery', 'color: #00BCD4; font-weight: bold;');
+                                console.log('  ├─ Segments Found: %c' + routePolylines.length, 'color: #4CAF50; font-weight: bold;');
+                                console.log('  └─ Search Time: %c' + segmentSearchTime + 'ms', 'color: #9E9E9E;');
                                 
                                 // Clear previously highlighted route if different
-                                if (currentlyHighlighted && currentlyHighlighted !== poly) {{
-                                    console.log('  Clearing previous highlight');
-                                    currentlyHighlighted.setStyle({{ 
-                                        color: currentlyHighlighted._originalColor, 
-                                        weight: currentlyHighlighted._originalWeight, 
-                                        opacity: currentlyHighlighted._originalOpacity 
+                                if (currentlyHighlighted && currentlyHighlighted._routeId && currentlyHighlighted._routeId !== poly._routeId) {{
+                                    var clearStart = performance.now();
+                                    console.log('%c🧹 Clearing Previous Route Highlight', 'color: #FF5722; font-weight: bold; font-size: 13px;');
+                                    console.log('  ├─ Previous Route ID: %c' + currentlyHighlighted._routeId, 'color: #FF7043;');
+                                    var clearedCount = 0;
+                                    // Clear all segments of the previous route
+                                    map.eachLayer(function(lyr) {{
+                                        if (lyr instanceof L.Polyline && lyr._routeId && lyr._routeId === currentlyHighlighted._routeId && lyr._highlighted) {{
+                                            lyr.setStyle({{ 
+                                                color: lyr._originalColor, 
+                                                weight: lyr._originalWeight, 
+                                                opacity: lyr._originalOpacity 
+                                            }});
+                                            if (lyr._path) {{
+                                                lyr._path.style.filter = 'none';
+                                                var currentEl = lyr._path;
+                                                while (currentEl) {{
+                                                    if (currentEl.style) {{
+                                                        currentEl.style.zIndex = '';
+                                                    }}
+                                                    if (currentEl.tagName === 'svg') break;
+                                                    currentEl = currentEl.parentNode;
+                                                }}
+                                            }}
+                                            lyr._highlighted = false;
+                                            clearedCount++;
+                                        }}
                                     }});
-                                    if (currentlyHighlighted._path) {{
-                                        currentlyHighlighted._path.style.filter = 'none';
-                                    }}
-                                    currentlyHighlighted._highlighted = false;
+                                    var clearTime = (performance.now() - clearStart).toFixed(2);
+                                    console.log('  ├─ Segments Cleared: %c' + clearedCount, 'color: #8BC34A; font-weight: bold;');
+                                    console.log('  └─ Clear Time: %c' + clearTime + 'ms', 'color: #9E9E9E;');
                                 }}
                                 
                                 if (!poly._highlighted) {{
-                                    console.log('%c🟡 HIGHLIGHTING - Setting color to #FFD700 (was ' + poly._originalColor + ')', 'color: #FFD700; font-weight: bold; font-size: 12px;');
-                                    poly.setStyle({{ color: '#FFD700', weight: poly._originalWeight + 3, opacity: 1 }});
-                                    if (poly._path) {{ 
-                                        poly._path.style.filter = 'drop-shadow(0 0 8px rgba(255, 215, 0, 0.8))';
-                                    }}
-                                    poly._highlighted = true;
+                                    var highlightStart = performance.now();
+                                    console.log('%c🟡 APPLYING ROUTE HIGHLIGHT', 'color: #FFD700; font-weight: bold; font-size: 13px; background: #000; padding: 4px 8px; border-radius: 3px;');
+                                    console.log('  ├─ Target Route: %c#' + poly._routeId, 'color: #FFF59D; font-weight: bold;');
+                                    console.log('  ├─ Segments to Highlight: %c' + routePolylines.length, 'color: #FFEB3B;');
+                                    var highlightedCount = 0;
+                                    // Highlight all segments of this route
+                                    routePolylines.forEach(function(segment) {{
+                                        segment.setStyle({{ color: '#FFD700', weight: segment._originalWeight + 3, opacity: 1 }});
+                                        segment.bringToFront();
+                                        if (segment._path) {{ 
+                                            segment._path.style.filter = 'drop-shadow(0 0 8px rgba(255, 215, 0, 0.8))';
+                                            segment._path.setAttribute('pointer-events', 'visibleStroke');
+                                            // Force to highest z-index
+                                            var currentEl = segment._path;
+                                            while (currentEl) {{
+                                                if (currentEl.style) {{
+                                                    currentEl.style.zIndex = '9999';
+                                                }}
+                                                if (currentEl.tagName === 'svg') break;
+                                                currentEl = currentEl.parentNode;
+                                            }}
+                                            var svgParent = segment._path.parentNode;
+                                            if (svgParent) {{
+                                                svgParent.appendChild(segment._path);
+                                            }}
+                                        }}
+                                        segment._highlighted = true;
+                                        highlightedCount++;
+                                    }});
+                                    var highlightTime = (performance.now() - highlightStart).toFixed(2);
+                                    console.log('  ├─ Highlighted: %c' + highlightedCount + ' segments', 'color: #8BC34A; font-weight: bold;');
+                                    console.log('  └─ Highlight Time: %c' + highlightTime + 'ms', 'color: #9E9E9E;');
                                     currentlyHighlighted = poly;
-                                }} else {{
-                                    console.log('%c⚪ RESTORING - Back to ' + poly._originalColor, 'color: #2196F3; font-weight: bold; font-size: 12px;');
-                                    poly.setStyle({{ color: poly._originalColor, weight: poly._originalWeight, opacity: poly._originalOpacity }});
-                                    if (poly._path) {{ 
-                                        poly._path.style.filter = 'none';
+                                    
+                                    // Show route summary
+                                    var popupStart = performance.now();
+                                    var summaryDiv = document.getElementById('routeSummary');
+                                    if (summaryDiv && routeStatsData && routeMapping) {{
+                                        console.log('%c📋 ROUTE SUMMARY POPUP', 'color: #3F51B5; font-weight: bold; font-size: 13px;');
+                                        // Find the vehicle_id for this route number
+                                        var vehicleId = null;
+                                        for (var vid in routeMapping) {{
+                                            if (routeMapping[vid] == poly._routeId) {{
+                                                vehicleId = vid;
+                                                break;
+                                            }}
+                                        }}
+                                        console.groupCollapsed('%c  ├─ Vehicle ID: ' + vehicleId, 'color: #7986CB; font-weight: bold;');
+                                        console.log('Mapping Entry:', vehicleId, '→', 'Route', poly._routeId);
+                                        console.groupEnd();
+                                        
+                                        if (vehicleId && routeStatsData[vehicleId]) {{
+                                            var stats = routeStatsData[vehicleId];
+                                            console.groupCollapsed('%c  ├─ Route Statistics', 'color: #7986CB; font-weight: bold;');
+                                            console.table({{
+                                                'Vendors': stats.num_vendors || 0,
+                                                'Distance (km)': stats.total_distance ? stats.total_distance.toFixed(2) : 0,
+                                                'Time (hours)': stats.total_time_hours ? stats.total_time_hours.toFixed(2) : 0,
+                                                'Cargo (kg)': stats.total_cargo ? stats.total_cargo.toFixed(0) : 0,
+                                                'Volume (m³)': stats.total_loading ? stats.total_loading.toFixed(2) : 0,
+                                                'Vendor IDs': stats.vendors ? stats.vendors.join(', ') : 'N/A'
+                                            }});
+                                            console.groupEnd();
+                                            
+                                            document.getElementById('routeNumber').textContent = poly._routeId;
+                                            document.getElementById('routeVendors').textContent = stats.num_vendors || '-';
+                                            document.getElementById('routeDistance').textContent = (stats.total_distance ? stats.total_distance.toFixed(1) + ' km' : '-');
+                                            document.getElementById('routeCargo').textContent = (stats.total_cargo ? stats.total_cargo.toFixed(0) + ' kg' : '-');
+                                            document.getElementById('routeTime').textContent = (stats.total_time_hours ? formatHours(stats.total_time_hours) : '-');
+                                            document.getElementById('routeVolume').textContent = (stats.total_loading ? stats.total_loading.toFixed(2) + ' m³' : '-');
+                                            summaryDiv.style.display = 'block';
+                                            
+                                            var popupTime = (performance.now() - popupStart).toFixed(2);
+                                            console.log('  └─ Popup Render Time: %c' + popupTime + 'ms', 'color: #9E9E9E;');
+                                            console.log('  %c✓ Popup displayed successfully', 'color: #8BC34A; font-weight: bold; font-size: 12px;');
+                                        }} else {{
+                                            console.warn('%c  ⚠️ No stats data found for vehicle ' + vehicleId, 'color: #FF9800; font-weight: bold;');
+                                            console.log('  Available vehicle IDs:', Object.keys(routeStatsData));
+                                        }}
+                                    }} else {{
+                                        console.warn('%c  ⚠️ Popup Requirements Missing', 'color: #FF9800; font-weight: bold;');
+                                        console.log('  Summary Div:', !!summaryDiv, '| Stats Data:', !!routeStatsData, '| Mapping:', !!routeMapping);
                                     }}
-                                    poly._highlighted = false;
+                                }} else {{
+                                    var restoreStart = performance.now();
+                                    console.log('%c⚪ RESTORING ROUTE TO ORIGINAL STATE', 'color: #2196F3; font-weight: bold; font-size: 13px; background: #E3F2FD; padding: 4px 8px; border-radius: 3px;');
+                                    console.log('  ├─ Route ID: %c#' + poly._routeId, 'color: #64B5F6;');
+                                    var restoredCount = 0;
+                                    // Restore all segments of this route
+                                    routePolylines.forEach(function(segment) {{
+                                        segment.setStyle({{ color: segment._originalColor, weight: segment._originalWeight, opacity: segment._originalOpacity }});
+                                        if (segment._path) {{ 
+                                            segment._path.style.filter = 'none';
+                                            var currentEl = segment._path;
+                                            while (currentEl) {{
+                                                if (currentEl.style) {{
+                                                    currentEl.style.zIndex = '';
+                                                }}
+                                                if (currentEl.tagName === 'svg') break;
+                                                currentEl = currentEl.parentNode;
+                                            }}
+                                        }}
+                                        segment._highlighted = false;
+                                        restoredCount++;
+                                    }});
+                                    var restoreTime = (performance.now() - restoreStart).toFixed(2);
+                                    console.log('  ├─ Segments Restored: %c' + restoredCount, 'color: #8BC34A; font-weight: bold;');
+                                    console.log('  └─ Restore Time: %c' + restoreTime + 'ms', 'color: #9E9E9E;');
                                     currentlyHighlighted = null;
+                                    
+                                    // Hide route summary
+                                    var summaryDiv = document.getElementById('routeSummary');
+                                    if (summaryDiv) {{
+                                        summaryDiv.style.display = 'none';
+                                        console.log('  %c✓ Popup hidden', 'color: #8BC34A; font-weight: bold;');
+                                    }}
                                 }}
+                                
+                                var totalTime = (performance.now() - startTime).toFixed(2);
+                                console.log('%c╠═══════════════════════════════════════════════════════╣', 'color: #666;');
+                                console.log('%c⏱️  TOTAL OPERATION TIME: ' + totalTime + 'ms', 'color: #9C27B0; font-weight: bold; font-size: 12px;');
+                                console.log('%c╚═══════════════════════════════════════════════════════╝', 'color: #666; font-weight: bold;');
+                                console.log(' ');
                             }});
                         }})(layer, idx);
                         
@@ -1944,6 +2287,46 @@ class DeliveryOptimizer:
                 
                 console.log('[ROUTE HIGHLIGHT] Scheduling first attachment in 100ms');
                 setTimeout(attachHandlers, 100);
+                
+                // Add map click handler to deselect routes when clicking on map background
+                map.on('click', function(e) {{
+                    // Check if click was on the map background (not on a marker, polyline, or other UI element)
+                    if (e.originalEvent && (e.originalEvent.target.tagName === 'CANVAS' || e.originalEvent.target.classList.contains('leaflet-container'))) {{
+                        console.log('%c🗺️ MAP BACKGROUND CLICK - Clearing route highlight', 'color: #2196F3; font-weight: bold;');
+                        
+                        // Clear highlighted routes
+                        if (currentlyHighlighted) {{
+                            map.eachLayer(function(lyr) {{
+                                if (lyr instanceof L.Polyline && lyr._routeId && lyr._routeId === currentlyHighlighted._routeId && lyr._highlighted) {{
+                                    lyr.setStyle({{ 
+                                        color: lyr._originalColor, 
+                                        weight: lyr._originalWeight, 
+                                        opacity: lyr._originalOpacity 
+                                    }});
+                                    if (lyr._path) {{
+                                        lyr._path.style.filter = 'none';
+                                        var currentEl = lyr._path;
+                                        while (currentEl) {{
+                                            if (currentEl.style) {{
+                                                currentEl.style.zIndex = '';
+                                            }}
+                                            if (currentEl.tagName === 'svg') break;
+                                            currentEl = currentEl.parentNode;
+                                        }}
+                                    }}
+                                    lyr._highlighted = false;
+                                }}
+                            }});
+                            currentlyHighlighted = null;
+                        }}
+                        
+                        // Hide route summary
+                        var summaryDiv = document.getElementById('routeSummary');
+                        if (summaryDiv) {{
+                            summaryDiv.style.display = 'none';
+                        }}
+                    }}
+                }});
                 
                 // Retry after page load
                 if (document.readyState === 'loading') {{
@@ -1962,6 +2345,111 @@ class DeliveryOptimizer:
         </script>
         """
         m.get_root().html.add_child(folium.Element(route_highlight_js))
+        
+        # Route summary window (top-right, above legend) - initially hidden
+        route_summary_html = """
+        <div id="routeSummary" style="position: fixed; bottom: 160px; right: 20px; z-index: 999999;
+                    background: rgba(255, 255, 255, 0.95); padding: 12px 14px;
+                    border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+                    font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; line-height: 1.5;
+                    display: none; min-width: 160px;">
+            <div style="font-weight: 700; font-size: 13px; margin-bottom: 8px; color: #2C3E50;">
+                Route <span id="routeNumber">-</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                <span style="color: #7F8C8D;">Vendors:</span>
+                <span style="font-weight: 600;" id="routeVendors">-</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                <span style="color: #7F8C8D;">Distance:</span>
+                <span style="font-weight: 600;" id="routeDistance">-</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                <span style="color: #7F8C8D;">Cargo:</span>
+                <span style="font-weight: 600;" id="routeCargo">-</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                <span style="color: #7F8C8D;">Time:</span>
+                <span style="font-weight: 600;" id="routeTime">-</span>
+            </div>
+            <div style="display: flex; justify-content: space-between;">
+                <span style="color: #7F8C8D;">Volume:</span>
+                <span style="font-weight: 600;" id="routeVolume">-</span>
+            </div>
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(route_summary_html))
+        
+        # Embed route statistics into JavaScript
+        # Convert numpy types to native Python types for JSON serialization
+        route_stats_clean = {}
+        for k, v in route_stats.items():
+            # Calculate total time from segments if available
+            total_time_hours = 0
+            if 'segments' in v:
+                total_time_hours = sum(seg.get('duration', 0) for seg in v.get('segments', []))
+            
+            route_stats_clean[str(k)] = {
+                'total_cargo': float(v.get('total_cargo', 0)),
+                'total_loading': float(v.get('total_loading', 0)),
+                'total_distance': float(v.get('total_distance', 0)),
+                'total_time_hours': float(total_time_hours),
+                'num_vendors': int(v.get('num_vendors', 0)),
+                'vendors': [int(vid) for vid in v.get('vendors', [])],
+            }
+        
+        route_mapping_clean = {str(k): int(v) for k, v in route_mapping.items()}
+        
+        route_stats_js = f"""
+        <script>
+        // Helper function to format hours as "Xh Ym"
+        function formatHours(hours) {{
+            if (hours === null || hours === undefined || isNaN(hours)) return '0h 0m';
+            const totalMinutes = Math.round(Number(hours) * 60);
+            const h = Math.floor(totalMinutes / 60);
+            const m = totalMinutes % 60;
+            return `${{h}}h ${{m}}m`;
+        }}
+        
+        var routeStatsData = {json.dumps(route_stats_clean)};
+        var routeMapping = {json.dumps(route_mapping_clean)};
+        </script>
+        """
+        m.get_root().html.add_child(folium.Element(route_stats_js))
+
+        # Legend (bottom-right): vendor pin, depot marker, route + highlight
+        legend_html = """
+        <div style="position: fixed; bottom: 20px; right: 20px; z-index: 999999;
+                    background: rgba(255, 255, 255, 0.9); padding: 10px 12px;
+                    border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+                    font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; line-height: 1.4;">
+            <div style="display: flex; align-items: center; margin-bottom: 4px;">
+                <div style="width: 18px; height: 24px; margin-right: 8px;">
+                    <svg width="18" height="24" viewBox="0 0 30 40" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M15,0 C8.373,0 3,5.373 3,12 C3,20.25 15,40 15,40 C15,40 27,20.25 27,12 C27,5.373 21.627,0 15,0 Z"
+                              fill="#1976D2" stroke="#1565C0" stroke-width="1"/>
+                        <circle cx="15" cy="12" r="6" fill="white"/>
+                    </svg>
+                </div>
+                <span>Vendor</span>
+            </div>
+            <div style="display: flex; align-items: center; margin-bottom: 4px;">
+                <div style="position: relative; width: 18px; height: 18px; margin-right: 8px;">
+                    <svg width="18" height="18" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="20" cy="20" r="10" fill="rgba(231, 76, 60, 0.15)" stroke="#E74C3C" stroke-width="2"/>
+                        <circle cx="20" cy="20" r="4" fill="rgba(231, 76, 60, 0.4)" stroke="#C0392B" stroke-width="2"/>
+                    </svg>
+                </div>
+                <span>Depot</span>
+            </div>
+            <div style="display: flex; align-items: center; margin-bottom: 4px;">
+                <div style="width: 28px; height: 6px; margin-right: 8px; background: linear-gradient(90deg, #2980B9, #16A085);
+                            border-radius: 4px; border: 1px solid rgba(0,0,0,0.15);"></div>
+                <span>Route (per vehicle)</span>
+            </div>
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(legend_html))
         
         # Fit bounds to show all markers
         m.fit_bounds([[min(all_lats), min(all_lons)], [max(all_lats), max(all_lons)]])

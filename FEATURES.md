@@ -1,7 +1,25 @@
 # Parcel Delivery Solver - Feature Documentation
 
 ## Overview
-This document describes all features implemented in the web application, including the 12 new enhancements added in the latest update.
+This document describes all features implemented in the web application, including intelligent clustering, real-time optimization, and advanced routing capabilities.
+
+## Architecture
+
+### Clustering System
+- **Algorithm**: K-Medoids (PAM - Partitioning Around Medoids)
+- **Input**: Travel time distance matrix (real road distances, not Euclidean)
+- **Target**: ~3 vendors per cluster (target formula: `len(vendors) // 3`)
+- **Outlier Detection**: Vendors > 2σ from mean depot distance get dedicated routes
+- **Benefit**: Creates geographically compact clusters, reducing cross-country routes
+- **Initial Solution**: Clustering provides a feasible starting point for ALNS optimization
+
+### Optimization Pipeline
+1. **K-Medoids Clustering** → 12+ clusters for 58 vendors
+2. **Greedy Cluster Routing** → Build initial routes within each cluster
+3. **ALNS Metaheuristic** → Improve solution via destroy/repair operators
+4. **Route Merging** → Intelligently combine routes while respecting constraints (every 250 iterations + final pass)
+5. **Selective Route Fixing** → Split only infeasible routes, keep good routes intact
+6. **Solution Export** → Output geographically optimized routes with time metrics
 
 ## Core Features
 
@@ -37,13 +55,13 @@ This document describes all features implemented in the web application, includi
 #### Network Parameters
 - **Depot Hours**: Starting depot (default: 8:00), Closing depot (default: 18:00)
 - **Vehicle Capacity**: Max weight (tons), Max loading meters (m³)
-- **Routing**: Max driving hours per day
+- **Routing**: Max driving hours per day (recommended minimum: 69h for US operations)
 - **Validation**: Real-time validation prevents depot start ≥ close time (red border on errors)
 - **Tooltips**: Hover hints on Depot Start, Max Driving, Max Weight parameters
 
 #### Solver Selection
 - **ALNS Metaheuristic**: Checkbox to enable/disable (checked by default)
-- **Auto-switching**: System automatically uses ALNS for ≥20 vendors
+- **Auto-switching**: System automatically uses ALNS for ≥20 vendors (k-medoids clustering used for initial solution)
 
 #### Cost Estimation (NEW)
 - **Location**: Sidebar > Below solver checkbox, above optimization button

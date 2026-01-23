@@ -29,8 +29,14 @@ An elegant, enterprise-grade AI-powered route optimization platform for vehicle 
 ### 🚚 Advanced Optimization
 - **Multi-Vehicle Routing** - Efficiently assigns parcels to vehicles and optimizes delivery routes
 - **Dual Solver Architecture** - CBC MIP for exact solutions + ALNS metaheuristic for large-scale problems
+- **K-Medoids Clustering** - Intelligent geographical grouping using PAM algorithm on travel time matrix
+  - Creates 12+ clusters for 58 vendors (target: 3 vendors per cluster)
+  - Uses real travel distances, not Euclidean coordinates
+  - Identifies extreme outliers for dedicated routes
 - **12 Network Parameters** - Comprehensive configuration for depot hours, driving limits, vehicle capacity
 - **Smart Auto-Scaling** - Automatically switches to metaheuristic for datasets with 20+ vendors
+- **Selective Route Fixing** - Only fixes violated routes instead of full fallback to trivial solution
+- **Route Merging Optimization** - Intelligently combines routes when feasible, maintaining constraints
 - **Scalable to 50+ Vendors** - Handles large datasets with advanced ALNS optimization
 
 ### 🗺️ Interactive Visualization
@@ -92,7 +98,19 @@ Comprehensive route details with 14 columns per stop:
 - Distance/time matrix calculation via OSRM
 - Time discretization for optimization
 
-## 📋 Prerequisites
+## � Documentation Guide
+
+**New users?** Start here in this order:
+1. **[GETTING_STARTED.md](GETTING_STARTED.md)** ← Begin here! (5-minute quick start)
+2. **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** ← Handy cheat sheet
+3. **[README.md](README.md)** (this file) ← Features and installation
+4. **[ARCHITECTURE.md](ARCHITECTURE.md)** ← How the algorithm works (deep dive)
+5. **[FEATURES.md](FEATURES.md)** ← Detailed feature descriptions
+6. **[DEPLOYMENT.md](DEPLOYMENT.md)** ← Production deployment
+
+---
+
+## �📋 Prerequisites
 
 - Python 3.8 or higher
 - pip package manager
@@ -357,10 +375,9 @@ Distance reduction achieved: 24.03%
 - 💨 Average speed
 - 📊 Complete route summary with capacity utilization
 
-**Click on vendors** to see:
-- 🏭 Vendor information (name, city, postal code)
-- 📦 Cargo to pickup (weight and volume)
-- 🚚 Solution stage (assigned vehicle, stop number)
+**Vendor markers** display:
+- Blue teardrop pins showing pickup locations
+- Tooltip on hover with vendor name and city
 
 **Map Controls:**
 - 🗺️ Multiple tile layers (Street Map, Light, Dark, Terrain)

@@ -1,192 +1,299 @@
-# Parcel Delivery Solver - AI Agent Instructions
+# Copilot Instructions - Parcel Delivery Solver
 
-## Architecture Overview
+**Last Updated**: January 23, 2026  
+**Project**: Enterprise VRP solver with K-Medoids clustering, ALNS metaheuristic, and Flask web UI
 
-This is a **vehicle routing problem (VRP) optimization platform** with three entry points:
-- `streamlit_app.py` - Streamlit web UI for interactive optimization
-- `app.py` - Flask REST API backend serving `web/` frontend
-- `example/simulator.py` - CLI script for batch optimization
+---
 
-### Core Components
+## 🏗️ Architecture Overview
 
-**Time-Expanded Network Model:**
-- `model/graph_creator/graph_creator.py` creates time-discretized graphs from vendor data
-- Time is discretized into periods (default 4-hour blocks via `discretization_constant`)
-- Nodes represent (location, time) tuples; arcs connect feasible transitions
-- Arc pruning parameters: `max_feasible_distance`, `time_window_sampling_threshold`
+**Three-layer optimization pipeline:**
+1. **K-Medoids Clustering** ([alns_solver.py](../model/optimizer/alns_solver.py#L200-L300)) - PAM algorithm groups vendors by travel time (not Euclidean distance)
+2. **Greedy Initial Solution** - Builds feasible routes within each cluster
+3. **ALNS Metaheuristic** - Adaptive destroy/repair operators optimize across 2500 iterations
 
 **Dual Solver Architecture:**
-- `model/optimizer/delivery_model.py` - CBC MIP exact solver (OR-Tools)
-  - Creates binary decision variables for time-expanded network
-  - Handles <20 vendors efficiently, uses `mip_gap` tolerance (default 0.1)
-- `model/optimizer/alns_solver.py` - ALNS metaheuristic (fast for 20+ vendors)
-  - Route-based representation (not binary tensors)
-  - Destroy/repair operators: random, worst_cost, shaw, greedy, regret2
-  - Adaptive operator weights updated during search
-- **Auto-switching:** System automatically selects ALNS for ≥20 vendors
+- **CBC MIP** ([delivery_model.py](../model/optimizer/delivery_model.py)) - Exact solutions for <20 vendors, time-expanded network formulation
+- **ALNS** ([alns_solver.py](../model/optimizer/alns_solver.py)) - Metaheuristic for ≥20 vendors, route-based representation
+- Auto-switches based on vendor count in [app.py#L420](../app.py#L420)
 
-**Routing Providers (Priority Order):**
-1. **OSRM** (default, free, unlimited) - `http://router.project-osrm.org`
-2. Google Maps (if `google_maps_api_key` in `network_params.txt`)
-3. OpenRouteService (ORS) - fallback with API key
-4. Haversine formula - straight-line distance fallback
+**Key Distinction:** ALNS uses **route representation** `[[0,3,5,0], [0,2,8,0]]` while MIP uses **time-expanded binary tensors**. Never mix them.
 
-## Key Workflows
+---
 
-### Running Optimization
+## 🚨 Critical Constraints & Gotchas
 
-**CLI (Recommended for development):**
-```bash
-# Activate environment first
-source parcel_env/bin/activate  # or parcel_env\Scripts\activate on Windows
+### Time Window Calculation (FIXED in Jan 2026)
+**Problem:** 58-65 time window violations rejecting valid routes  
+**Root Cause:** Depot window used `max(vendor_delivery_times)` instead of `latest_vendor_window + travel_time`
 
-# Run simulator
-python example/simulator.py
-
-# Configuration files read from:
-# - model/config/network_params.txt (depot hours, vehicle capacity)
-# - model/config/model_params.txt (solver parameters, MIP gap)
-# - model/config/simulation_params.txt (geocoding, visualization)
-```
-
-**Streamlit UI:**
-```bash
-streamlit run streamlit_app.py
-```
-
-**Flask API:**
-```bash
-python app.py  # Serves on http://localhost:5000
-```
-
-### Geocoding System
-
-- `model/utils/geocoder.py` provides persistent caching in `data/geocode_cache.csv`
-- **Never delete the cache** - geocoding is rate-limited and slow
-- Normalizes postcodes (e.g., "98101.0" → "98101") before geocoding
-- Priority: ORS API > Nominatim (respects `min_delay_seconds` rate limits)
-- Coordinates in `vendor_latitude`, `vendor_longitude`, `recipient_latitude`, `recipient_longitude`
-
-### CSV Data Structure
-
-Expected columns (case-sensitive variants handled):
-- `Vendor Name` / `vendor Name`
-- `Vendor Gross Weight` / `Total Gross Weight` [kg]
-- `Vendor Loading Meters` / `Calculated Loading Meters` / `Vendor Dimensions in m3` [m³]
-- `Requested Loading Date` / `Requested Loading` [datetime]
-- `Requested Delivery Date` / `Requested Delivery` [datetime]
-- Address components: `Vendor Street`, `Vendor City`, `Vendor Postcode`, etc.
-
-Date formats: Parse with `pd.to_datetime(errors='coerce')`, output as `'%Y-%m-%d %H:%M:%S'`
-
-## Configuration Parameters
-
-**Network Parameters** (`model/config/network_params.txt`):
-```json
-{
-  "discretization_constant": 4,        // Time block size in hours
-  "starting_depot": 8,                 // Depot opening hour
-  "closing_depot": 18,                 // Depot closing hour
-  "max_driving": 9,                    // Max driving hours per day
-  "max_weight": 24,                    // Vehicle capacity [tons]
-  "max_ldms": 13.6,                    // Vehicle volume [m³]
-  "google_maps_api_key": null          // Optional: use Google Maps
-}
-```
-
-**Auto-Scaling Behavior:**
-- <20 vendors → CBC MIP (exact solution, may take minutes)
-- ≥20 vendors → ALNS metaheuristic (heuristic, seconds to minutes)
-- ALNS config: `max_iterations=2000`, `cooling_rate=0.997`, `initial_temperature=1500`
-
-## Project-Specific Conventions
-
-### Path Management
-Always use absolute paths from project root. All modules add parent to `sys.path`:
+**Correct Formula** ([delivery_model.py#L850-L900](../model/optimizer/delivery_model.py#L850-L900)):
 ```python
-from pathlib import Path
-project_root = Path(__file__).resolve().parent.parent
-sys.path.append(str(project_root))
+# Vendor earliest arrival = loading_date - earl_arv_days
+# Vendor latest arrival = loading_date + late_arv_days
+# Depot earliest = min(vendor_earliest) - travel_time - service_time
+# Depot latest = max(vendor_latest) + travel_time + service_time
 ```
 
-### Solution Format
-- `connections_solution` - List of route tuples: `[(vendor_id, time_period), ...]`
-- `vehicles_solution` - Vehicle assignment per arc
-- Routes saved to `uploads/processed_YYYYMMDD_HHMMSS.csv`
-- Interactive maps generated with `folium` (multi-layer tiles, Excel-style route filters)
+**Testing:** Run `python test_alns_direct.py` - should have 0 time window violations
 
-### Capacity Handling
-- Weight: kg (convert to tons: `/1000`)
-- Volume: "loading meters" (m³) - NOT linear meters
-- Constraints enforced per route: `sum(cargo) <= max_capacity_kg[vehicle]`
+### Period Buffers (CRITICAL)
+**Always use ±12h buffers** when calculating optimization period ([app.py#L250-L280](../app.py#L250-L280)):
+```python
+period_start = min_loading_date - timedelta(hours=12)  # Vendor prep time
+period_end = max_delivery_date + timedelta(hours=12)   # Depot receiving time
+```
+Missing buffers → infeasible solutions due to too-tight time windows.
 
-### Visualization
-- Maps use OSRM for real road routing (polylines via `folium.PolyLine`)
-- Transparent route filter panels with Select All/Deselect All
-- Tooltips show: cargo weight/volume, distance, duration, capacity utilization
-- Same-location vendors get circular markers
+### max_driving Constraint
+**Minimum:** 67 hours for US cross-country routes (Seattle to Miami one-way + service)  
+**Formula:** `max_driving ≥ travel_time + (num_stops × loading_hours)`  
+**Common Error:** Setting max_driving < 67 → trivial solutions (1 vendor per route)
 
-## Common Pitfalls
+See [QUICK_REFERENCE.md](../QUICK_REFERENCE.md) for parameter table.
 
-1. **Geocoding Rate Limits:** Always use cached geocoder, never call APIs directly
-2. **Date Format Mismatches:** Graph creator expects exact `'%Y-%m-%d %H:%M:%S'` format
-3. **Column Name Variants:** Use defensive checks for both `Vendor Name` and `vendor Name`
-4. **MIP Timeout:** Large instances (>20 vendors) may timeout - use ALNS instead
-5. **Distance Matrix Size:** OSRM/Google have batch limits - requests chunked automatically
-6. **Depot Index:** Depot is always `index 0` in distance/capacity matrices
+---
 
-## Testing & Dependencies
+## 📂 Key Files & Entry Points
+
+### Flask Server
+- **[app.py](../app.py)** - Main entry point on port 8080
+  - Line 69: `/api/upload-csv` - CSV upload & geocoding
+  - Line 211: `/api/optimize` - Core optimization endpoint
+  - Line 800: `/api/saved-runs` - Run history management
+  
+### Core Optimization
+- **[alns_solver.py](../model/optimizer/alns_solver.py)** - ALNS metaheuristic (2500 iterations)
+  - Line 200: `k_medoids_clustering()` - PAM algorithm using travel time matrix
+  - Line 400: `generate_initial_solution()` - Greedy cluster routing
+  - Line 95: `solve()` - Main ALNS loop with simulated annealing
+  
+- **[delivery_model.py](../model/optimizer/delivery_model.py)** - MIP formulation
+  - Line 30: `__init__()` - Time-expanded network setup
+  - Line 850: Time window constraint definitions (CRITICAL - see gotchas above)
+  
+- **[route_solution.py](../model/optimizer/route_solution.py)** - Route container class
+  - Stores routes as `List[List[int]]` where each inner list is `[depot, vendor1, vendor2, ..., depot]`
+  - Line 50: `evaluate()` - Calculates total distance (objective function)
+  - Line 150: `is_feasible()` - Validates capacity, time, and driving constraints
+
+### Distance & Time Matrices
+- **[graph_creator.py](../model/graph_creator/graph_creator.py)** - OSRM/Google Maps integration
+  - Line 80: Routing provider selection (Google preferred, ORS fallback)
+  - Line 200: `create_distance_matrix()` - Real road distances via OSRM
+  - Uses persistent geocoding cache at [data/geocode_cache.csv](../data/geocode_cache.csv)
+
+---
+
+## 🧪 Testing Workflow
+
+### Direct Optimization Testing (Bypasses Flask)
+```bash
+python test_alns_direct.py  # Uses most recent processed CSV from uploads/
+```
+**Use case:** Debug optimization logic without Flask server issues  
+**Validates:** Time window violations, constraint satisfaction, K-Medoids clustering
+
+### API Integration Testing
+```bash
+python test_period_fix_fast.py  # Fast ALNS test
+python test_validation.py        # Full validation suite
+```
+
+### Test Datasets
+- `data/amazon_test_dataset_small.csv` - 8 vendors (~20s, development)
+- `data/amazon_test_dataset_medium.csv` - 30 vendors (~45s, demos)
+- `data/amazon_test_dataset.csv` - 58 vendors (~90s, production)
+
+**Pattern:** Test files prefixed with `test_*` are standalone scripts, not pytest suites.
+
+---
+
+## 🔧 Development Workflows
+
+### Starting Development Server
+```bash
+cd /Users/axelvargas/Documents/Axel/parcel_delivery/parcel-delivery-solver
+source parcel_env/bin/activate  # Python 3.9+ venv
+python app.py                     # Starts Flask on http://localhost:8080
+```
+
+### Adding New ALNS Operators
+1. Define in [local_search.py](../model/optimizer/local_search.py) (destroy/repair methods)
+2. Register in [alns_solver.py](../model/optimizer/alns_solver.py#L70-L85) operator dictionaries
+3. Adaptive weights auto-tune based on improvement success rate
+
+### Modifying Constraints
+**MIP constraints:** [delivery_model.py](../model/optimizer/delivery_model.py) methods prefixed with `_add_constraint_*`  
+**ALNS feasibility checks:** [route_solution.py](../model/optimizer/route_solution.py#L150) `is_feasible()` method  
+⚠️ **Must update BOTH** or solvers will diverge in behavior
+
+---
+
+## 📊 CSV Column Mappings
+
+**Required columns** (flexible naming, app.py maps automatically):
+```python
+# Weight
+'Vendor Gross Weight' OR 'Total Gross Weight' → capacity_matrix
+
+# Volume (tries in order)
+'Vendor Volume in m3' → loading_matrix
+'Vendor Linear Length' → loading_matrix
+'Calculated Loading Meters' → loading_matrix  
+'Vendor Dimensions in m3' → loading_matrix
+
+# Dates
+'Requested Loading Date' → vendor time windows
+'Requested Delivery Date' → depot time windows
+
+# Location (geocoded if missing lat/lon)
+'Vendor Street', 'Vendor City', 'Vendor Postcode'
+'vendor_latitude', 'vendor_longitude' (auto-generated)
+'recipient_latitude', 'recipient_longitude' (auto-generated)
+```
+
+See [QUICK_REFERENCE.md](../QUICK_REFERENCE.md) for complete spec.
+
+---
+
+## 🗺️ Map Visualization
+
+**Folium-based** interactive maps generated in [app.py#L600-L800](../app.py#L600-L800):
+- **Vendor pins:** Blue gradient teardrop markers (precise coordinate anchoring)
+- **Depot:** Unfilled concentric red circles (3 rings)
+- **Routes:** Color-coded polylines fetched from OSRM with real road geometry
+- **Segment details:** Click routes for distance/duration/speed popup
+
+**Common Issue:** Markers not appearing → Check geocoding succeeded (vendor_latitude exists)
+
+---
+
+## 🐞 Debugging Tips
+
+### Flask Server Code 137 Exit
+**Symptom:** `python app.py` terminates immediately during initialization  
+**Workaround:** Use `python test_alns_direct.py` to test optimization logic directly  
+**Status:** Known issue as of Jan 2026, affects web UI only (optimization code works)
+
+### Infeasible Solutions
+1. Check `max_driving ≥ 67` for US routes
+2. Verify period buffers (±12h) applied
+3. Run with `verbose=True` in [alns_solver.py#L95](../model/optimizer/alns_solver.py#L95) to see violation details
+4. Inspect depot time window calculation in [delivery_model.py#L850](../model/optimizer/delivery_model.py#L850)
+
+### Distance Matrix Issues
+- **OSRM unavailable:** Check OSRM server running or use Google Maps API key
+- **Geocoding failures:** Inspect [data/geocode_cache.csv](../data/geocode_cache.csv), uses city fallbacks
+- **Zero distances:** Likely using dummy ORS client (see [graph_creator.py#L25](../model/graph_creator/graph_creator.py#L25))
+
+---
+
+## 📦 Dependencies & Environment
+
+**Core:** pandas, numpy, ortools (≥9.7), Flask (≥3.1), folium (≥0.14)  
+**Routing:** OSRM (preferred) or Google Maps API  
+**Config:** [pyproject.toml](../pyproject.toml) - Python ≥3.8, setuptools build system
 
 **Virtual Environment:**
 ```bash
 python -m venv parcel_env
 source parcel_env/bin/activate
-pip install -r streamlit-requirements.txt  # For Streamlit
-# OR install from pyproject.toml
+pip install -e .  # Installs from pyproject.toml
+```
+
+---
+
+## 📚 Documentation Hierarchy
+
+**Start here:**
+1. [README.md](../README.md) - Features overview & tech stack
+2. [GETTING_STARTED.md](../GETTING_STARTED.md) - 5-minute quick start
+3. [QUICK_REFERENCE.md](../QUICK_REFERENCE.md) - One-page cheat sheet
+
+**Deep dives:**
+- [ARCHITECTURE.md](../ARCHITECTURE.md) - System design, K-Medoids algorithm, constraint formulas
+- [FEATURES.md](../FEATURES.md) - Detailed feature documentation
+- [PROJECT_STRUCTURE.md](../PROJECT_STRUCTURE.md) - File organization guide
+
+**Operational:**
+- [CHANGELOG.md](../CHANGELOG.md) - Version history & recent fixes
+- [DEPLOYMENT.md](../DEPLOYMENT.md) - Production deployment guide
+
+---
+
+## 🎯 Project-Specific Conventions
+
+### Naming Patterns
+- **max_ldms_vc** (DEPRECATED) → Use **max_volume** for volume capacity (m³)
+- **max_linear_length** → Linear dimension constraint (meters)
+- **discretization_constant** → Time step size in hours (typically 4h)
+- **Tau_hours** → Total optimization horizon in discrete time steps
+
+### Route Representation
+**ALNS:** `[[0,3,5,0], [0,2,8,0]]` - Lists of node indices (0 = depot)  
+**MIP:** Binary tensor `x[i,j,t,v]` - Arc activation at time t for vehicle v  
+Never mix these in the same function.
+
+### Logging
+Uses Python stdlib `logging` with rotating file handlers:
+- App logs → `/tmp/flask_app.log` (5MB limit, 3 backups)
+- Optimization logs → `stdout` with `log.info()` from [model/utils/project_utils.py](../model/utils/project_utils.py)
+
+### State Management
+**APP_STATE** dict in [app.py#L53](../app.py#L53) - In-memory state for route editing:
+```python
+APP_STATE = {
+    'routes': List[List[int]],      # Current route solution
+    'distance_matrix': List[List[float]],
+    'capacity_matrix': List[float],  # Indexed by vendor ID (depot at 0)
+    'frozen_prefix': List[int]       # Optional: stops to preserve per route
+}
+```
+
+---
+
+## ⚡ Performance Expectations
+
+| Vendors | Solver | Time | Routes | Quality |
+|---------|--------|------|--------|---------|
+| 8       | MIP    | ~20s | 2-3    | Optimal |
+| 30      | ALNS   | ~45s | 8-12   | 30% reduction vs naive |
+| 58      | ALNS   | ~90s | 15-20  | 50% reduction vs naive |
+
+**Scaling:** ALNS handles 100+ vendors in ~3 minutes. K-Medoids clustering prevents quadratic explosion.
+
+---
+
+## 🔗 External Integrations
+
+**OSRM (Open Source Routing Machine):**
+- Default endpoint: `http://router.project-osrm.org`
+- Used for real road distances/times instead of haversine
+- Fallback: Google Maps Distance Matrix API (requires API key)
+
+**Geocoding:**
+- Nominatim (OpenStreetMap) with 1-second rate limit
+- Persistent cache at [data/geocode_cache.csv](../data/geocode_cache.csv)
+- City coordinate fallbacks for common US/CA/MX cities
+
+---
+
+## 🚀 Quick Command Reference
+
+```bash
+# Start server
+python app.py
+
+# Test optimization directly
+python test_alns_direct.py
+
+# Install dependencies
 pip install -e .
+
+# Run specific test dataset
+# (Upload via web UI at localhost:8080)
+data/amazon_test_dataset_small.csv
 ```
 
-**Core Dependencies:**
-- `ortools>=9.7.0` - CBC/GLOP solvers
-- `pandas>=2.0.0`, `numpy>=1.24.0`
-- `folium>=0.14.0` - Interactive maps
-- `geopy>=2.4.0` - Geocoding
-- `requests>=2.31.0` - OSRM/ORS API calls
-
-**Python Version:** 3.8+ (tested up to 3.12)
-
-## File Organization
-
-```
-model/
-├── graph_creator/graph_creator.py  - Time-expanded network builder
-├── optimizer/
-│   ├── delivery_model.py           - MIP solver (OR-Tools CBC)
-│   ├── alns_solver.py              - Metaheuristic (route-based)
-│   ├── route_solution.py           - Route representation class
-│   └── local_search.py             - ALNS operators
-└── utils/
-    ├── geocoder.py                 - Persistent geocoding cache
-    ├── pre_processing.py           - Data normalization
-    └── project_utils.py            - Utilities (logging, helpers)
-
-data/geocode_cache.csv              - NEVER DELETE (persistent cache)
-uploads/                            - Processed CSVs with solutions
-results/optimization/               - Output artifacts
-cache/                              - Distance matrix cache (JSON)
-```
-
-## External Integrations
-
-- **OSRM:** Public demo server, no auth, handles `table` endpoint for matrices
-- **Google Maps:** Distance Matrix API, requires key + enabled billing
-- **ORS:** Free tier (5000 req/day), requires API key in `graph_creator.py`
-- **Nominatim:** Geocoding fallback, 1 req/sec rate limit
-
-## When Modifying Solvers
-
-- **MIP changes:** Edit `delivery_model.py`, constraints use OR-Tools `pywraplp`
-- **ALNS changes:** Operators in `alns_solver.py`, fitness in `route_solution.evaluate()`
-- **New destroy operator:** Add to `self.destroy_operators` dict with weight=1.0
-- **New repair operator:** Add to `self.repair_operators` dict
-- **Testing:** Use `data/amazon_test_dataset_small.csv` (5 vendors) for quick iteration
+**Web UI:** http://localhost:8080 (3 tabs: Optimizer, Saved Runs, Route Visualization)

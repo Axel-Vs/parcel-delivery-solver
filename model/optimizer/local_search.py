@@ -12,6 +12,23 @@ class LocalSearchOperators:
     """
     
     @staticmethod
+    def _route_distance(route, distance_matrix):
+        """
+        Calculate total distance of a route.
+        
+        Args:
+            route: List of nodes (including depot at start/end)
+            distance_matrix: Distance matrix
+            
+        Returns:
+            float: Total route distance
+        """
+        total_distance = 0.0
+        for i in range(len(route) - 1):
+            total_distance += distance_matrix[route[i], route[i+1]]
+        return total_distance
+    
+    @staticmethod
     def two_opt_route(route, distance_matrix):
         """
         2-opt improvement within a single route.
@@ -121,21 +138,21 @@ class LocalSearchOperators:
                 
                 # Check capacity constraints if provided
                 if capacity_matrix is not None and max_weights is not None:
-                    weight1_before = sum(capacity_matrix[v] for v in route1 if v != 0)
-                    weight2_before = sum(capacity_matrix[v] for v in route2 if v != 0)
+                    weight1_before = sum(LocalSearchOperators._get_vendor_capacity(capacity_matrix, v) for v in route1 if v != 0)
+                    weight2_before = sum(LocalSearchOperators._get_vendor_capacity(capacity_matrix, v) for v in route2 if v != 0)
                     
-                    weight1_after = weight1_before - capacity_matrix[vendor1] + capacity_matrix[vendor2]
-                    weight2_after = weight2_before - capacity_matrix[vendor2] + capacity_matrix[vendor1]
+                    weight1_after = weight1_before - LocalSearchOperators._get_vendor_capacity(capacity_matrix, vendor1) + LocalSearchOperators._get_vendor_capacity(capacity_matrix, vendor2)
+                    weight2_after = weight2_before - LocalSearchOperators._get_vendor_capacity(capacity_matrix, vendor2) + LocalSearchOperators._get_vendor_capacity(capacity_matrix, vendor1)
                     
                     if weight1_after > max_weights[0] or weight2_after > max_weights[1]:
                         continue
                 
                 if loading_matrix is not None and max_volumes is not None:
-                    volume1_before = sum(loading_matrix[v] for v in route1 if v != 0)
-                    volume2_before = sum(loading_matrix[v] for v in route2 if v != 0)
+                    volume1_before = sum(LocalSearchOperators._get_vendor_volume(loading_matrix, v) for v in route1 if v != 0)
+                    volume2_before = sum(LocalSearchOperators._get_vendor_volume(loading_matrix, v) for v in route2 if v != 0)
                     
-                    volume1_after = volume1_before - loading_matrix[vendor1] + loading_matrix[vendor2]
-                    volume2_after = volume2_before - loading_matrix[vendor2] + loading_matrix[vendor1]
+                    volume1_after = volume1_before - LocalSearchOperators._get_vendor_volume(loading_matrix, vendor1) + LocalSearchOperators._get_vendor_volume(loading_matrix, vendor2)
+                    volume2_after = volume2_before - LocalSearchOperators._get_vendor_volume(loading_matrix, vendor2) + LocalSearchOperators._get_vendor_volume(loading_matrix, vendor1)
                     
                     if volume1_after > max_volumes[0] or volume2_after > max_volumes[1]:
                         continue
@@ -186,13 +203,13 @@ class LocalSearchOperators:
             
             # Check capacity if moving to route2
             if capacity_matrix is not None and max_weights is not None:
-                weight2 = sum(capacity_matrix[v] for v in route2 if v != 0)
-                if weight2 + capacity_matrix[vendor] > max_weights[1]:
+                weight2 = sum(LocalSearchOperators._get_vendor_capacity(capacity_matrix, v) for v in route2 if v != 0)
+                if weight2 + LocalSearchOperators._get_vendor_capacity(capacity_matrix, vendor) > max_weights[1]:
                     continue
             
             if loading_matrix is not None and max_volumes is not None:
-                volume2 = sum(loading_matrix[v] for v in route2 if v != 0)
-                if volume2 + loading_matrix[vendor] > max_volumes[1]:
+                volume2 = sum(LocalSearchOperators._get_vendor_volume(loading_matrix, v) for v in route2 if v != 0)
+                if volume2 + LocalSearchOperators._get_vendor_volume(loading_matrix, vendor) > max_volumes[1]:
                     continue
             
             # Try inserting at each position in route2
@@ -215,13 +232,13 @@ class LocalSearchOperators:
             
             # Check capacity if moving to route1
             if capacity_matrix is not None and max_weights is not None:
-                weight1 = sum(capacity_matrix[v] for v in route1 if v != 0)
-                if weight1 + capacity_matrix[vendor] > max_weights[0]:
+                weight1 = sum(LocalSearchOperators._get_vendor_capacity(capacity_matrix, v) for v in route1 if v != 0)
+                if weight1 + LocalSearchOperators._get_vendor_capacity(capacity_matrix, vendor) > max_weights[0]:
                     continue
             
             if loading_matrix is not None and max_volumes is not None:
-                volume1 = sum(loading_matrix[v] for v in route1 if v != 0)
-                if volume1 + loading_matrix[vendor] > max_volumes[0]:
+                volume1 = sum(LocalSearchOperators._get_vendor_volume(loading_matrix, v) for v in route1 if v != 0)
+                if volume1 + LocalSearchOperators._get_vendor_volume(loading_matrix, vendor) > max_volumes[0]:
                     continue
             
             # Try inserting at each position in route1
@@ -267,6 +284,23 @@ class LocalSearchOperators:
                     improved_solution.routes[route_idx] = new_route
                     improved = True
             
+            # Intra-route relocate (fine-tuning order)
+            for route_idx in range(len(improved_solution.routes)):
+                route = improved_solution.routes[route_idx]
+                max_w = improved_solution.max_capacity_kg[route_idx] if route_idx < len(improved_solution.max_capacity_kg) else float('inf')
+                max_v = improved_solution.max_volume[route_idx] if route_idx < len(improved_solution.max_volume) else float('inf')
+                new_route, changed = LocalSearchOperators.relocate_intra(
+                    route,
+                    improved_solution.distance_matrix,
+                    improved_solution.capacity_matrix,
+                    improved_solution.loading_matrix,
+                    max_w,
+                    max_v
+                )
+                if changed:
+                    improved_solution.routes[route_idx] = new_route
+                    improved = True
+
             # Inter-route swap
             for i in range(len(improved_solution.routes)):
                 for j in range(i + 1, len(improved_solution.routes)):
@@ -275,8 +309,8 @@ class LocalSearchOperators:
                         improved_solution.max_capacity_kg[j] if j < len(improved_solution.max_capacity_kg) else float('inf')
                     ]
                     max_volumes = [
-                        improved_solution.max_ldms_vc[i] if i < len(improved_solution.max_ldms_vc) else float('inf'),
-                        improved_solution.max_ldms_vc[j] if j < len(improved_solution.max_ldms_vc) else float('inf')
+                        improved_solution.max_volume[i] if i < len(improved_solution.max_volume) else float('inf'),
+                        improved_solution.max_volume[j] if j < len(improved_solution.max_volume) else float('inf')
                     ]
                     
                     route1, route2, changed = LocalSearchOperators.swap_inter(
@@ -293,6 +327,32 @@ class LocalSearchOperators:
                         improved_solution.routes[i] = route1
                         improved_solution.routes[j] = route2
                         improved = True
+
+            # Inter-route relocate (move a vendor to better route)
+            for i in range(len(improved_solution.routes)):
+                for j in range(i + 1, len(improved_solution.routes)):
+                    # Extract scalar values from arrays
+                    max_weight_i = float(improved_solution.max_capacity_kg[i]) if hasattr(improved_solution.max_capacity_kg, '__len__') else float(improved_solution.max_capacity_kg)
+                    max_weight_j = float(improved_solution.max_capacity_kg[j]) if hasattr(improved_solution.max_capacity_kg, '__len__') else float(improved_solution.max_capacity_kg)
+                    max_volume_i = float(improved_solution.max_volume[i]) if hasattr(improved_solution.max_volume, '__len__') else float(improved_solution.max_volume)
+                    max_volume_j = float(improved_solution.max_volume[j]) if hasattr(improved_solution.max_volume, '__len__') else float(improved_solution.max_volume)
+                    
+                    max_weights = [max_weight_i, max_weight_j]
+                    max_volumes = [max_volume_i, max_volume_j]
+                    
+                    route1, route2, changed = LocalSearchOperators.relocate_inter(
+                        improved_solution.routes[i],
+                        improved_solution.routes[j],
+                        improved_solution.distance_matrix,
+                        improved_solution.capacity_matrix,
+                        improved_solution.loading_matrix,
+                        max_weights,
+                        max_volumes
+                    )
+                    if changed:
+                        improved_solution.routes[i] = route1
+                        improved_solution.routes[j] = route2
+                        improved = True
             
             improved_solution.invalidate_cache()
             
@@ -302,7 +362,26 @@ class LocalSearchOperators:
         return improved_solution
     
     @staticmethod
-    def _route_distance(route, distance_matrix):
+    def _get_vendor_capacity(capacity_matrix, vendor_id):
+        """Safely extract vendor capacity as scalar value."""
+        if capacity_matrix is None:
+            return 0
+        val = capacity_matrix[vendor_id]
+        # If it's an array/row, extract the first element
+        if hasattr(val, '__len__') and not isinstance(val, (str, bytes)):
+            return float(val[0]) if len(val) > 0 else float(val)
+        return float(val)
+    
+    @staticmethod
+    def _get_vendor_volume(loading_matrix, vendor_id):
+        """Safely extract vendor volume as scalar value."""
+        if loading_matrix is None:
+            return 0
+        val = loading_matrix[vendor_id]
+        # If it's an array/row, extract the first element
+        if hasattr(val, '__len__') and not isinstance(val, (str, bytes)):
+            return float(val[0]) if len(val) > 0 else float(val)
+        return float(val)
         """Calculate total distance of a route."""
         distance = 0
         for i in range(len(route) - 1):
