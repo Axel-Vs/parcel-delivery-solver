@@ -3,7 +3,8 @@
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+repo_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(repo_root))
 
 from model.graph_creator.graph_creator import Graph
 from model.optimizer.delivery_model import DeliveryOptimizer
@@ -12,7 +13,7 @@ from datetime import datetime
 
 # Load a processed CSV file that has geocoded coordinates
 import glob
-processed_files = sorted(glob.glob("uploads/processed_*.csv"))
+processed_files = sorted(glob.glob(str(repo_root / "uploads" / "processed_*.csv")))
 if not processed_files:
     print("ERROR: No processed CSV files found in uploads/")
     sys.exit(1)
@@ -53,7 +54,7 @@ network_params = {
     'loading': 2,
     'earl_arv': 24,
     'late_arv': 24,
-    'max_driving': 50,
+    'max_driving': 75,
     'max_weight': 30,
     'max_ldms': 70,
     'plot_centered_coordinates': [47.6062, -122.3321],
@@ -107,7 +108,8 @@ optimizer = DeliveryOptimizer(
     loading_matrix=loading_matrix,
     service_time_matrix=service_time_matrix,
     max_capacity=network_params['max_weight'],
-    max_ldms=network_params['max_ldms'],
+    max_volume=network_params['max_ldms'],
+    max_linear_length=16.1,
     max_driving=network_params['max_driving'],
     is_gap=False,
     mip_gap=0.05,
@@ -121,7 +123,7 @@ optimizer.min_date = pd.to_datetime(period[0])
 print(f"Running ALNS solver with evaluation_period parameter...")
 status, x, y = optimizer.solve_with_metaheuristic(
     w=0.5,
-    max_iterations=500,  # Fewer iterations for quick test
+    max_iterations=1,  # Single iteration for debug
     verbose=True
 )
 

@@ -2022,7 +2022,7 @@
                 if (data.success) {
                     displayResults(data);
                 } else {
-                    alert('Optimization failed: ' + data.error);
+                    displayResults(data);
                 }
             } catch (error) {
                 alert('Error: ' + error.message);
@@ -2038,6 +2038,39 @@
             console.log('Map URL in data:', data.map_url);
             
             document.getElementById('resultsContainer').classList.add('show');
+
+            // If optimization failed, show warnings and skip map/stats rendering
+            if (data && data.success === false) {
+                document.getElementById('exportSection').style.display = 'none';
+                document.getElementById('routeOpsSection').style.display = 'none';
+                document.getElementById('filtersSection').style.display = 'none';
+
+                const warningsDiv = document.getElementById('geocodeWarnings');
+                const violations = data.constraint_violations || [];
+                warningsDiv.innerHTML = `
+                    <div class="warning-box">
+                        <div class="warning-header">OPTIMIZATION WARNINGS (${data.constraint_violation_count || violations.length || 0})</div>
+                        <div class="warning-list">
+                            ${violations.length > 0 ? violations.map(v => `
+                                <div class="warning-item">
+                                    <div class="warning-item-type">CONSTRAINT</div>
+                                    <div class="warning-item-detail">${v}</div>
+                                </div>
+                            `).join('') : `
+                                <div class="warning-item">
+                                    <div class="warning-item-type">STATUS</div>
+                                    <div class="warning-item-detail">${data.warning || 'Optimization infeasible'}</div>
+                                </div>
+                            `}
+                        </div>
+                    </div>
+                `;
+                document.getElementById('statsGrid').innerHTML = '';
+                document.getElementById('routeSummary').innerHTML = '';
+                const mapFrame = document.getElementById('mapFrame');
+                mapFrame.removeAttribute('src');
+                return;
+            }
             
             // Store current solution
             currentSolutionData = data;
@@ -2060,31 +2093,54 @@
                 populateTruckDropdown(data.statistics.num_routes);
             }
 
-            // Geocoding warnings
+            // Geocoding + preprocessing warnings
             const warningsDiv = document.getElementById('geocodeWarnings');
-            if (data.failed_geocodes && data.failed_geocodes.length > 0) {
-                warningsDiv.innerHTML = `
-                    <div class="warning-box">
-                        <div class="warning-header">GEOCODING WARNINGS (${data.failed_geocodes.length})</div>
-                        <div class="warning-list">
-                            ${data.failed_geocodes.map(fail => `
-                                <div class="warning-item">
-                                    <div class="warning-item-type">${fail.type.toUpperCase()}: ${fail.vendor_name}</div>
-                                    <div class="warning-item-detail">Row ${fail.row + 1}: ${fail.address}</div>
-                                </div>
-                            `).join('')}
-                        </div>
+            const geocodeWarnings = (data.failed_geocodes && data.failed_geocodes.length > 0) ? `
+                <div class="warning-box">
+                    <div class="warning-header">GEOCODING WARNINGS (${data.failed_geocodes.length})</div>
+                    <div class="warning-list">
+                        ${data.failed_geocodes.map(fail => `
+                            <div class="warning-item">
+                                <div class="warning-item-type">${fail.type.toUpperCase()}: ${fail.vendor_name}</div>
+                                <div class="warning-item-detail">Row ${fail.row + 1}: ${fail.address}</div>
+                            </div>
+                        `).join('')}
                     </div>
-                `;
-            } else {
-                warningsDiv.innerHTML = '';
-            }
+                </div>
+            ` : '';
+
+            const preprocessingWarnings = (data.preprocessing_warnings && data.preprocessing_warnings.length > 0) ? `
+                <div class="warning-box">
+                    <div class="warning-header">DATA WARNINGS (${data.preprocessing_warnings.length})</div>
+                    <div class="warning-list">
+                        ${data.preprocessing_warnings.map(w => `
+                            <div class="warning-item">
+                                <div class="warning-item-type">${(w.type || 'data').toUpperCase()}: ${w.vendor_name || 'Vendor'}</div>
+                                <div class="warning-item-detail">${w.detail || ''}</div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            ` : '';
+
+            const osrmWarnings = (data.osrm_failures && data.osrm_failures.length > 0) ? `
+                <div class="warning-box">
+                    <div class="warning-header">ROUTING WARNINGS (${data.osrm_failures.length})</div>
+                    <div class="warning-list">
+                        ${data.osrm_failures.map(w => `
+                            <div class="warning-item">
+                                <div class="warning-item-type">OSRM</div>
+                                <div class="warning-item-detail">${w}</div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            ` : '';
+
+            warningsDiv.innerHTML = `${geocodeWarnings}${preprocessingWarnings}${osrmWarnings}`;
 
             // Statistics
             const stats = data.statistics;
-            
-            // Calculate total time across all routes
-            const totalTime = (data.routes || []).reduce((sum, route) => sum + (route.total_time_hours || 0), 0);
             
             document.getElementById('statsGrid').innerHTML = `
                 <div class="stat-card">
@@ -2098,10 +2154,6 @@
                 <div class="stat-card">
                     <div class="stat-label">TOTAL DISTANCE</div>
                     <div class="stat-value">${stats.total_distance.toLocaleString()}<span class="stat-unit">km</span></div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">TOTAL TIME</div>
-                    <div class="stat-value">${formatHours(totalTime)}</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">TOTAL CARGO</div>
@@ -2426,6 +2478,16 @@
                 </div>
                 <div style="margin-bottom: 16px;">
                     <div style="font-weight: 600; font-size: 13px; color: #666; margin-bottom: 8px;">ROUTE SEGMENTS</div>
+                    <div class="route-detail-segment">
+                        <div class="route-detail-segment-title">Route start</div>
+                        <div class="route-detail-segment-info">
+                            <div class="full-width">📍 Starting vendor: ${route.start_vendor || 'N/A'}</div>
+                            <div class="full-width">📅 Requested loading: ${route.start_requested_loading || 'N/A'}</div>
+                            <div class="full-width">⏱️ Expected arrival: ${route.start_expected_arrival || 'N/A'}</div>
+                            <div class="full-width">📦 Cargo: ${route.start_cargo_kg ? route.start_cargo_kg.toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1}) : '0.0'} kg</div>
+                            <div class="full-width">📐 Volume: ${route.start_volume_m3 ? route.start_volume_m3.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '0.00'} m³</div>
+                        </div>
+                    </div>
                     ${route.segments.map((seg, idx) => `
                         <div class="route-detail-segment">
                             <div class="route-detail-segment-title">
@@ -2433,17 +2495,19 @@
                                 ${seg.warning ? `<div style="color: #B39A7C; font-size: 10px; margin-top: 4px;">${seg.warning}</div>` : ''}
                             </div>
                             <div class="route-detail-segment-info">
-                                ${seg.distance > 0 ? `<div>📏 Distance: ${seg.distance.toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1})} km</div>` : ''}
-                                ${seg.duration > 0 ? `<div>⏱️ Duration: ${seg.duration.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} hrs</div>` : ''}
-                                ${seg.service_time_hours > 0 ? `<div>🛠️ Loading: ${seg.service_time_hours.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} hrs</div>` : ''}
-                                <div>📦 Cargo: ${seg.cargo_kg ? seg.cargo_kg.toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1}) : '0.0'} kg</div>
-                                <div>📐 Volume: ${seg.volume_m3 ? seg.volume_m3.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '0.00'} m³</div>
-                                ${seg.is_depot_destination ? 
-                                    `<div class="full-width">📅 Requested delivery (depot): ${seg.requested_depot_delivery || 'N/A'}</div>
-                                     <div class="full-width">⏱️ Expected arrival (depot): ${seg.expected_arrival || 'N/A'}</div>` :
-                                    `<div class="full-width">📅 Requested pickup (vendor): ${seg.requested_vendor_pickup || seg.pickup_date || 'N/A'}</div>
-                                     <div class="full-width">⏱️ Expected arrival (vendor): ${seg.expected_arrival || 'N/A'}</div>`
-                                }
+                            ${seg.distance > 0 ? `<div>📏 Distance: ${seg.distance.toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1})} km</div>` : ''}
+                            ${seg.duration > 0 ? `<div>⏱️ Duration: ${seg.duration.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} hrs</div>` : ''}
+                            ${seg.service_time_hours > 0 ? `<div>🛠️ Loading: ${seg.service_time_hours.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} hrs</div>` : ''}
+                            <div>📦 Cargo: ${seg.cargo_kg ? seg.cargo_kg.toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1}) : '0.0'} kg</div>
+                            <div>📐 Volume: ${seg.volume_m3 ? seg.volume_m3.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '0.00'} m³</div>
+                            ${seg.is_depot_destination ? 
+                                `<div class="full-width">🧭 Vendor time: ${seg.expected_arrival_vendor_from || 'N/A'} (expected)</div>
+                                 <div class="full-width">📅 Vendor window: ${seg.requested_vendor_pickup_from || 'N/A'} (requested)</div>
+                                 <div class="full-width">🧭 Depot time: ${seg.expected_arrival || 'N/A'} (expected)</div>
+                                 <div class="full-width">📅 Depot window: ${seg.requested_depot_delivery || 'N/A'} (requested)</div>` :
+                                `<div class="full-width">🧭 Vendor time: ${seg.expected_arrival || 'N/A'} (expected)</div>
+                                 <div class="full-width">📅 Vendor window: ${seg.requested_vendor_pickup || seg.pickup_date || 'N/A'} (requested)</div>`
+                            }
                             </div>
                         </div>
                     `).join('')}

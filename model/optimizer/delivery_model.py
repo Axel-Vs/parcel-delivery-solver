@@ -12,6 +12,7 @@ sys.path.append(str(project_root))
 # Import required modules
 from utils.project_utils import *
 from ortools.linear_solver import pywraplp
+from concurrent.futures import ProcessPoolExecutor
 
 # Import metaheuristic solvers
 try:
@@ -22,12 +23,42 @@ try:
 except ImportError:
     METAHEURISTIC_AVAILABLE = False
 
+
+def _solve_alns_group(payload):
+    group_solver = ALNSSolver(
+        vendors_df=payload['vendors_df'],
+        distance_matrix=payload['distance_matrix'],
+        time_matrix=payload['time_matrix'],
+        capacity_matrix=payload['capacity_matrix'],
+        loading_matrix=payload['loading_matrix'],
+        service_time_matrix=payload['service_time_matrix'],
+        max_capacity_kg=payload['max_capacity_kg'],
+        max_volume=payload['max_volume'],
+        max_linear_length=payload['max_linear_length'],
+        discretization_constant=payload['discretization_constant'],
+        min_date=payload['min_date'],
+        max_driving_hours=payload['max_driving_hours'],
+        config=payload['alns_config'],
+        evaluation_period=payload['evaluation_period'],
+        allowed_early_hours=payload['allowed_early_hours'],
+        allowed_late_hours=payload['allowed_late_hours'],
+        vendor_ids=payload['vendor_ids'],
+    )
+    group_solution = group_solver.solve(verbose=payload['verbose'])
+    group_solution = LocalSearchOperators.improve_solution(group_solution, max_iterations=payload['ls_iters'])
+    feasible = group_solution.is_feasible(check_all=True)
+    return {
+        'routes': group_solution.routes,
+        'feasible': feasible,
+        'violations': list(group_solution._constraint_violations),
+    }
+
 # Define the DeliveryOptimizer class
 class DeliveryOptimizer:
     def __init__(self, evaluation_period, discretization_constant, time_expanded_network, time_expanded_network_index,
                  Tau_hours, distance_matrix, time_distance_matrix, disc_time_distance_matrix, capacity_matrix, loading_matrix,
                  max_capacity, max_volume, max_linear_length, max_driving, is_gap, mip_gap, maximum_minutes,
-                 service_time_matrix=None, vendors_df=None):
+                 service_time_matrix=None, vendors_df=None, allowed_early_hours=12, allowed_late_hours=12):
         # Log information about the MIP model setup
         log.info('Defining MIP model... ')
 
@@ -44,6 +75,8 @@ class DeliveryOptimizer:
         self.loading_matrix = loading_matrix
         self.service_time_matrix = service_time_matrix if service_time_matrix is not None else np.zeros(len(distance_matrix))
         self.vendors_df = vendors_df
+        self.allowed_early_hours = allowed_early_hours
+        self.allowed_late_hours = allowed_late_hours
 
         # Calculate derived attributes
         self.max_driving_hours = max_driving
@@ -74,6 +107,7 @@ class DeliveryOptimizer:
         self.connections_solution = None
         self.vehicles_solution = None
         self.used_metaheuristic = False
+        self.last_constraint_violations = []
 
         # Create a solver instance with specified time limit
         self.model = pywraplp.Solver('DeliveryOptimizer', pywraplp.Solver.CBC_MIXED_INTEGER_PROGRAMMING)
@@ -170,34 +204,109 @@ class DeliveryOptimizer:
             'cooling_rate': cooling
         }
         
-        alns = ALNSSolver(
-            vendors_df=self.vendors_df,
-            distance_matrix=self.distance_matrix,
-            time_matrix=self.time_distance_matrix,
-            capacity_matrix=self.capacity_matrix,
-            loading_matrix=self.loading_matrix,
-            service_time_matrix=self.service_time_matrix,
-            max_capacity_kg=self.max_capacity_kg,
-            max_volume=self.max_volume_vc,
-            max_linear_length=self.max_linear_length_vc,
-            discretization_constant=self.discretization_constant,
-            min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
-            max_driving_hours=self.max_driving_hours,
-            config=alns_config,
-            evaluation_period=self.evaluation_period
-        )
-        
-        # Solve with ALNS
-        solution = alns.solve(verbose=verbose)
-        
-        # Apply local search improvement
-        if verbose:
-            print('   - Applying local search improvement...')
-        solution = LocalSearchOperators.improve_solution(solution, max_iterations=ls_iters)
-        
-        # Check feasibility
-        is_feasible = solution.is_feasible(check_all=True)
-        status = 0 if is_feasible else 2
+        # Parallel solve by time-window groups when available
+        group_map = {}
+        if self.vendors_df is not None and 'time_bucket' in self.vendors_df.columns:
+            for i in range(len(self.vendors_df)):
+                raw_bucket = self.vendors_df.iloc[i].get('time_bucket', '')
+                bucket = str(raw_bucket).strip()
+                if bucket:
+                    group_map.setdefault(bucket, []).append(i + 1)
+
+        if len(group_map) > 1:
+            if verbose:
+                print(f'🔀 Parallel ALNS groups: {len(group_map)}')
+            max_workers = min(len(group_map), max(1, (os.cpu_count() or 2) // 2))
+
+            payloads = []
+            for vendor_ids in group_map.values():
+                payloads.append({
+                    'vendors_df': self.vendors_df,
+                    'distance_matrix': self.distance_matrix,
+                    'time_matrix': self.time_distance_matrix,
+                    'capacity_matrix': self.capacity_matrix,
+                    'loading_matrix': self.loading_matrix,
+                    'service_time_matrix': self.service_time_matrix,
+                    'max_capacity_kg': self.max_capacity_kg,
+                    'max_volume': self.max_volume_vc,
+                    'max_linear_length': self.max_linear_length_vc,
+                    'discretization_constant': self.discretization_constant,
+                    'min_date': self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
+                    'max_driving_hours': self.max_driving_hours,
+                    'alns_config': alns_config,
+                    'evaluation_period': self.evaluation_period,
+                    'allowed_early_hours': self.allowed_early_hours,
+                    'allowed_late_hours': self.allowed_late_hours,
+                    'vendor_ids': vendor_ids,
+                    'verbose': verbose,
+                    'ls_iters': ls_iters,
+                })
+
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                group_results = list(executor.map(_solve_alns_group, payloads))
+
+            combined_routes = []
+            combined_violations = []
+            feasible = True
+            for result in group_results:
+                combined_routes.extend(result['routes'])
+                combined_violations.extend(result['violations'])
+                feasible = feasible and result['feasible']
+
+            solution = RouteSolution(
+                routes=combined_routes,
+                vendors_df=self.vendors_df,
+                distance_matrix=self.distance_matrix,
+                time_matrix=self.time_distance_matrix,
+                capacity_matrix=self.capacity_matrix,
+                loading_matrix=self.loading_matrix,
+                service_time_matrix=self.service_time_matrix,
+                max_capacity_kg=self.max_capacity_kg,
+                max_volume=self.max_volume_vc,
+                max_linear_length=self.max_linear_length_vc,
+                discretization_constant=self.discretization_constant,
+                min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
+                max_driving_hours=self.max_driving_hours,
+                evaluation_period=self.evaluation_period,
+                allowed_early_hours=self.allowed_early_hours,
+                allowed_late_hours=self.allowed_late_hours,
+            )
+            is_feasible = solution.is_feasible(check_all=True) if feasible else False
+            solution._constraint_violations = combined_violations if combined_violations else list(solution._constraint_violations)
+            status = 0 if is_feasible else 2
+            self.last_constraint_violations = list(solution._constraint_violations)
+        else:
+            alns = ALNSSolver(
+                vendors_df=self.vendors_df,
+                distance_matrix=self.distance_matrix,
+                time_matrix=self.time_distance_matrix,
+                capacity_matrix=self.capacity_matrix,
+                loading_matrix=self.loading_matrix,
+                service_time_matrix=self.service_time_matrix,
+                max_capacity_kg=self.max_capacity_kg,
+                max_volume=self.max_volume_vc,
+                max_linear_length=self.max_linear_length_vc,
+                discretization_constant=self.discretization_constant,
+                min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
+                max_driving_hours=self.max_driving_hours,
+                config=alns_config,
+                evaluation_period=self.evaluation_period,
+                allowed_early_hours=self.allowed_early_hours,
+                allowed_late_hours=self.allowed_late_hours
+            )
+            
+            # Solve with ALNS
+            solution = alns.solve(verbose=verbose)
+            
+            # Apply local search improvement
+            if verbose:
+                print('   - Applying local search improvement...')
+            solution = LocalSearchOperators.improve_solution(solution, max_iterations=ls_iters)
+            
+            # Check feasibility
+            is_feasible = solution.is_feasible(check_all=True)
+            status = 0 if is_feasible else 2
+            self.last_constraint_violations = list(solution._constraint_violations)
         
         if verbose:
             if is_feasible:
@@ -206,6 +315,8 @@ class DeliveryOptimizer:
                 print(f'   ✗ Solution infeasible: {len(solution._constraint_violations)} violations')
                 for violation in solution._constraint_violations[:5]:
                     print(f'     - {violation}')
+                if len(solution._constraint_violations) > 5:
+                    print(f'     ... and {len(solution._constraint_violations) - 5} more')
                 
                 # Smart fallback: Split only violated routes, keep feasible ones
                 print(f'   🔧 Fixing {len(solution._constraint_violations)} violated routes...')
@@ -247,7 +358,9 @@ class DeliveryOptimizer:
                     discretization_constant=self.discretization_constant,
                     min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
                     max_driving_hours=self.max_driving_hours,
-                    evaluation_period=self.evaluation_period
+                    evaluation_period=self.evaluation_period,
+                    allowed_early_hours=self.allowed_early_hours,
+                    allowed_late_hours=self.allowed_late_hours
                 )
                 is_feasible = solution.is_feasible(check_all=True)
                 if is_feasible:
@@ -256,6 +369,7 @@ class DeliveryOptimizer:
                 else:
                     status = 2
                     print(f'   ✗ Still infeasible after fix!')
+                self.last_constraint_violations = list(solution._constraint_violations)
         
         # Convert route solution to MIP-style x and y matrices for compatibility
         x, y = self._convert_routes_to_mip_format(solution)
@@ -264,6 +378,7 @@ class DeliveryOptimizer:
         self.connections_solution = x
         self.vehicles_solution = y
         self.used_metaheuristic = True
+        self.metaheuristic_solution = solution
         self.metaheuristic_objective = solution.evaluate()
         self.metaheuristic_routes = solution.get_num_routes()
         self.secs_taken = 0  # Metaheuristic doesn't track time separately
@@ -1052,10 +1167,8 @@ class DeliveryOptimizer:
         
         # Find used vehicles
         vehicles_used = [k for k in range(len(vehicles)) if vehicles[k] > 0.5]
-        
-        if not vehicles_used:
-            print('⚠️  No vehicles used in solution - nothing to plot')
-            return
+        log.info(f"📊 DEBUG: vehicles_used from y = {vehicles_used}")
+        log.info(f"📊 DEBUG: y length={len(vehicles)} sample={list(vehicles)[:5]}")
         
         # Extract coordinates from vendors_df
         if self.vendors_df is None:
@@ -1084,9 +1197,12 @@ class DeliveryOptimizer:
             node_info[0] = {'name': 'Depot (Seattle)', 'type': 'depot'}
             print(f'📍 Depot coordinates: {depot_lat}, {depot_lon}')
         
-        # Vendors are nodes 1, 2, 3, ... (node_id = dataframe_index + 1, since depot is node 0)
+        # Vendors are nodes 1, 2, 3, ...
+        index_min = int(self.vendors_df.index.min()) if len(self.vendors_df.index) > 0 else 0
+        index_max = int(self.vendors_df.index.max()) if len(self.vendors_df.index) > 0 else 0
+        use_df_index = index_min == 1 and index_max == len(self.vendors_df)
         for df_idx, row in self.vendors_df.iterrows():
-            node_id = df_idx + 1  # Shift by 1 since depot is node 0
+            node_id = int(df_idx) if use_df_index else int(df_idx) + 1
             vendor_lat = row.get('vendor_latitude', None)
             vendor_lon = row.get('vendor_longitude', None)
             vendor_name = row.get('vendor Name', f'Vendor {node_id}')
@@ -1163,11 +1279,44 @@ class DeliveryOptimizer:
         
         # Check if metaheuristic was used (stores arcs at time 0)
         is_metaheuristic = getattr(self, 'used_metaheuristic', False)
+        use_direct_routes = is_metaheuristic and getattr(self, 'metaheuristic_solution', None) is not None
+        log.info(f"📊 DEBUG: used_metaheuristic={is_metaheuristic}, has_meta_solution={getattr(self, 'metaheuristic_solution', None) is not None}")
+        if use_direct_routes:
+            raw_routes = {k: list(route) for k, route in enumerate(self.metaheuristic_solution.routes)}
+            routes = {
+                k: route for k, route in raw_routes.items()
+                if route and any(node != 0 for node in route)
+            }
+            vehicles_used = list(routes.keys())
+            log.info(f"📊 DEBUG: meta routes count={len(routes)}, vehicles_used set to {vehicles_used}")
+            log.info(f"📊 DEBUG: meta routes preview={list(routes.values())[:3]}")
+
+        if not vehicles_used and use_direct_routes and routes:
+            vehicles_used = list(routes.keys())
+            log.info(f"📊 DEBUG: vehicles_used repaired from routes={vehicles_used}")
+            print(f"📊 DEBUG: vehicles_used repaired from routes={vehicles_used}")
+
+        if not vehicles_used:
+            log.warning('⚠️  No vehicles used in solution - nothing to plot')
+            log.info(f"📊 DEBUG: routes keys={list(routes.keys())}")
+            return
         
         for k in vehicles_used:
             route_arcs = []
             
-            if is_metaheuristic:
+            if use_direct_routes:
+                route_path = routes.get(k, [])
+                if route_path and route_path[0] != 0:
+                    route_path = [0] + route_path
+                if route_path and route_path[-1] != 0:
+                    route_path = route_path + [0]
+                # Display routes should start at first vendor (no depot start)
+                display_path = route_path[1:] if route_path and route_path[0] == 0 else route_path
+                routes[k] = display_path
+                log.info(f"📊 DEBUG: route_path for vehicle {k} = {route_path}")
+                log.info(f"📊 DEBUG: display_path for vehicle {k} = {display_path}")
+                route_path = display_path
+            elif is_metaheuristic:
                 # For metaheuristic: iterate through all node pairs at time 0
                 for i in range(self.length):
                     for j in range(self.length):
@@ -1185,7 +1334,9 @@ class DeliveryOptimizer:
                             route_arcs.append((i, j))
             
             # Build route path by following arcs (starting from vendors)
-            if route_arcs:
+            if use_direct_routes:
+                pass
+            elif route_arcs:
                 # Create adjacency dict
                 arc_dict = {arc[0]: arc[1] for arc in route_arcs}
                 
@@ -1221,140 +1372,242 @@ class DeliveryOptimizer:
                     route_path = cleaned_route
                 
                 routes[k] = route_path
+            elif not use_direct_routes:
+                continue
                 
-                # Calculate vehicle statistics
-                total_cargo = 0
-                total_loading = 0
-                total_distance = 0
-                vendors_visited = []
-                segments = []  # Store segment details for route card display
-                
-                cumulative_time_hours = 0.0
-                for i in range(len(route_path) - 1):
-                    node_from = route_path[i]
-                    node_to = route_path[i + 1]
-                    
-                    # Skip invalid segments (same node to itself)
-                    if node_from == node_to:
-                        continue
-                    
-                    # Add cargo and loading from vendor nodes
-                    if node_from != 0:
-                        total_cargo += self.capacity_matrix[node_from]
-                        total_loading += self.loading_matrix[node_from]
-                        vendors_visited.append(node_from)
-                    
-                    # Add distance and duration for this segment
-                    if node_from in range(len(self.distance_matrix)) and node_to in range(len(self.distance_matrix)):
-                        seg_distance = self.distance_matrix[node_from][node_to]
-                        total_distance += seg_distance
-                        
-                        # Get duration from time matrix (convert seconds to hours)
-                        seg_duration = 0
-                        if hasattr(self, 'time_distance_matrix') and self.time_distance_matrix is not None:
-                            if node_from < len(self.time_distance_matrix) and node_to < len(self.time_distance_matrix[node_from]):
-                                seg_duration = self.time_distance_matrix[node_from][node_to] / 3600.0  # seconds to hours
-                        
-                        # Calculate average speed
-                        avg_speed = seg_distance / seg_duration if seg_duration > 0 else 0
+            # Calculate vehicle statistics
+            if not route_path or route_path == [0, 0]:
+                continue
 
-                        # Expected arrival time at destination (hours since route start)
-                        arrival_hours = cumulative_time_hours + seg_duration
-                        arrival_iso = None
-                        base_dt = None
-                        min_dt = getattr(self, 'min_date', None)
+            vendors_visited = [n for n in route_path if n != 0]
+            unique_vendors = []
+            seen_vendors = set()
+            for v in vendors_visited:
+                if v not in seen_vendors:
+                    seen_vendors.add(v)
+                    unique_vendors.append(v)
 
-                        # Parse the optimizer's min_date once (fallback baseline)
-                        if min_dt is not None:
-                            # First try pandas Timestamp
-                            if hasattr(min_dt, 'to_pydatetime'):
-                                try:
-                                    base_dt = min_dt.to_pydatetime()
-                                except Exception as e:
-                                    print(f"⚠️ Warning: to_pydatetime failed: {e}")
-                                    base_dt = None
+            total_cargo = sum(self.capacity_matrix[v] for v in unique_vendors if v < len(self.capacity_matrix))
+            total_loading = sum(self.loading_matrix[v] for v in unique_vendors if v < len(self.loading_matrix))
+            total_distance = 0
+            segments = []  # Store segment details for route card display
 
-                            # Second try: string formats
-                            if base_dt is None and isinstance(min_dt, str):
-                                for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d', '%Y-%m-%dT%H:%M:%S'):
-                                    try:
-                                        base_dt = datetime.strptime(min_dt, fmt)
-                                        break
-                                    except ValueError:
-                                        continue
-                                if base_dt is None:
-                                    try:
-                                        base_dt = datetime.fromisoformat(min_dt)
-                                    except (ValueError, AttributeError):
-                                        pass
+            def _to_naive(dt_value):
+                if dt_value is None:
+                    return None
+                if isinstance(dt_value, pd.Timestamp):
+                    ts = dt_value.tz_convert(None) if dt_value.tzinfo is not None else dt_value
+                    return ts.to_pydatetime()
+                if hasattr(dt_value, 'tzinfo') and dt_value.tzinfo is not None:
+                    return dt_value.replace(tzinfo=None)
+                return dt_value
 
-                        # Optional: try to align arrival to the vendor's requested pickup/delivery window
-                        vendor_dt = None
-                        if node_to != 0 and self.vendors_df is not None:
+            # Determine route baseline time: optimize within vendor + depot windows
+            base_dt = None
+            first_vendor_id = next((n for n in route_path if n != 0), None)
+            if first_vendor_id is not None and self.vendors_df is not None:
+                try:
+                    vendor_row = self.vendors_df.iloc[int(first_vendor_id) - 1]
+                    raw_candidates = [
+                        vendor_row.get('Requested Loading', None),
+                        vendor_row.get('Requested Loading Date', None),
+                        vendor_row.get('Requested Delivery', None),
+                        vendor_row.get('Requested Delivery Date', None),
+                    ]
+                    first_vendor_requested = None
+                    for raw_dt in raw_candidates:
+                        parsed = pd.to_datetime(raw_dt, errors='coerce', utc=True)
+                        if pd.notna(parsed):
+                            first_vendor_requested = _to_naive(parsed)
+                            break
+
+                    # Compute route duration (travel + service) to reach depot
+                    route_duration_seconds = 0
+                    for i in range(1, len(route_path)):
+                        prev_node = route_path[i - 1]
+                        node = route_path[i]
+                        if prev_node < len(self.time_distance_matrix) and node < len(self.time_distance_matrix[prev_node]):
+                            route_duration_seconds += self.time_distance_matrix[prev_node][node]
+                        if node != 0 and self.service_time_matrix is not None and node < len(self.service_time_matrix):
+                            route_duration_seconds += self.service_time_matrix[node] * 60
+
+                    # Latest requested delivery in this route (for depot window)
+                    route_latest_delivery = None
+                    for node in route_path:
+                        if node == 0:
+                            continue
+                        vendor_row = self.vendors_df.iloc[int(node) - 1]
+                        raw_delivery_candidates = [
+                            vendor_row.get('Requested Delivery', None),
+                            vendor_row.get('Requested Delivery Date', None),
+                        ]
+                        for raw in raw_delivery_candidates:
+                            parsed = pd.to_datetime(raw, errors='coerce', utc=True)
+                            if pd.notna(parsed):
+                                parsed = _to_naive(parsed)
+                                route_latest_delivery = parsed if route_latest_delivery is None else max(route_latest_delivery, parsed)
+                                break
+
+                    if first_vendor_requested is not None:
+                        allowed_early_hours = float(getattr(self, 'allowed_early_hours', 12))
+                        allowed_late_hours = float(getattr(self, 'allowed_late_hours', 12))
+
+                        vendor_window_start = first_vendor_requested - timedelta(hours=allowed_early_hours)
+                        vendor_window_end = first_vendor_requested + timedelta(hours=allowed_late_hours)
+
+                        if route_latest_delivery is not None:
+                            depot_window_start = route_latest_delivery - timedelta(hours=allowed_early_hours)
+                            depot_window_end = route_latest_delivery + timedelta(hours=allowed_late_hours)
+                        else:
+                            depot_window_start = getattr(self, 'min_date', None)
+                            depot_window_end = getattr(self, 'max_date', None)
+
+                        if depot_window_start is not None and depot_window_end is not None:
+                            depot_start_min = depot_window_start - timedelta(seconds=route_duration_seconds)
+                            depot_start_max = depot_window_end - timedelta(seconds=route_duration_seconds)
+                            start_min = max(vendor_window_start, depot_start_min)
+                            start_max = min(vendor_window_end, depot_start_max)
+                        else:
+                            start_min = vendor_window_start
+                            start_max = vendor_window_end
+
+                        # Choose start time closest to requested loading, within feasible window
+                        if start_min <= start_max:
+                            if first_vendor_requested < start_min:
+                                base_dt = start_min
+                            elif first_vendor_requested > start_max:
+                                base_dt = start_max
+                            else:
+                                base_dt = first_vendor_requested
+                        else:
+                            base_dt = vendor_window_start
+
+                        log.info(
+                            "🕒 Route %s optimized start: first_vendor_id=%s requested=%s start=%s",
+                            k,
+                            first_vendor_id,
+                            first_vendor_requested,
+                            base_dt
+                        )
+                except Exception:
+                    base_dt = None
+
+            if base_dt is None:
+                min_dt = getattr(self, 'min_date', None)
+                if min_dt is not None:
+                    if hasattr(min_dt, 'to_pydatetime'):
+                        try:
+                            base_dt = min_dt.to_pydatetime()
+                        except Exception as e:
+                            print(f"⚠️ Warning: to_pydatetime failed: {e}")
+                            base_dt = None
+                    if base_dt is None and isinstance(min_dt, str):
+                        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d', '%Y-%m-%dT%H:%M:%S'):
                             try:
-                                vendor_row = self.vendors_df.iloc[int(node_to) - 1]
-                                raw_candidates = [
-                                    vendor_row.get('Requested Loading', None),
-                                    vendor_row.get('Requested Loading Date', None),
-                                    vendor_row.get('Requested Delivery', None),
-                                    vendor_row.get('Requested Delivery Date', None),
-                                ]
-                                for raw_dt in raw_candidates:
-                                    parsed = pd.to_datetime(raw_dt, errors='coerce')
-                                    if pd.notna(parsed):
-                                        vendor_dt = parsed.to_pydatetime()
-                                        break
-                            except Exception:
-                                vendor_dt = None
+                                base_dt = datetime.strptime(min_dt, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        if base_dt is None:
+                            try:
+                                base_dt = datetime.fromisoformat(min_dt)
+                            except (ValueError, AttributeError):
+                                pass
 
-                        # Compute candidate arrival time
-                        candidate_dt = None
-                        if base_dt is not None:
-                            candidate_dt = base_dt + timedelta(hours=arrival_hours)
-                        elif vendor_dt is not None:
-                            # Fall back to vendor requested time if base is unavailable
-                            candidate_dt = vendor_dt
+            cumulative_time_hours = 0.0
+            for i in range(len(route_path) - 1):
+                node_from = route_path[i]
+                node_to = route_path[i + 1]
 
-                        # Enforce a not-earlier-than window of 24h before requested time (if available)
-                        if vendor_dt is not None and candidate_dt is not None:
-                            earliest_allowed = vendor_dt - timedelta(hours=24)
-                            candidate_dt = max(candidate_dt, earliest_allowed)
+                # Skip invalid segments (same node to itself)
+                if node_from == node_to:
+                    continue
+                # Add distance and duration for this segment
+                if node_from in range(len(self.distance_matrix)) and node_to in range(len(self.distance_matrix)):
+                    seg_distance = self.distance_matrix[node_from][node_to]
+                    total_distance += seg_distance
 
-                        if candidate_dt is not None:
-                            arrival_iso = candidate_dt.strftime('%Y-%m-%d %H:%M:%S')
-                        elif min_dt is not None:
-                            # Debug: min_dt exists but base_dt is None - conversion failed
-                            print(f"⚠️ Warning: Could not convert min_date to datetime. min_date={min_dt} (type: {type(min_dt).__name__})")
+                    # Get duration from time matrix (convert seconds to hours)
+                    seg_duration = 0
+                    if hasattr(self, 'time_distance_matrix') and self.time_distance_matrix is not None:
+                        if node_from < len(self.time_distance_matrix) and node_to < len(self.time_distance_matrix[node_from]):
+                            seg_duration = self.time_distance_matrix[node_from][node_to] / 3600.0  # seconds to hours
 
+                    # Calculate average speed
+                    avg_speed = seg_distance / seg_duration if seg_duration > 0 else 0
 
-                        # Service time at destination (hours)
-                        service_time_hours_node = 0.0
-                        if hasattr(self, 'service_time_matrix') and self.service_time_matrix is not None:
-                            if node_to < len(self.service_time_matrix):
-                                service_time_hours_node = self.service_time_matrix[node_to] / 60.0
+                    # Expected arrival time at destination (hours since route start)
+                    arrival_hours = cumulative_time_hours + seg_duration
+                    arrival_iso = None
+                    vendor_dt = None
+                    if node_to != 0 and self.vendors_df is not None:
+                        try:
+                            vendor_row = self.vendors_df.iloc[int(node_to) - 1]
+                            raw_candidates = [
+                                vendor_row.get('Requested Loading', None),
+                                vendor_row.get('Requested Loading Date', None),
+                                vendor_row.get('Requested Delivery', None),
+                                vendor_row.get('Requested Delivery Date', None),
+                            ]
+                            for raw_dt in raw_candidates:
+                                parsed = pd.to_datetime(raw_dt, errors='coerce', utc=True)
+                                if pd.notna(parsed):
+                                    vendor_dt = _to_naive(parsed)
+                                    break
+                        except Exception:
+                            vendor_dt = None
 
-                        # Store segment details (only valid segments with different nodes)
-                        segments.append({
-                            'from_id': node_from,
-                            'to_id': node_to,
-                            'distance': seg_distance,
-                            'duration': seg_duration,
-                            'avg_speed': avg_speed,
-                            'arrival_hours': arrival_hours,
-                            'arrival_time': arrival_iso
-                        })
+                    # Compute candidate arrival time
+                    candidate_dt = None
+                    if base_dt is not None:
+                        candidate_dt = _to_naive(base_dt) + timedelta(hours=arrival_hours)
+                    elif vendor_dt is not None:
+                        # Fall back to vendor requested time if base is unavailable
+                        candidate_dt = vendor_dt
 
-                        # Advance cumulative time (travel + service at destination)
-                        cumulative_time_hours = arrival_hours + service_time_hours_node
-                
-                route_stats[k] = {
-                    'total_cargo': total_cargo,
-                    'total_loading': total_loading,
-                    'total_distance': total_distance,
-                    'num_vendors': len(set(vendors_visited)),
-                    'vendors': vendors_visited,
-                    'segments': segments  # Add segment details
-                }
+                    # Enforce a not-earlier-than window of allowed_early hours (if available)
+                    if vendor_dt is not None and candidate_dt is not None:
+                        vendor_dt = _to_naive(vendor_dt)
+                        candidate_dt = _to_naive(candidate_dt)
+                        allowed_early_hours = float(getattr(self, 'allowed_early_hours', 12))
+                        earliest_allowed = vendor_dt - timedelta(hours=allowed_early_hours)
+                        candidate_dt = max(candidate_dt, earliest_allowed)
+
+                    if candidate_dt is not None:
+                        arrival_iso = candidate_dt.strftime('%Y-%m-%d %H:%M:%S')
+                    elif getattr(self, 'min_date', None) is not None:
+                        # Debug: min_dt exists but base_dt is None - conversion failed
+                        min_dt = getattr(self, 'min_date', None)
+                        print(f"⚠️ Warning: Could not convert min_date to datetime. min_date={min_dt} (type: {type(min_dt).__name__})")
+
+                    # Service time at destination (hours)
+                    service_time_hours_node = 0.0
+                    if hasattr(self, 'service_time_matrix') and self.service_time_matrix is not None:
+                        if node_to < len(self.service_time_matrix):
+                            service_time_hours_node = self.service_time_matrix[node_to] / 60.0
+
+                    # Store segment details (only valid segments with different nodes)
+                    segments.append({
+                        'from_id': node_from,
+                        'to_id': node_to,
+                        'distance': seg_distance,
+                        'duration': seg_duration,
+                        'avg_speed': avg_speed,
+                        'arrival_hours': arrival_hours,
+                        'arrival_time': arrival_iso
+                    })
+
+                    # Advance cumulative time (travel + service at destination)
+                    cumulative_time_hours = arrival_hours + service_time_hours_node
+
+            route_stats[k] = {
+                'total_cargo': total_cargo,
+                'total_loading': total_loading,
+                'total_distance': total_distance,
+                'num_vendors': len(unique_vendors),
+                'vendors': unique_vendors,
+                'segments': segments  # Add segment details
+            }
         
         print('🗺️  Generating route visualization with actual road routing...')
         
@@ -1374,6 +1627,7 @@ class DeliveryOptimizer:
                         vendor_visits[node] = {'vehicle': vehicle_id, 'route_number': route_mapping[vehicle_id], 'step': step_num, 'total_steps': len([n for n in route if n != 0])}
         
         # Plot routes using OSRM for actual street routing
+        osrm_failures = []
         route_feature_groups = {}  # Store feature groups for each route
         
         for vehicle_id, route in routes.items():
@@ -1388,7 +1642,7 @@ class DeliveryOptimizer:
             for i in range(len(route) - 1):
                 node_from = route[i]
                 node_to = route[i + 1]
-                
+
                 # Calculate step number (1-indexed)
                 step_number = i + 1
                 total_steps = len(route) - 1
@@ -1515,7 +1769,9 @@ class DeliveryOptimizer:
                             raise Exception(f"OSRM API error: {response.status_code}")
                             
                     except Exception as e:
-                        print(f'  ⚠️  Could not get route from OSRM for segment {node_from}→{node_to}: {e}')
+                        failure_msg = f"OSRM route failed for segment {node_from}→{node_to}: {e}"
+                        print(f'  ⚠️  {failure_msg}')
+                        osrm_failures.append(failure_msg)
                         # Fallback to straight line with clear indication
                         folium.PolyLine(
                             [(lat_from, lon_from), (lat_to, lon_to)],
@@ -1638,6 +1894,9 @@ class DeliveryOptimizer:
                 vendor_markers_added += 1
         
         log.info(f'✅ COMPLETE: All node markers processed (1 depot + {vendor_markers_added} vendors added)')
+
+        # Expose OSRM failures (if any) for API/UI warnings
+        self.osrm_failures = osrm_failures
         
         # Add fullscreen button
         plugins.Fullscreen(position='topleft', title='Fullscreen', titleCancel='Exit Fullscreen').add_to(m)
@@ -1660,7 +1919,7 @@ class DeliveryOptimizer:
         
         # Mini map removed per user request
         
-        log.info(f'✅ COMPLETE: All node markers added to map (1 depot + {num_vendors} vendors)')
+        log.info(f'✅ COMPLETE: All node markers added to map (1 depot + {vendor_markers_added} vendors)')
         
         # Calculate total distance across all routes
         total_distance = sum(stats['total_distance'] for stats in route_stats.values())

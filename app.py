@@ -28,6 +28,87 @@ import json
 app = Flask(__name__, static_folder='web', static_url_path='')
 CORS(app)
 
+# ---------- Time window grouping ----------
+def _compute_time_groups(df, earl_arv_hours, late_arv_hours):
+    """Group requests by overlapping time windows (transitive overlap)."""
+    # Prefer normalized columns, fall back to raw if needed
+    loading_col = 'Requested Loading' if 'Requested Loading' in df.columns else 'Requested Loading Date'
+    delivery_col = 'Requested Delivery' if 'Requested Delivery' in df.columns else 'Requested Delivery Date'
+
+    loading_dt = pd.to_datetime(df.get(loading_col), errors='coerce', utc=True)
+    delivery_dt = pd.to_datetime(df.get(delivery_col), errors='coerce', utc=True)
+    delivery_dt = delivery_dt.fillna(loading_dt)
+
+    start_dt = loading_dt - pd.to_timedelta(earl_arv_hours, unit='h')
+    end_dt = delivery_dt + pd.to_timedelta(late_arv_hours, unit='h')
+
+    entries = []
+    for idx in df.index:
+        s = start_dt.loc[idx]
+        e = end_dt.loc[idx]
+        if pd.isna(s) or pd.isna(e):
+            entries.append((idx, None, None))
+        else:
+            entries.append((idx, s.to_pydatetime(), e.to_pydatetime()))
+
+    # Sort valid entries by start time
+    valid_entries = [(idx, s, e) for idx, s, e in entries if s is not None and e is not None]
+    valid_entries.sort(key=lambda x: x[1])
+
+    group_ids = {}
+    groups = []
+    group_counter = 1
+    current_start = None
+    current_end = None
+    current_members = []
+
+    def _close_group():
+        nonlocal group_counter, current_start, current_end, current_members
+        if current_start is None:
+            return
+        group_id = f"G{group_counter}"
+        for idx in current_members:
+            group_ids[idx] = group_id
+        groups.append({
+            'group_id': group_id,
+            'min_start': current_start.strftime('%Y-%m-%d %H:%M:%S'),
+            'max_end': current_end.strftime('%Y-%m-%d %H:%M:%S'),
+        })
+        group_counter += 1
+        current_start = None
+        current_end = None
+        current_members = []
+
+    for idx, s, e in valid_entries:
+        if current_start is None:
+            current_start, current_end = s, e
+            current_members = [idx]
+            continue
+        if s <= current_end:
+            current_end = max(current_end, e)
+            current_members.append(idx)
+        else:
+            _close_group()
+            current_start, current_end = s, e
+            current_members = [idx]
+
+    _close_group()
+
+    # Assign missing-date rows to their own group
+    for idx, s, e in entries:
+        if s is None or e is None:
+            group_id = f"UNGROUPED-{idx}"
+            group_ids[idx] = group_id
+            groups.append({
+                'group_id': group_id,
+                'min_start': None,
+                'max_end': None,
+            })
+
+    # Return a series aligned with df
+    group_series = pd.Series([group_ids.get(idx, '') for idx in df.index], index=df.index)
+    return group_series, groups
+
 # Configure file logging to /tmp/flask_app.log
 log_path = '/tmp/flask_app.log'
 try:
@@ -68,6 +149,7 @@ def index():
 def upload_csv():
     """Handle CSV file upload and return vendor data"""
     try:
+        preprocessing_warnings = []
         if 'file' not in request.files:
             return jsonify({'error': 'No file uploaded'}), 400
         
@@ -199,6 +281,21 @@ def upload_csv():
         if calculated_max_linear_length is not None:
             response_data['calculated_max_linear_length'] = round(calculated_max_linear_length, 1)
         
+        response_data['preprocessing_warnings'] = preprocessing_warnings
+        # Optional grouping preview with default tolerances
+        try:
+            preview_groups = []
+            df_preview = pd.read_csv(filepath)
+            if 'Requested Loading Date' in df_preview.columns or 'Requested Delivery Date' in df_preview.columns:
+                group_series, preview_groups = _compute_time_groups(df_preview, 24, 24)
+                response_data['time_groups'] = preview_groups
+                logging.info(
+                    "🧩 Upload time-window groups (%s): %s",
+                    len(preview_groups),
+                    ", ".join([f"{g['group_id']}[{g['min_start']}..{g['max_end']}]" for g in preview_groups if g.get('min_start')])
+                )
+        except Exception:
+            pass
         return jsonify(response_data)
     
     except Exception as e:
@@ -240,9 +337,9 @@ def optimize_routes():
             print(f"Using CSV file: {csv_filepath}")
             df_raw = pd.read_csv(csv_filepath)
             
-            # Calculate period from RAW dates with CORRECT 12-hour buffers
-            # Period Start = MIN(Requested Loading Date) - 12 hours
-            # Period End = MAX(Requested Delivery Date) + 12 hours
+            # Calculate period from RAW dates using input buffers
+            # Period Start = MIN(Requested Loading Date) - earl_arv hours
+            # Period End = MAX(Requested Delivery Date) + late_arv hours
             period = None
             loading_min = None
             delivery_max = None
@@ -260,13 +357,15 @@ def optimize_routes():
                     delivery_max = delivery_dates.max()
             
             if loading_min is not None and delivery_max is not None:
-                # Apply 12-hour buffers (vendor must have time to prepare, depot must have time to receive)
-                period_start = loading_min - timedelta(hours=12)
-                period_end = delivery_max + timedelta(hours=12)
+                # Apply input buffers
+                buffer_early_hours = int(params.get('earl_arv', 12))
+                buffer_late_hours = int(params.get('late_arv', 12))
+                period_start = loading_min - timedelta(hours=buffer_early_hours)
+                period_end = delivery_max + timedelta(hours=buffer_late_hours)
                 period = [period_start, period_end]
-                print(f"📅 Correct Tour Period (with ±12h buffers):")
-                print(f"   MIN(Requested Loading Date) - 12h = {period_start}")
-                print(f"   MAX(Requested Delivery Date) + 12h = {period_end}")
+                print(f"📅 Correct Tour Period (with ±{buffer_early_hours}h/{buffer_late_hours}h buffers):")
+                print(f"   MIN(Requested Loading Date) - {buffer_early_hours}h = {period_start}")
+                print(f"   MAX(Requested Delivery Date) + {buffer_late_hours}h = {period_end}")
                 print(f"   Period: {period_start} to {period_end}")
             
                 # Analyze the date distribution for debugging time window issues
@@ -306,6 +405,17 @@ def optimize_routes():
                 df['Requested Delivery'] = pd.to_datetime(df['Requested Delivery Date'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
             else:
                 df['Requested Delivery'] = df['Requested Loading']
+
+            # Add time bucket based on overlapping time windows (transitive overlap)
+            buffer_early_hours = int(params.get('earl_arv', 24))
+            buffer_late_hours = int(params.get('late_arv', 24))
+            time_group_series, time_groups = _compute_time_groups(df, buffer_early_hours, buffer_late_hours)
+            df['time_bucket'] = time_group_series.fillna('')
+            logging.info(
+                "🧩 Time-window groups (%s): %s",
+                len(time_groups),
+                ", ".join([f"{g['group_id']}[{g['min_start']}..{g['max_end']}]" for g in time_groups if g.get('min_start')])
+            )
             
             # Track failed geocoding attempts (will be returned to frontend)
             failed_geocodes = []
@@ -502,6 +612,7 @@ def optimize_routes():
             'time_window_sampling_threshold': 20,
             'time_window_sample_size': 20
         }
+        print(f"🧭 Time window params: earl_arv={network_params['earl_arv']}h, late_arv={network_params['late_arv']}h")
         
         # Create graph
         print(f"Creating graph with {len(vendors_data)} vendors...")
@@ -530,6 +641,40 @@ def optimize_routes():
             complete_coordinates, vendors_df = net.read_data(period_str, df)
         except Exception as e:
             return jsonify({'error': f'Failed to read vendor data: {str(e)}'}), 500
+
+        # Preprocessing warnings (rows filtered out before optimization)
+        preprocessing_warnings = []
+        try:
+            period_start_dt = pd.to_datetime(period_str[0], errors='coerce')
+            period_end_dt = pd.to_datetime(period_str[1], errors='coerce')
+            if 'Requested Loading' in df.columns:
+                loading_dt = pd.to_datetime(df['Requested Loading'], errors='coerce')
+                in_period = (loading_dt >= period_start_dt) & (loading_dt <= period_end_dt)
+                for idx, row in df[~in_period].iterrows():
+                    vendor_name = str(row.get('vendor Name', row.get('Vendor Name', f'Vendor {idx + 1}'))).strip()
+                    vendor_city = str(row.get('Vendor City', 'Unknown')).strip()
+                    preprocessing_warnings.append({
+                        'type': 'filtered_outside_period',
+                        'vendor_name': vendor_name,
+                        'city': vendor_city,
+                        'detail': f"Requested Loading Date {row.get('Requested Loading')} is outside period [{period_str[0]} .. {period_str[1]}]"
+                    })
+            # Detect inconsistent loading/delivery ordering
+            if 'Requested Loading' in df.columns and 'Requested Delivery' in df.columns:
+                loading_dt = pd.to_datetime(df['Requested Loading'], errors='coerce')
+                delivery_dt = pd.to_datetime(df['Requested Delivery'], errors='coerce')
+                invalid_order = delivery_dt.notna() & loading_dt.notna() & (delivery_dt < loading_dt)
+                for idx, row in df[invalid_order].iterrows():
+                    vendor_name = str(row.get('vendor Name', row.get('Vendor Name', f'Vendor {idx + 1}'))).strip()
+                    vendor_city = str(row.get('Vendor City', 'Unknown')).strip()
+                    preprocessing_warnings.append({
+                        'type': 'delivery_before_loading',
+                        'vendor_name': vendor_name,
+                        'city': vendor_city,
+                        'detail': f"Requested Delivery Date {row.get('Requested Delivery')} is earlier than Requested Loading Date {row.get('Requested Loading')}"
+                    })
+        except Exception:
+            pass
         
         vendor_count = len(vendors_df)
         print(f"Successfully loaded {vendor_count} vendors")
@@ -582,19 +727,42 @@ def optimize_routes():
                 max_vendor_depot_time_hours = max(vendor_to_depot_times) / 3600.0
                 # Add service time per stop + safety buffer
                 service_time_hours = (params.get('service_time_minutes', 120)) / 60.0
-                calculated_max_driving = max_vendor_depot_time_hours + service_time_hours + 2.0
+
+                # Estimate multi-stop route requirement to avoid over-splitting
+                vendor_count = len(net.time_distance_matrix) - 1
+                vendor_to_vendor_times = []
+                for i in range(1, len(net.time_distance_matrix)):
+                    for j in range(1, len(net.time_distance_matrix)):
+                        if i != j:
+                            vendor_to_vendor_times.append(net.time_distance_matrix[i][j])
+                max_vendor_to_vendor_hours = (max(vendor_to_vendor_times) / 3600.0) if vendor_to_vendor_times else 0.0
+
+                # Target at least 2 routes for small datasets; estimate stops per route
+                target_routes = max(2, int(np.ceil(vendor_count / 3))) if vendor_count > 1 else 1
+                stops_per_route = max(1, int(np.ceil(vendor_count / target_routes)))
+
+                estimated_multi_stop = (
+                    max_vendor_depot_time_hours +
+                    max_vendor_to_vendor_hours * max(0, stops_per_route - 1) +
+                    service_time_hours * stops_per_route +
+                    2.0
+                )
+
+                calculated_max_driving = max(
+                    max_vendor_depot_time_hours + service_time_hours + 2.0,
+                    estimated_multi_stop
+                )
                 
                 # Use calculated value (user can still override by changing the form from default 67)
                 user_max_driving = params.get('max_driving', None)
                 
-                # Hard minimum validation - reject if below calculated minimum
+                # If user-provided max_driving is too low, auto-raise to minimum
                 if user_max_driving is not None and user_max_driving < calculated_max_driving:
-                    return jsonify({
-                        'success': False,
-                        'error': f'max_driving ({user_max_driving:.1f}h) is below the minimum required ({calculated_max_driving:.1f}h). '
-                                f'The farthest vendor-to-depot requires {max_vendor_depot_time_hours:.1f}h travel. '
-                                f'Please set max_driving to at least {calculated_max_driving:.1f}h.'
-                    }), 400
+                    print(
+                        f"⚠️  max_driving ({user_max_driving:.1f}h) below minimum "
+                        f"({calculated_max_driving:.1f}h). Auto-raising to minimum."
+                    )
+                    user_max_driving = calculated_max_driving
                 
                 if user_max_driving is None or user_max_driving == 67:  # 67 is the new UI default
                     network_params['max_driving'] = calculated_max_driving
@@ -660,6 +828,8 @@ def optimize_routes():
             max_volume=network_params['max_volume'],
             max_linear_length=network_params['max_linear_length'],
             max_driving=network_params['max_driving'],
+            allowed_early_hours=network_params.get('earl_arv', 12),
+            allowed_late_hours=network_params.get('late_arv', 12),
             is_gap=not use_metaheuristic,
             # MIP gap: use live parameter (request > model_params > default)
             mip_gap=(
@@ -724,7 +894,22 @@ def optimize_routes():
         
         # Check if solution was found
         if status not in (0, 1):
-            return jsonify({'error': f'Optimization failed with status {status} (0=optimal, 1=feasible, 2=infeasible)'}), 500
+            violations = []
+            violation_count = 0
+            if hasattr(optimizer, 'last_constraint_violations'):
+                violations = optimizer.last_constraint_violations or []
+                violation_count = len(violations)
+            osrm_failures = getattr(optimizer, 'osrm_failures', None)
+            return jsonify({
+                'success': False,
+                'status': status,
+                'warning': f'Infeasible solution (status {status})',
+                'constraint_violation_count': violation_count,
+                'constraint_violations': violations[:50],
+                'preprocessing_warnings': preprocessing_warnings,
+                'time_groups': time_groups if 'time_groups' in locals() else [],
+                'osrm_failures': osrm_failures[:50] if osrm_failures else []
+            }), 200
         if status == 1:
             logging.info('⚠️ Optimization returned feasible (status=1); proceeding with best found solution')
         
@@ -841,8 +1026,11 @@ def optimize_routes():
         
         print(f"✅ Final depot location: {depot_city}, {depot_country}\n")
         
+        index_min = int(vendors_df.index.min()) if len(vendors_df.index) > 0 else 0
+        index_max = int(vendors_df.index.max()) if len(vendors_df.index) > 0 else 0
+        use_df_index = index_min == 1 and index_max == len(vendors_df)
         for idx, row in vendors_df.iterrows():
-            vendor_id = int(idx + 1)
+            vendor_id = int(idx) if use_df_index else int(idx) + 1
             vendor_name_map[vendor_id] = str(row.get('vendor Name', row.get('Vendor Name', f'Vendor {vendor_id}'))).strip()
             
             # Extract city information
@@ -887,6 +1075,98 @@ def optimize_routes():
             # Track cumulative cargo - what's currently on the truck
             cumulative_weight = 0.0
             cumulative_volume = 0.0
+            prev_arrival_time = None
+
+            # Route-level optimized start time (within vendor + depot windows)
+            route_base_dt = None
+            start_vendor_display = None
+            start_vendor_requested = None
+            start_cargo_kg = None
+            start_volume_m3 = None
+            try:
+                first_vendor_id = stats.get('vendors', [None])[0]
+                if first_vendor_id:
+                    vendor_row = vendors_df.iloc[int(first_vendor_id) - 1]
+                    start_vendor_name = vendor_name_map.get(int(first_vendor_id), f'Vendor {first_vendor_id}')
+                    start_vendor_city = vendor_city_map.get(int(first_vendor_id), 'Unknown')
+                    start_vendor_country = vendor_country_map.get(int(first_vendor_id), 'USA')
+                    start_vendor_display = f"{start_vendor_name}, {start_vendor_city}, {start_vendor_country}"
+                    raw_candidates = [
+                        vendor_row.get('Requested Loading', ''),
+                        vendor_row.get('Requested Loading Date', ''),
+                        vendor_row.get('Requested Delivery', ''),
+                        vendor_row.get('Requested Delivery Date', ''),
+                    ]
+                    first_vendor_requested = None
+                    for raw_dt in raw_candidates:
+                        parsed = pd.to_datetime(raw_dt, errors='coerce')
+                        if pd.notna(parsed):
+                            first_vendor_requested = parsed.to_pydatetime()
+                            start_vendor_requested = parsed.to_pydatetime()
+                            break
+
+                    if int(first_vendor_id) < len(capacity_matrix):
+                        start_cargo_kg = float(capacity_matrix[int(first_vendor_id)])
+                    if int(first_vendor_id) < len(loading_matrix):
+                        start_volume_m3 = float(loading_matrix[int(first_vendor_id)])
+
+                    # Compute route duration (travel + service) to reach depot
+                    route_duration_hours = 0.0
+                    for seg in raw_segments:
+                        route_duration_hours += float(seg.get('duration', 0) or 0)
+                        if seg.get('to_id') != 0:
+                            route_duration_hours += (service_time_minutes / 60.0)
+
+                    # Depot target window from latest requested delivery in route
+                    route_latest_delivery = None
+                    for v_id in stats.get('vendors', []):
+                        try:
+                            v_row = vendors_df.iloc[int(v_id) - 1]
+                            raw_delivery_candidates = [
+                                v_row.get('Requested Delivery', ''),
+                                v_row.get('Requested Delivery Date', ''),
+                            ]
+                            for raw_delivery in raw_delivery_candidates:
+                                parsed_delivery = pd.to_datetime(raw_delivery, errors='coerce')
+                                if pd.notna(parsed_delivery):
+                                    route_latest_delivery = parsed_delivery.to_pydatetime() if route_latest_delivery is None else max(route_latest_delivery, parsed_delivery.to_pydatetime())
+                                    break
+                        except Exception:
+                            continue
+
+                    if first_vendor_requested:
+                        allowed_early_hours = float(params.get('earl_arv', 12))
+                        allowed_late_hours = float(params.get('late_arv', 12))
+                        vendor_window_start = first_vendor_requested - timedelta(hours=allowed_early_hours)
+                        vendor_window_end = first_vendor_requested + timedelta(hours=allowed_late_hours)
+
+                        if route_latest_delivery:
+                            depot_window_start = route_latest_delivery - timedelta(hours=allowed_early_hours)
+                            depot_window_end = route_latest_delivery + timedelta(hours=allowed_late_hours)
+                        else:
+                            depot_window_start = period[0] if period else None
+                            depot_window_end = period[1] if period else None
+
+                        if depot_window_start and depot_window_end:
+                            depot_start_min = depot_window_start - timedelta(hours=route_duration_hours)
+                            depot_start_max = depot_window_end - timedelta(hours=route_duration_hours)
+                            start_min = max(vendor_window_start, depot_start_min)
+                            start_max = min(vendor_window_end, depot_start_max)
+                        else:
+                            start_min = vendor_window_start
+                            start_max = vendor_window_end
+
+                        if start_min <= start_max:
+                            if first_vendor_requested < start_min:
+                                route_base_dt = start_min
+                            elif first_vendor_requested > start_max:
+                                route_base_dt = start_max
+                            else:
+                                route_base_dt = first_vendor_requested
+                        else:
+                            route_base_dt = vendor_window_start
+            except Exception:
+                route_base_dt = None
             
             for seg_idx, seg in enumerate(raw_segments):
                 from_id = seg['from_id']
@@ -938,6 +1218,8 @@ def optimize_routes():
                 pickup_date = None
                 requested_vendor_pickup = None
                 requested_depot_delivery = None
+                requested_vendor_pickup_from = None
+                expected_arrival_vendor_from = None
                 
                 if to_id != 0:
                     # Going TO a vendor - show vendor's requested pickup/loading time
@@ -975,6 +1257,27 @@ def optimize_routes():
                                 break
                     except Exception:
                         pass
+                    # Also show vendor's requested loading and expected arrival (from previous segment)
+                    try:
+                        vendor_row = vendors_df.iloc[from_id - 1]
+                        raw_pickup_candidates = [
+                            vendor_row.get('Requested Loading', ''),
+                            vendor_row.get('Requested Loading Date', ''),
+                            vendor_row.get('Requested Delivery', ''),
+                            vendor_row.get('Requested Delivery Date', ''),
+                        ]
+                        for raw_pickup in raw_pickup_candidates:
+                            parsed_pickup = pd.to_datetime(raw_pickup, errors='coerce')
+                            if pd.notna(parsed_pickup):
+                                requested_vendor_pickup_from = parsed_pickup.strftime('%Y-%m-%d %H:%M:%S')
+                                break
+                    except Exception:
+                        pass
+                    if prev_arrival_time:
+                        expected_arrival_vendor_from = prev_arrival_time
+                    elif route_base_dt is not None:
+                        # For first-vendor start, use optimized route start time
+                        expected_arrival_vendor_from = route_base_dt.strftime('%Y-%m-%d %H:%M:%S')
 
                 seg_data = {
                     'from': from_display,
@@ -995,12 +1298,18 @@ def optimize_routes():
                     seg_data['requested_vendor_pickup'] = requested_vendor_pickup
                 if requested_depot_delivery:
                     seg_data['requested_depot_delivery'] = requested_depot_delivery
+                if requested_vendor_pickup_from:
+                    seg_data['requested_vendor_pickup_from'] = requested_vendor_pickup_from
+                if expected_arrival_vendor_from:
+                    seg_data['expected_arrival_vendor_from'] = expected_arrival_vendor_from
                 if 'arrival_time' in seg and seg.get('arrival_time'):
                     seg_data['expected_arrival'] = seg.get('arrival_time')
                 if 'arrival_hours' in seg and seg.get('arrival_hours') is not None:
                     seg_data['expected_arrival_hours'] = float(round(seg.get('arrival_hours'), 2))
                 
                 segments_with_names.append(seg_data)
+                if seg.get('arrival_time'):
+                    prev_arrival_time = seg.get('arrival_time')
 
             # Group segments by location to detect multi-pickups at same address
             grouped_segments = []
@@ -1089,6 +1398,11 @@ def optimize_routes():
                 'loading': float(round(stats['total_loading'], 2)),
                 'total_time_hours': float(round(total_time_hours, 2)),
                 'segments': list(segments_with_names),  # Make explicit copy
+                'start_vendor': start_vendor_display,
+                'start_requested_loading': start_vendor_requested.strftime('%Y-%m-%d %H:%M:%S') if start_vendor_requested else None,
+                'start_expected_arrival': route_base_dt.strftime('%Y-%m-%d %H:%M:%S') if route_base_dt else None,
+                'start_cargo_kg': float(round(start_cargo_kg, 2)) if start_cargo_kg is not None else None,
+                'start_volume_m3': float(round(start_volume_m3, 2)) if start_volume_m3 is not None else None,
                 # Utilization metrics
                 'weight_utilization': float(round(weight_utilization, 1)),
                 'volume_utilization': float(round(volume_utilization, 1)),
@@ -1111,8 +1425,11 @@ def optimize_routes():
 
         try:
             # Prepare vendor name and delivery date lookup (1-indexed)
+            index_min = int(vendors_df.index.min()) if len(vendors_df.index) > 0 else 0
+            index_max = int(vendors_df.index.max()) if len(vendors_df.index) > 0 else 0
+            use_df_index = index_min == 1 and index_max == len(vendors_df)
             for idx, row in vendors_df.iterrows():
-                vendor_id = int(idx + 1)
+                vendor_id = int(idx) if use_df_index else int(idx) + 1
                 vendor_name_map[vendor_id] = str(row.get('vendor Name', row.get('Vendor Name', f'Vendor {vendor_id}')))
 
                 raw_date = row.get('Requested Delivery', row.get('Requested Delivery Date', ''))
@@ -1238,20 +1555,22 @@ def optimize_routes():
             APP_STATE['max_capacity_kg'] = float(network_params['max_weight'] * 1000.0)
             APP_STATE['max_volume'] = float(network_params['max_volume'])
             APP_STATE['max_linear_length'] = float(network_params['max_linear_length'])
-            # Store simple time windows based on requested delivery ±12h
+            # Store simple time windows based on requested delivery ±allowed hours
             APP_STATE['min_date'] = str(net.min_date) if hasattr(net, 'min_date') else str(period[0])
             # Build earliest/latest arrays aligned to node index (0=depot placeholder)
             earliest = [None] * (len(vendors_df) + 1)
             latest = [None] * (len(vendors_df) + 1)
             base = pd.to_datetime(net.min_date) if hasattr(net, 'min_date') else pd.to_datetime(period[0])
+            allowed_early_hours = float(network_params.get('earl_arv', 12))
+            allowed_late_hours = float(network_params.get('late_arv', 12))
             for node_id, row in vendors_df.iterrows():
                 ts = pd.to_datetime(row.get('Requested Delivery', None), errors='coerce')
                 if pd.isna(ts):
                     continue
                 offset = (ts - base).total_seconds()
-                # window ±12h
-                earliest[node_id] = max(0.0, offset - 12 * 3600)
-                latest[node_id] = offset + 12 * 3600
+                # window ±allowed hours
+                earliest[node_id] = max(0.0, offset - allowed_early_hours * 3600)
+                latest[node_id] = offset + allowed_late_hours * 3600
             APP_STATE['earliest'] = earliest
             APP_STATE['latest'] = latest
             # Record original used vendors for status tracking
@@ -1321,6 +1640,9 @@ def optimize_routes():
             },
             'excluded_vendors': excluded_vendors,
             'failed_geocodes': failed_geocodes,
+            'preprocessing_warnings': preprocessing_warnings,
+            'time_groups': time_groups if 'time_groups' in locals() else [],
+            'osrm_failures': getattr(optimizer, 'osrm_failures', [])[:50],
             'run_id': run_id
         })
     

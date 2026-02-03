@@ -270,6 +270,10 @@ class LocalSearchOperators:
             RouteSolution: Improved solution
         """
         improved_solution = solution.copy()
+        route_buckets = [
+            LocalSearchOperators._get_route_time_bucket(route, improved_solution.vendors_df)
+            for route in improved_solution.routes
+        ]
         
         for iteration in range(max_iterations):
             improved = False
@@ -304,6 +308,9 @@ class LocalSearchOperators:
             # Inter-route swap
             for i in range(len(improved_solution.routes)):
                 for j in range(i + 1, len(improved_solution.routes)):
+                    if (route_buckets[i] is not None and route_buckets[j] is not None and
+                        route_buckets[i] != route_buckets[j]):
+                        continue
                     max_weights = [
                         improved_solution.max_capacity_kg[i] if i < len(improved_solution.max_capacity_kg) else float('inf'),
                         improved_solution.max_capacity_kg[j] if j < len(improved_solution.max_capacity_kg) else float('inf')
@@ -326,11 +333,16 @@ class LocalSearchOperators:
                     if changed:
                         improved_solution.routes[i] = route1
                         improved_solution.routes[j] = route2
+                        route_buckets[i] = LocalSearchOperators._get_route_time_bucket(route1, improved_solution.vendors_df)
+                        route_buckets[j] = LocalSearchOperators._get_route_time_bucket(route2, improved_solution.vendors_df)
                         improved = True
 
             # Inter-route relocate (move a vendor to better route)
             for i in range(len(improved_solution.routes)):
                 for j in range(i + 1, len(improved_solution.routes)):
+                    if (route_buckets[i] is not None and route_buckets[j] is not None and
+                        route_buckets[i] != route_buckets[j]):
+                        continue
                     # Extract scalar values from arrays
                     max_weight_i = float(improved_solution.max_capacity_kg[i]) if hasattr(improved_solution.max_capacity_kg, '__len__') else float(improved_solution.max_capacity_kg)
                     max_weight_j = float(improved_solution.max_capacity_kg[j]) if hasattr(improved_solution.max_capacity_kg, '__len__') else float(improved_solution.max_capacity_kg)
@@ -352,6 +364,8 @@ class LocalSearchOperators:
                     if changed:
                         improved_solution.routes[i] = route1
                         improved_solution.routes[j] = route2
+                        route_buckets[i] = LocalSearchOperators._get_route_time_bucket(route1, improved_solution.vendors_df)
+                        route_buckets[j] = LocalSearchOperators._get_route_time_bucket(route2, improved_solution.vendors_df)
                         improved = True
             
             improved_solution.invalidate_cache()
@@ -360,6 +374,22 @@ class LocalSearchOperators:
                 break
         
         return improved_solution
+
+    @staticmethod
+    def _get_route_time_bucket(route, vendors_df):
+        if vendors_df is None or len(route) <= 2:
+            return None
+        if 'time_bucket' not in vendors_df.columns:
+            return None
+        for node in route:
+            if node == 0:
+                continue
+            vendor_idx = int(node) - 1
+            if 0 <= vendor_idx < len(vendors_df):
+                raw_bucket = vendors_df.iloc[vendor_idx].get('time_bucket', None)
+                if isinstance(raw_bucket, str) and raw_bucket.strip():
+                    return raw_bucket.strip()
+        return None
     
     @staticmethod
     def _get_vendor_capacity(capacity_matrix, vendor_id):

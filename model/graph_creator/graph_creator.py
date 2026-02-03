@@ -173,7 +173,23 @@ class Graph:
         df_coord = filter_geocoded[['vendor_longitude', 'vendor_latitude']]
         vendor_coordinates = df_coord.apply(list, axis=1)       # just coordinates 
 
-        vendors_df = filter_geocoded[['vendor Name', 'vendor_longitude', 'vendor_latitude', 'Calculated Loading Meters', 'Total Gross Weight',  'Requested Loading', 'Requested Delivery', 'Vendor City', 'Vendor Postcode', 'Vendor Country Name', 'Recipient City', 'Recipient Country Name']]
+        base_cols = [
+            'vendor Name',
+            'vendor_longitude',
+            'vendor_latitude',
+            'Calculated Loading Meters',
+            'Total Gross Weight',
+            'Requested Loading',
+            'Requested Delivery',
+            'Vendor City',
+            'Vendor Postcode',
+            'Vendor Country Name',
+            'Recipient City',
+            'Recipient Country Name'
+        ]
+        if 'time_bucket' in filter_geocoded.columns:
+            base_cols.append('time_bucket')
+        vendors_df = filter_geocoded[base_cols]
         vendors_df.index = vendors_df.index + 1
         vendors_df = vendors_df
         if len(vendors_df) !=0:

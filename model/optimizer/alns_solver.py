@@ -4,8 +4,10 @@ Uses destroy and repair operators on route-based representations.
 """
 
 import numpy as np
+import pandas as pd
 import random
 import copy
+from datetime import datetime, timedelta
 from .route_solution import RouteSolution
 
 
@@ -21,7 +23,8 @@ class ALNSSolver:
                  capacity_matrix, loading_matrix, max_capacity_kg, max_ldms_vc=None,
                  discretization_constant=None, min_date=None, max_driving_hours=None,
                  service_time_matrix=None, config=None, evaluation_period=None,
-                 max_volume=None, max_linear_length=None):
+                 max_volume=None, max_linear_length=None, allowed_early_hours=12, allowed_late_hours=12,
+                 vendor_ids=None):
         """
         Initialize ALNS solver.
         
@@ -59,6 +62,8 @@ class ALNSSolver:
         self.min_date = min_date
         self.max_driving_hours = max_driving_hours
         self.evaluation_period = evaluation_period
+        self.allowed_early_hours = allowed_early_hours
+        self.allowed_late_hours = allowed_late_hours
         
         # ALNS parameters
         self.config = config or {}
@@ -80,7 +85,8 @@ class ALNSSolver:
             'regret2': {'weight': 1.0, 'calls': 0, 'improvements': 0}
         }
         
-        self.num_vendors = len(capacity_matrix) - 1  # Exclude depot
+        self.vendor_ids = list(vendor_ids) if vendor_ids is not None else None
+        self.num_vendors = len(self.vendor_ids) if self.vendor_ids is not None else len(capacity_matrix) - 1
     
     def solve(self, verbose=True):
         """
@@ -98,9 +104,7 @@ class ALNSSolver:
             print(f'   - Vendors: {self.num_vendors}')
             print(f'   - Max driving: {self.max_driving_hours}h')
         
-        # Generate initial solution using k-means clustering
-        # NOTE: Clustering is only a buffer for initialization. ALNS operators
-        # below are free to move vendors across cluster boundaries - no constraints.
+        # Generate initial solution using time-window-aware routing
         current = self.generate_initial_solution()
         best = current.copy()
         
@@ -218,40 +222,38 @@ class ALNSSolver:
                         print(f'       - {v}')
                     if len(late_violations) > 5:
                         print(f'       ... and {len(late_violations) - 5} more')
-        
+
+        # Prune empty depot-only routes
+        best.routes = [r for r in best.routes if len(r) > 2 and any(node != 0 for node in r)]
+        best.invalidate_cache()
+
         return best
     
     def generate_initial_solution(self):
-        """Generate initial solution using k-means clustering by geographical proximity.
-        
-        NOTE: Clustering is only used as a buffer for initial solution creation to handle
-        extreme cases (far vendors, dense clusters) and ensure feasibility. During ALNS
-        optimization, routes are FREE to visit vendors from any cluster - there are no
-        cluster boundaries enforced. This prevents artificial constraints and allows
-        finding optimal solutions across the entire vendor set.
-        
-        Groups vendors by their geographical coordinates, then builds routes
-        within each cluster. Handles extreme cases (far vendors, dense clusters).
+        """Generate initial solution without spatial/temporal grouping.
+
+        Builds routes by considering vendor time windows (earliest to latest) and
+        capacities, starting from the earliest requested arrivals.
         """
-        unrouted = list(range(1, self.num_vendors + 1))
+        unrouted = list(self.vendor_ids) if self.vendor_ids is not None else list(range(1, self.num_vendors + 1))
         routes = []
         
         # Capacity limits
         max_weight = max(self.max_capacity_kg) if self.max_capacity_kg else float('inf')
         max_volume = max(self.max_ldms_vc) if self.max_ldms_vc else float('inf')
         
-        # Step 1: Cluster vendors by geographical proximity using k-means
-        clusters = self._cluster_vendors_kmeans(unrouted)
-        
-        if len(clusters) > 1:
-            print(f'   📦 Created {len(clusters)} geographical clusters:')
-            for i, cluster in enumerate(clusters):
-                print(f'      Cluster {i+1}: {len(cluster)} vendors')
-        
-        # Step 2: Build routes for each cluster
-        for cluster in clusters:
-            cluster_routes = self._build_cluster_routes(cluster, max_weight, max_volume)
-            routes.extend(cluster_routes)
+        # Sort vendors by requested time (earliest to latest)
+        unrouted_sorted = sorted(
+            unrouted,
+            key=lambda v: (
+                self._get_vendor_requested_time(v).timestamp()
+                if self._get_vendor_requested_time(v)
+                else float('inf')
+            )
+        )
+
+        # Build routes greedily with time-window feasibility
+        routes = self._build_time_feasible_routes(unrouted_sorted, max_weight, max_volume)
         
         # Build RouteSolution
         return RouteSolution(
@@ -268,197 +270,152 @@ class ALNSSolver:
             discretization_constant=self.discretization_constant,
             min_date=self.min_date,
             max_driving_hours=self.max_driving_hours,
-            evaluation_period=self.evaluation_period
+            evaluation_period=self.evaluation_period,
+            allowed_early_hours=self.allowed_early_hours,
+            allowed_late_hours=self.allowed_late_hours
         )
     
-    def _cluster_vendors_kmeans(self, vendors):
-        """Cluster vendors using k-medoids (PAM) based on travel time distances.
-        
-        K-medoids is superior to k-means for this problem because:
-        - Works directly with the travel time distance matrix
-        - More robust to outliers (uses actual data points as centers)
-        - Better for non-Euclidean metrics
-        
-        Returns list of vendor clusters (lists of vendor IDs).
-        """
-        if len(vendors) <= 3:
-            return [vendors]  # Too few to cluster
-        
-        # Determine optimal number of clusters (target ~3-4 vendors per cluster)
-        # For 58 vendors: 58/3.5 ≈ 16-17 clusters
-        num_clusters = max(1, len(vendors) // 3)  # Target 3 vendors per cluster, no max limit
-        
-        # Identify extreme outliers (very far vendors with dedicated routes)
-        depot_distances = [(v, self.distance_matrix[0][v]) for v in vendors]
-        distances = [d for _, d in depot_distances]
-        mean_dist = sum(distances) / len(distances)
-        std_dist = (sum((d - mean_dist) ** 2 for d in distances) / len(distances)) ** 0.5
-        threshold_far = mean_dist + 2.0 * std_dist  # Only extreme outliers (>2σ)
-        
-        outliers = [v for v, d in depot_distances if d > threshold_far]
-        normal_vendors = [v for v, d in depot_distances if d <= threshold_far]
-        
-        clusters = []
-        
-        # Process extreme outliers individually
-        for outlier in outliers:
-            clusters.append([outlier])
-        
-        # K-medoids on normal vendors using travel time matrix
-        if len(normal_vendors) > 0:
-            if len(normal_vendors) <= num_clusters:
-                # Too few vendors for clustering, create 1 cluster per vendor group
-                clusters.append(normal_vendors)
-            else:
-                # Run k-medoids on travel times with appropriate cluster count
-                num_normal_clusters = max(1, len(normal_vendors) // 3)  # 3 vendors per cluster
-                vendor_clusters = self._kmedoids_cluster(normal_vendors, num_normal_clusters)
-                clusters.extend(vendor_clusters)
-        
-        return clusters
-    
-    
-    def _kmedoids_cluster(self, vendors, k):
-        """K-medoids (PAM) clustering on travel time distance matrix.
-        
-        Uses actual vendors as cluster centers (medoids) rather than synthetic centroids.
-        More robust than k-means for distance matrices and non-Euclidean metrics.
-        
-        Args:
-            vendors: List of vendor IDs
-            k: Number of clusters
-            
-        Returns:
-            List of clusters (each cluster is a list of vendor IDs)
-        """
-        n = len(vendors)
-        
-        if n <= k:
-            return [[v] for v in vendors]
-        
-        # Build distance matrix for these vendors
-        dist_matrix = np.zeros((n, n))
-        for i in range(n):
-            for j in range(n):
-                if i != j:
-                    dist_matrix[i][j] = self.time_matrix[vendors[i]][vendors[j]]
-        
-        # Initialize medoids using k-medoids++ strategy
-        # Start with vendor closest to the "center" (min sum of distances)
-        medoid_indices = []
-        
-        # First medoid: minimize total distance to all other points
-        total_distances = np.sum(dist_matrix, axis=1)
-        first_medoid = np.argmin(total_distances)
-        medoid_indices.append(first_medoid)
-        
-        # Remaining medoids: farthest from existing medoids
-        for _ in range(k - 1):
-            min_distances_to_medoids = np.min(
-                [dist_matrix[m] for m in medoid_indices], 
-                axis=0
-            )
-            next_medoid = np.argmax(min_distances_to_medoids)
-            medoid_indices.append(next_medoid)
-        
-        # PAM iterations
-        max_iters = 50
-        improved = True
-        iteration = 0
-        
-        while improved and iteration < max_iters:
-            iteration += 1
-            improved = False
-            
-            # Assign each point to nearest medoid
-            assignments = np.zeros(n, dtype=int)
-            for i in range(n):
-                if i not in medoid_indices:
-                    distances_to_medoids = [dist_matrix[i][m] for m in medoid_indices]
-                    assignments[i] = np.argmin(distances_to_medoids)
-            
-            # Try swapping each medoid with each non-medoid
-            for m_idx, medoid_pos in enumerate(medoid_indices):
-                for candidate in range(n):
-                    if candidate in medoid_indices:
-                        continue
-                    
-                    # Calculate cost change of swapping medoid_pos with candidate
-                    old_cost = 0
-                    new_cost = 0
-                    
-                    for i in range(n):
-                        if i == candidate:
-                            continue
-                        
-                        # Current assignment cost
-                        if i == medoid_pos:
-                            # This medoid is being replaced
-                            old_cost += min(dist_matrix[i][m] for m in medoid_indices)
-                        else:
-                            assigned_medoid = medoid_indices[assignments[i]]
-                            old_cost += dist_matrix[i][assigned_medoid]
-                        
-                        # New assignment cost (with candidate as new medoid)
-                        new_medoids = medoid_indices.copy()
-                        new_medoids[m_idx] = candidate
-                        new_cost += min(dist_matrix[i][m] for m in new_medoids)
-                    
-                    # Accept swap if it improves
-                    if new_cost < old_cost:
-                        medoid_indices[m_idx] = candidate
-                        improved = True
-                        break
-                
-                if improved:
-                    break
-        
-        # Build final clusters
-        clusters = [[] for _ in range(k)]
-        
-        for i in range(n):
-            distances_to_medoids = [dist_matrix[i][m] for m in medoid_indices]
-            cluster_idx = np.argmin(distances_to_medoids)
-            clusters[cluster_idx].append(vendors[i])
-        
-        # Filter out empty clusters
-        clusters = [c for c in clusters if len(c) > 0]
-        
-        return clusters
-    
-    def _build_cluster_routes(self, cluster, max_weight, max_volume):
-        """Build one or more routes for a cluster of vendors."""
+    def _get_vendor_requested_time(self, vendor_id):
+        if self.vendors_df is None:
+            return None
+        vendor_idx = vendor_id - 1
+        if vendor_idx < 0 or vendor_idx >= len(self.vendors_df):
+            return None
+        vendor_row = self.vendors_df.iloc[vendor_idx]
+        for raw in [
+            vendor_row.get('Requested Loading', None),
+            vendor_row.get('Requested Loading Date', None),
+        ]:
+            parsed = pd.to_datetime(raw, errors='coerce', utc=True)
+            if pd.notna(parsed):
+                return self._to_naive(parsed)
+        return None
+
+    def _get_vendor_time_window(self, vendor_id):
+        requested = self._get_vendor_requested_time(vendor_id)
+        if requested is None:
+            return None, None
+        requested_dt = self._to_naive(requested)
+        allowed_early = float(self.allowed_early_hours) * 3600
+        allowed_late = float(self.allowed_late_hours) * 3600
+        earliest = requested_dt - timedelta(seconds=allowed_early)
+        latest = requested_dt + timedelta(seconds=allowed_late)
+        return earliest, latest
+
+    def _get_vendor_time_bucket(self, vendor_id):
+        if self.vendors_df is None:
+            return None
+        vendor_idx = vendor_id - 1
+        if vendor_idx < 0 or vendor_idx >= len(self.vendors_df):
+            return None
+        vendor_row = self.vendors_df.iloc[vendor_idx]
+        raw_bucket = vendor_row.get('time_bucket', None)
+        if isinstance(raw_bucket, str) and raw_bucket.strip():
+            return raw_bucket.strip()
+        requested = self._get_vendor_requested_time(vendor_id)
+        if requested is None:
+            return None
+        requested_dt = self._to_naive(requested)
+        if requested_dt is None:
+            return None
+        return requested_dt.strftime('%Y-%m')
+
+    def _get_route_time_bucket(self, route):
+        for node in route:
+            if node == 0:
+                continue
+            return self._get_vendor_time_bucket(node)
+        return None
+
+    def _get_route_time_span_hours(self, route):
+        earliest = None
+        latest = None
+        for node in route:
+            if node == 0:
+                continue
+            node_earliest, node_latest = self._get_vendor_time_window(node)
+            if node_earliest is None or node_latest is None:
+                continue
+            earliest = node_earliest if earliest is None else min(earliest, node_earliest)
+            latest = node_latest if latest is None else max(latest, node_latest)
+        if earliest is None or latest is None:
+            return 0.0
+        return (latest - earliest).total_seconds() / 3600.0
+
+    def _to_naive(self, dt_value):
+        if dt_value is None:
+            return None
+        if isinstance(dt_value, str):
+            parsed = pd.to_datetime(dt_value, errors='coerce', utc=True)
+            if pd.notna(parsed):
+                ts = parsed.tz_convert(None)
+                return ts.to_pydatetime()
+            return None
+        if isinstance(dt_value, pd.Timestamp):
+            ts = dt_value.tz_convert(None) if dt_value.tzinfo is not None else dt_value
+            return ts.to_pydatetime()
+        if isinstance(dt_value, np.datetime64):
+            return pd.to_datetime(dt_value).to_pydatetime()
+        if isinstance(dt_value, datetime):
+            return dt_value.replace(tzinfo=None)
+        if hasattr(dt_value, 'tzinfo') and dt_value.tzinfo is not None:
+            return dt_value.replace(tzinfo=None)
+        return dt_value
+
+    def _build_time_feasible_routes(self, vendors, max_weight, max_volume):
+        """Build routes considering vendor earliest/latest arrival windows."""
         routes = []
-        unrouted = cluster.copy()
+        unrouted = vendors.copy()
+        safety_counter = 0
         
         while unrouted:
+            safety_counter += 1
+            if safety_counter > max(10, len(vendors) * 5):
+                print("⚠️  Safety break: initial route construction not converging.")
+                break
             route = [0]  # Start from depot
             current_weight = 0
             current_volume = 0
+            current_time = self._to_naive(self.min_date) if self.min_date is not None else None
+            route_bucket = None
+            if current_time is None and self.evaluation_period:
+                current_time = self._to_naive(self.evaluation_period[0])
             
-            # For single-vendor clusters (outliers), create direct route
-            if len(cluster) == 1 and len(unrouted) == 1:
-                vendor = unrouted[0]
+            # For single-vendor routes, create direct route
+            if len(unrouted) == 1:
+                vendor = unrouted.pop(0)
                 routes.append([0, vendor, 0])
-                unrouted.remove(vendor)
                 continue
-            
-            # Greedy insertion within cluster: add nearest feasible vendor
+
+            # Greedy insertion by earliest feasible arrival
+            initial_unrouted_count = len(unrouted)
             while unrouted:
                 last_node = route[-1]
                 
-                # Find nearest unrouted vendor that fits capacity
+                # Find nearest unrouted vendor that fits capacity/time window
                 best_vendor = None
                 best_distance = float('inf')
                 
                 for vendor in unrouted:
+                    vendor_bucket = self._get_vendor_time_bucket(vendor)
+                    if route_bucket is not None and vendor_bucket is not None and vendor_bucket != route_bucket:
+                        continue
                     vendor_weight = float(self.capacity_matrix[vendor])
                     vendor_volume = float(self.loading_matrix[vendor])
                     
                     # Check capacity
                     if (current_weight + vendor_weight <= max_weight and 
                         current_volume + vendor_volume <= max_volume):
-                        
+                        # Check time window feasibility
+                        earliest, latest = self._get_vendor_time_window(vendor)
+                        if current_time is not None and earliest is not None:
+                            travel_seconds = self.time_matrix[last_node][vendor]
+                            arrival_time = self._to_naive(current_time + timedelta(seconds=travel_seconds))
+                            if arrival_time < earliest:
+                                arrival_time = earliest
+                            if latest is not None and arrival_time > latest:
+                                continue
+
                         distance = self.distance_matrix[last_node][vendor]
                         if distance < best_distance:
                             best_distance = distance
@@ -472,6 +429,12 @@ class ALNSSolver:
                 
                 # Check max_driving if specified
                 if self.max_driving_hours is not None:
+                    # Reject if vendor time windows span too large for a single route
+                    span_hours = self._get_route_time_span_hours(test_route)
+                    if span_hours > self.max_driving_hours:
+                        best_vendor = None
+                        break
+
                     route_travel_seconds = 0
                     
                     # If route has only depot + one vendor, just count vendor→depot
@@ -497,10 +460,20 @@ class ALNSSolver:
                     if total_time > self.max_driving_hours:
                         break
                 
-                # Add vendor to route
+                # Add vendor to route and advance time
                 route.append(best_vendor)
+                if route_bucket is None:
+                    route_bucket = self._get_vendor_time_bucket(best_vendor)
                 current_weight += float(self.capacity_matrix[best_vendor])
                 current_volume += float(self.loading_matrix[best_vendor])
+                if current_time is not None:
+                    travel_seconds = self.time_matrix[last_node][best_vendor]
+                    current_time = self._to_naive(current_time + timedelta(seconds=travel_seconds))
+                    earliest, _ = self._get_vendor_time_window(best_vendor)
+                    if earliest is not None and current_time < earliest:
+                        current_time = earliest
+                    service_time_per_stop = self.service_time_matrix[1] / 60.0 if len(self.service_time_matrix) > 1 else 0
+                    current_time = current_time + timedelta(hours=service_time_per_stop)
                 unrouted.remove(best_vendor)
             
             # Close route by returning to depot
@@ -512,6 +485,11 @@ class ALNSSolver:
                 if unrouted:
                     vendor = unrouted.pop(0)
                     routes.append([0, vendor, 0])
+            
+            # Ensure progress if no vendors were removed in this pass
+            if len(unrouted) == initial_unrouted_count and unrouted:
+                vendor = unrouted.pop(0)
+                routes.append([0, vendor, 0])
         
         return routes
     
@@ -519,9 +497,7 @@ class ALNSSolver:
         """
         Destroy operators: remove vendors from solution.
         
-        NOTE: These operators are cluster-agnostic - they can remove any vendor
-        from any route, regardless of initial cluster assignments. Clustering is
-        only used for initial solution generation.
+        NOTE: These operators can remove any vendor from any route.
         
         Returns:
             RouteSolution: Partial solution
@@ -620,9 +596,7 @@ class ALNSSolver:
         """
         Repair operators: reinsert removed vendors.
         
-        NOTE: These operators are cluster-agnostic - they can insert vendors into
-        any route, regardless of initial cluster assignments. Routes are free to
-        visit vendors from different clusters during optimization.
+        NOTE: These operators can insert vendors into any route.
         
         Returns:
             RouteSolution: Repaired solution
@@ -640,9 +614,13 @@ class ALNSSolver:
             best_cost = float('inf')
             best_route_idx = -1
             best_position = -1
+            vendor_bucket = self._get_vendor_time_bucket(vendor)
             
             # Try inserting in existing routes
             for route_idx, route in enumerate(solution.routes):
+                route_bucket = self._get_route_time_bucket(route)
+                if route_bucket is not None and vendor_bucket is not None and vendor_bucket != route_bucket:
+                    continue
                 for pos in range(1, len(route)):
                     # Check capacity
                     route_weight, route_volume = solution.get_route_capacity_usage(route_idx)
@@ -657,6 +635,11 @@ class ALNSSolver:
                     
                     # Check max_driving constraint
                     if self.max_driving_hours is not None:
+                        # Reject if vendor time windows span too large for a single route
+                        span_hours = self._get_route_time_span_hours(route[:pos] + [vendor] + route[pos:])
+                        if span_hours > self.max_driving_hours:
+                            continue
+
                         test_route = route[:pos] + [vendor] + route[pos:]
                         route_travel_seconds = 0
                         
@@ -715,8 +698,12 @@ class ALNSSolver:
             for vendor in uninserted:
                 # Find best and second-best insertion positions
                 costs = []
+                vendor_bucket = self._get_vendor_time_bucket(vendor)
                 
                 for route_idx, route in enumerate(solution.routes):
+                    route_bucket = self._get_route_time_bucket(route)
+                    if route_bucket is not None and vendor_bucket is not None and vendor_bucket != route_bucket:
+                        continue
                     for pos in range(1, len(route)):
                         # Check capacity
                         route_weight, route_volume = solution.get_route_capacity_usage(route_idx)
@@ -731,6 +718,11 @@ class ALNSSolver:
                         
                         # Check max_driving constraint
                         if self.max_driving_hours is not None:
+                            # Reject if vendor time windows span too large for a single route
+                            span_hours = self._get_route_time_span_hours(route[:pos] + [vendor] + route[pos:])
+                            if span_hours > self.max_driving_hours:
+                                continue
+
                             test_route = route[:pos] + [vendor] + route[pos:]
                             route_travel_seconds = 0
                             
@@ -827,6 +819,11 @@ class ALNSSolver:
                     # Skip if either route is empty or just depot
                     if len(route_i) <= 2 or len(route_j) <= 2:
                         continue
+
+                    route_i_bucket = self._get_route_time_bucket(route_i)
+                    route_j_bucket = self._get_route_time_bucket(route_j)
+                    if route_i_bucket is not None and route_j_bucket is not None and route_i_bucket != route_j_bucket:
+                        continue
                     
                     # Get vendors from both routes (exclude depot)
                     vendors_i = [v for v in route_i if v != 0]
@@ -836,6 +833,12 @@ class ALNSSolver:
                     # Test combined route: depot → vendors_i → vendors_j → depot
                     combined_vendors = vendors_i + vendors_j
                     test_route = [0] + combined_vendors + [0]
+
+                    # Reject if vendor time windows span too large for a single route
+                    if self.max_driving_hours is not None:
+                        span_hours = self._get_route_time_span_hours(test_route)
+                        if span_hours > self.max_driving_hours:
+                            continue
                     
                     # Check capacity constraints
                     total_weight = sum(self.capacity_matrix[v] for v in combined_vendors)

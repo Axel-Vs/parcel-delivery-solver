@@ -23,7 +23,8 @@ class RouteSolution:
     def __init__(self, routes, vendors_df, distance_matrix, time_matrix, 
                  capacity_matrix, loading_matrix, max_capacity_kg, max_volume, max_linear_length,
                  discretization_constant, min_date, max_driving_hours=None,
-                 service_time_matrix=None, evaluation_period=None):
+                 service_time_matrix=None, evaluation_period=None,
+                 allowed_early_hours=12, allowed_late_hours=12):
         """
         Initialize route solution.
         
@@ -56,6 +57,9 @@ class RouteSolution:
         self.min_date = min_date
         self.max_driving_hours = max_driving_hours
         self.evaluation_period = evaluation_period
+        self.allowed_early_hours = allowed_early_hours
+        self.allowed_late_hours = allowed_late_hours
+        self.debug_time_windows = False
         
         # Cache evaluation results
         self._total_distance = None
@@ -185,8 +189,8 @@ class RouteSolution:
             period_end = pd.to_datetime(self.evaluation_period[1])
             
             # Allowed buffers: 12 hours before/after vendor date
-            allowed_early = timedelta(hours=12)
-            allowed_late = timedelta(hours=12)
+            allowed_early = timedelta(hours=float(self.allowed_early_hours))
+            allowed_late = timedelta(hours=float(self.allowed_late_hours))
 
             def _to_naive(dt_value):
                 if dt_value is None:
@@ -197,11 +201,31 @@ class RouteSolution:
                     return dt_value.replace(tzinfo=None)
                 return dt_value
 
-            # DEBUG: Log time window parameters
-            print(f"\n📋 TIME WINDOW CONFIGURATION:")
-            print(f"   - allowed_early: {allowed_early} ({allowed_early.total_seconds() / 3600:.0f} hours)")
-            print(f"   - allowed_late: {allowed_late} ({allowed_late.total_seconds() / 3600:.0f} hours)")
-            print(f"   - Evaluation period min_date: {self.min_date}")
+            def _fmt_time(val):
+                if val is None:
+                    return "None"
+                if isinstance(val, pd.Timestamp):
+                    val = _to_naive(val)
+                if isinstance(val, datetime):
+                    return val.strftime("%Y-%m-%d")
+                if isinstance(val, timedelta):
+                    seconds = val.total_seconds()
+                elif isinstance(val, (int, float, np.number)):
+                    seconds = float(val)
+                else:
+                    return str(val)
+                hours = seconds / 3600.0
+                if abs(hours) >= 48:
+                    return f"{hours / 24.0:.1f}d"
+                return f"{hours:.1f}h"
+
+            # DEBUG: Log time window parameters (log once per solution)
+            log_time_config = self.debug_time_windows and not getattr(self, "_logged_time_window_config", False)
+            if log_time_config:
+                print(f"\n📋 TIME WINDOW CONFIGURATION:")
+                print(f"   - allowed_early: {allowed_early} ({allowed_early.total_seconds() / 3600:.0f} hours)")
+                print(f"   - allowed_late: {allowed_late} ({allowed_late.total_seconds() / 3600:.0f} hours)")
+                print(f"   - Evaluation period min_date: {self.min_date}")
 
             # Determine depot delivery target (use LATEST vendor's requested delivery to set depot window)
             # This is critical: route only returns to depot AFTER serving all vendors
@@ -216,8 +240,43 @@ class RouteSolution:
                 depot_latest = datetime.strptime(self.evaluation_period[1], '%Y-%m-%d %H:%M:%S')
             else:
                 depot_latest = _to_naive(self.evaluation_period[1])
-            
+
             for route_idx, route in enumerate(self.routes):
+                # Also enforce depot arrival relative to this route's latest requested time
+                route_latest_requested = None
+                depot_target_earliest = None
+                depot_target_latest = None
+                for node in route:
+                    if node == 0:
+                        continue
+                    vendor_idx = node - 1
+                    if vendor_idx >= len(self.vendors_df):
+                        continue
+                    vendor_row = self.vendors_df.iloc[vendor_idx]
+                    raw_candidates = [
+                        vendor_row.get('Requested Delivery', None),
+                        vendor_row.get('Requested Delivery Date', None),
+                    ]
+                    for raw in raw_candidates:
+                        parsed = pd.to_datetime(raw, errors='coerce')
+                        if pd.notna(parsed):
+                            parsed = _to_naive(parsed)
+                            route_latest_requested = parsed if route_latest_requested is None else max(route_latest_requested, parsed)
+                            break
+                if route_latest_requested is not None:
+                    depot_target_earliest = route_latest_requested - allowed_early
+                    depot_target_latest = route_latest_requested + allowed_late
+                    if log_time_config:
+                        print(
+                            f"🧭 Route {route_idx}: depot target window "
+                            f"[{depot_target_earliest} .. {depot_target_latest}] "
+                            f"(latest requested={route_latest_requested})"
+                        )
+                if log_time_config:
+                    print(
+                        f"🧭 Route {route_idx}: depot evaluation window "
+                        f"[{depot_earliest} .. {depot_latest}]"
+                    )
                 # Initialize current_time baseline from min_date
                 if isinstance(self.min_date, datetime):
                     current_time = _to_naive(self.min_date)
@@ -231,7 +290,7 @@ class RouteSolution:
                     # Skip if min_date is not usable
                     continue
 
-                # Anchor start time to the first vendor's earliest allowed window (if available)
+                # Anchor start time to the first vendor's requested window (if available)
                 first_vendor_requested = None
                 for node in route:
                     if node == 0:
@@ -243,8 +302,6 @@ class RouteSolution:
                     raw_candidates = [
                         vendor_row.get('Requested Loading', None),
                         vendor_row.get('Requested Loading Date', None),
-                        vendor_row.get('Requested Delivery', None),
-                        vendor_row.get('Requested Delivery Date', None),
                     ]
                     for raw in raw_candidates:
                         parsed = pd.to_datetime(raw, errors='coerce')
@@ -255,9 +312,57 @@ class RouteSolution:
                         break
 
                 if first_vendor_requested is not None:
-                    anchor_start = first_vendor_requested - allowed_early
-                    if anchor_start > current_time:
-                        current_time = anchor_start
+                    # Compute route duration (travel + service) to reach depot
+                    route_duration_seconds = 0
+                    for i in range(1, len(route)):
+                        prev_node = route[i - 1]
+                        node = route[i]
+                        if prev_node < len(self.time_matrix) and node < len(self.time_matrix[prev_node]):
+                            route_duration_seconds += self.time_matrix[prev_node][node]
+                        if node != 0 and self.service_time_matrix is not None and node < len(self.service_time_matrix):
+                            route_duration_seconds += self.service_time_matrix[node] * 60
+
+                    # Vendor window for the first vendor
+                    vendor_window_start = first_vendor_requested - allowed_early
+                    vendor_window_end = first_vendor_requested + allowed_late
+
+                    # Depot window (target if available, otherwise evaluation period)
+                    if depot_target_earliest is not None:
+                        depot_window_start = depot_target_earliest
+                        depot_window_end = depot_target_latest
+                    else:
+                        depot_window_start = depot_earliest
+                        depot_window_end = depot_latest
+
+                    # Translate depot window into feasible start window
+                    if route_duration_seconds > 0:
+                        depot_start_min = depot_window_start - timedelta(seconds=route_duration_seconds)
+                        depot_start_max = depot_window_end - timedelta(seconds=route_duration_seconds)
+                    else:
+                        depot_start_min = depot_window_start
+                        depot_start_max = depot_window_end
+
+                    # Combine windows and min_date
+                    start_min = max(current_time, vendor_window_start, depot_start_min)
+                    start_max = min(vendor_window_end, depot_start_max)
+
+                    # Choose start time closest to requested loading, within feasible window
+                    if start_min <= start_max:
+                        if first_vendor_requested < start_min:
+                            current_time = start_min
+                        elif first_vendor_requested > start_max:
+                            current_time = start_max
+                        else:
+                            current_time = first_vendor_requested
+                    else:
+                        # No feasible start window; fall back to earliest vendor window
+                        current_time = max(current_time, vendor_window_start)
+
+                    if log_time_config:
+                        print(f"🕒 Route {route_idx}: optimized start time = {current_time}")
+
+                if log_time_config:
+                    self._logged_time_window_config = True
 
                 for i, node in enumerate(route):
                     # Add travel time from previous node
@@ -270,19 +375,35 @@ class RouteSolution:
                     if node == 0:
                         # Check depot time window only at END of route (return to depot)
                         if i == len(route) - 1:
-                            # Arrival at depot must be within evaluation_period window
-                            if current_time < depot_earliest:
-                                violation_msg = (f"Route {route_idx}: returns to depot at {current_time} "
-                                               f"before earliest allowed {depot_earliest}")
-                                self._constraint_violations.append(violation_msg)
-                                if not check_all:
-                                    return False
-                            if current_time > depot_latest:
-                                violation_msg = (f"Route {route_idx}: returns to depot at {current_time} "
-                                               f"after latest allowed {depot_latest}")
-                                self._constraint_violations.append(violation_msg)
-                                if not check_all:
-                                    return False
+                            # Arrival at depot must be within delivery window for this route.
+                            # If early or late, mark infeasible.
+                            if depot_target_earliest is not None:
+                                if current_time < depot_target_earliest:
+                                    violation_msg = (f"Route {route_idx}: depot arrival too early "
+                                                   f"({_fmt_time(current_time)}; window starts {_fmt_time(depot_target_earliest)})")
+                                    self._constraint_violations.append(violation_msg)
+                                    if not check_all:
+                                        return False
+                                if current_time > depot_target_latest:
+                                    violation_msg = (f"Route {route_idx}: depot arrival too late "
+                                                   f"({_fmt_time(current_time)}; window ends {_fmt_time(depot_target_latest)})")
+                                    self._constraint_violations.append(violation_msg)
+                                    if not check_all:
+                                        return False
+                            else:
+                                # Fallback to evaluation period if no depot delivery window is available
+                                if current_time < depot_earliest:
+                                    violation_msg = (f"Route {route_idx}: depot arrival too early "
+                                                   f"({_fmt_time(current_time)}; window starts {_fmt_time(depot_earliest)})")
+                                    self._constraint_violations.append(violation_msg)
+                                    if not check_all:
+                                        return False
+                                if current_time > depot_latest:
+                                    violation_msg = (f"Route {route_idx}: depot arrival too late "
+                                                   f"({_fmt_time(current_time)}; window ends {_fmt_time(depot_latest)})")
+                                    self._constraint_violations.append(violation_msg)
+                                    if not check_all:
+                                        return False
                         continue
 
                     vendor_idx = node - 1
@@ -293,8 +414,6 @@ class RouteSolution:
                     raw_candidates = [
                         vendor_row.get('Requested Loading', None),
                         vendor_row.get('Requested Loading Date', None),
-                        vendor_row.get('Requested Delivery', None),
-                        vendor_row.get('Requested Delivery Date', None),
                     ]
                     requested_dt = None
                     for raw in raw_candidates:
@@ -314,14 +433,8 @@ class RouteSolution:
                     latest_allowed = requested_dt + allowed_late
 
                     if current_time < earliest_allowed:
-                        days_early = (earliest_allowed - current_time).days
-                        hours_early = ((earliest_allowed - current_time).total_seconds() / 3600) % 24
-                        violation_msg = (f"Route {route_idx}: arrives at vendor {node} at {current_time} "
-                                         f"before earliest allowed {earliest_allowed} ({days_early}d {hours_early:.0f}h early)")
-                        self._constraint_violations.append(violation_msg)
-                        if not check_all:
-                            self._is_feasible = False
-                            return False
+                        # Wait until the earliest allowed time instead of marking infeasible
+                        current_time = earliest_allowed
 
                     if current_time > latest_allowed:
                         days_late = (current_time - latest_allowed).days
@@ -381,7 +494,9 @@ class RouteSolution:
             discretization_constant=self.discretization_constant,
             min_date=self.min_date,
             max_driving_hours=self.max_driving_hours,
-            evaluation_period=self.evaluation_period
+            evaluation_period=self.evaluation_period,
+            allowed_early_hours=self.allowed_early_hours,
+            allowed_late_hours=self.allowed_late_hours
         )
     
     def invalidate_cache(self):

@@ -329,6 +329,14 @@ The elegant 2-column layout displays results in a compact sidebar:
 - **TOTAL CARGO**: Sum of all cargo weight in kg (e.g., 561,002 kg)
 - **TOTAL LOADING**: Aggregate volume in m³ (e.g., 1,314.65 m³)
 - **SOLVING TIME**: Optimization duration in seconds (e.g., 10.62 sec)
+- **WARNINGS**: Infeasible solutions and preprocessing issues appear inline (no popups)
+
+**Route Detail Popup (Left Sidebar):**
+- **Route start**: Starting vendor, requested loading, expected arrival, cargo, volume
+- **Segments**: Vendor → vendor → depot with distance, duration, loading time
+- **Time windows**:
+  - Vendor: expected arrival vs requested loading window
+  - Depot: expected arrival vs requested delivery window
 
 **Interactive Map (Right):**
 - Full-screen route visualization with multiple tile layers
