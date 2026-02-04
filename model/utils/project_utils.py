@@ -444,6 +444,9 @@ def info_matrix_definition(coordinates, source_node, shape, client, provider='or
             time_mtrx[i][source_node] = 0
         distance_mtrx = np.asarray(distance_mtrx)
         time_mtrx = np.asarray(time_mtrx)
+    else:
+        distance_mtrx = np.asarray(distance_mtrx)
+        time_mtrx = np.asarray(time_mtrx)
     return distance_mtrx, time_mtrx
 
 def cargo_vector(vendor_df):

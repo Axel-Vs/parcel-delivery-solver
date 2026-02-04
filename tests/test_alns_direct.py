@@ -65,7 +65,7 @@ network_params = {
 
 # Create graph and process
 net = Graph(network_params)
-complete_coordinates, vendors_df = net.read_data(period, df)
+complete_coordinates, vendors_df, depots_df = net.read_data(period, df)
 
 print(f"\nProcessed {len(vendors_df)} vendors with dates")
 print(f"Creating network...")

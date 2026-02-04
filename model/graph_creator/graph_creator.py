@@ -155,8 +155,19 @@ class Graph:
         #---!
 
 
-        # recipient_extract
-        recipient_values = initial_dataset[['recipient_longitude', 'recipient_latitude']].apply(list, axis=1)
+        # recipient_extract (for multi-depot support)
+        def _first_col(df, options):
+            for col in options:
+                if col in df.columns:
+                    return col
+            return None
+
+        recipient_lon_col = _first_col(initial_dataset, ['recipient_longitude', 'Recipient Longitude'])
+        recipient_lat_col = _first_col(initial_dataset, ['recipient_latitude', 'Recipient Latitude'])
+        recipient_city_col = _first_col(initial_dataset, ['Recipient City'])
+        recipient_country_col = _first_col(initial_dataset, ['Recipient Country Name'])
+
+        recipient_values = initial_dataset[[recipient_lon_col, recipient_lat_col]].apply(list, axis=1)
 
         # vendor_extrac
         if not isinstance(period, list):
@@ -189,17 +200,80 @@ class Graph:
         ]
         if 'time_bucket' in filter_geocoded.columns:
             base_cols.append('time_bucket')
-        vendors_df = filter_geocoded[base_cols]
+        vendors_df = filter_geocoded[base_cols].copy()
         vendors_df.index = vendors_df.index + 1
         vendors_df = vendors_df
         if len(vendors_df) !=0:
             print('Number of vendors extracted:', len(vendors_df))   # complete dataset
-        
-        # consolidation
-        complete_coordinates = pd.concat([recipient_values.head(1), vendor_coordinates], ignore_index=False)
-        complete_coordinates = list(complete_coordinates)
-        
-        return complete_coordinates, vendors_df
+
+        # Build unique depots from recipient coordinates + location info
+        depots_df = pd.DataFrame(columns=[
+            'depot_id',
+            'node_id',
+            'recipient_longitude',
+            'recipient_latitude',
+            'Recipient City',
+            'Recipient Country Name'
+        ])
+        if recipient_lon_col and recipient_lat_col:
+            depots_raw = filter_geocoded[[recipient_lon_col, recipient_lat_col]].copy()
+            depots_raw['Recipient City'] = (
+                filter_geocoded[recipient_city_col].astype(str).str.strip()
+                if recipient_city_col in filter_geocoded.columns else ''
+            )
+            depots_raw['Recipient Country Name'] = (
+                filter_geocoded[recipient_country_col].astype(str).str.strip()
+                if recipient_country_col in filter_geocoded.columns else ''
+            )
+            depots_raw['recipient_longitude'] = depots_raw[recipient_lon_col].astype(float)
+            depots_raw['recipient_latitude'] = depots_raw[recipient_lat_col].astype(float)
+            depots_raw['depot_key'] = depots_raw.apply(
+                lambda r: (
+                    round(float(r['recipient_longitude']), 6),
+                    round(float(r['recipient_latitude']), 6),
+                    str(r['Recipient City']).strip(),
+                    str(r['Recipient Country Name']).strip()
+                ),
+                axis=1
+            )
+            depots_df = depots_raw.drop_duplicates('depot_key').reset_index(drop=True)
+            depots_df['depot_id'] = range(1, len(depots_df) + 1)
+            depots_df['node_id'] = depots_df['depot_id']
+
+            depot_map = {
+                row['depot_key']: int(row['depot_id'])
+                for _, row in depots_df.iterrows()
+            }
+
+            depots_df = depots_df[[
+                'depot_id',
+                'node_id',
+                'recipient_longitude',
+                'recipient_latitude',
+                'Recipient City',
+                'Recipient Country Name'
+            ]]
+            vendor_keys = depots_raw['depot_key'].tolist()
+            vendor_depot_ids = [depot_map.get(key) for key in vendor_keys]
+            vendors_df.loc[:, 'depot_id'] = vendor_depot_ids
+            vendors_df.loc[:, 'depot_node_id'] = vendors_df['depot_id']
+
+        # Assign node_id for vendors after depot nodes
+        depot_count = len(depots_df)
+        vendors_df.loc[:, 'node_id'] = vendors_df.index + depot_count
+
+        # Consolidation: [dummy_start] + depots + vendors
+        depots_coords = []
+        if len(depots_df) > 0:
+            depots_coords = depots_df[['recipient_longitude', 'recipient_latitude']].apply(list, axis=1).tolist()
+            dummy_coord = depots_coords[0]
+        elif len(vendor_coordinates) > 0:
+            dummy_coord = vendor_coordinates.iloc[0]
+        else:
+            dummy_coord = [0.0, 0.0]
+        complete_coordinates = [dummy_coord] + depots_coords + list(vendor_coordinates)
+
+        return complete_coordinates, vendors_df, depots_df
         
 
     def create_network(self, complete_coordinates, vendors_df):

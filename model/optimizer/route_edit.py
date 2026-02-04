@@ -10,15 +10,21 @@ import math
 Depot = 0
 
 
-def _route_load(route: List[int], capacity_matrix, loading_matrix) -> Tuple[float, float]:
-    weight = sum(capacity_matrix[node] for node in route if node != Depot)
-    volume = sum(loading_matrix[node] for node in route if node != Depot)
+def _is_depot(node_id: int, depot_node_ids=None) -> bool:
+    depot_nodes = set(depot_node_ids or [Depot])
+    return node_id in depot_nodes
+
+
+def _route_load(route: List[int], capacity_matrix, loading_matrix, depot_node_ids=None) -> Tuple[float, float]:
+    weight = sum(capacity_matrix[node] for node in route if not _is_depot(node, depot_node_ids))
+    volume = sum(loading_matrix[node] for node in route if not _is_depot(node, depot_node_ids))
     return float(weight), float(volume)
 
 
 def remove_stop(
     routes: List[List[int]],
     stop: int,
+    depot_node_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Remove a stop from the first route that contains it.
 
@@ -34,8 +40,9 @@ def remove_stop(
             removed_from = idx
             new_route = [node for node in route if node != stop or node == Depot]
             # Ensure route still ends at depot
-            if new_route and new_route[-1] != Depot:
-                new_route.append(Depot)
+            if new_route and not _is_depot(new_route[-1], depot_node_ids):
+                fallback_depot = (depot_node_ids or [Depot])[0]
+                new_route.append(fallback_depot)
             # Avoid empty route; keep at least depot
             if not new_route:
                 new_route = [Depot]
@@ -60,6 +67,7 @@ def insert_stop_best_position(
     max_ldms_vc: float,
     frozen_prefix: Optional[List[int]] = None,
     allow_new_route: bool = True,
+    depot_node_ids: Optional[List[int]] = None,
     # Time feasibility (optional)
     time_matrix=None,
     earliest=None,
@@ -84,10 +92,15 @@ def insert_stop_best_position(
 
     for r_idx, route in enumerate(routes):
         fp = frozen_prefix[r_idx] if r_idx < len(frozen_prefix) else 0
-        # route must end with depot; insertion positions are after fp up to before last node
+        # route must end with depot; insertion positions are after fp up to before first depot
         if len(route) < 2:
             continue
-        for pos in range(max(fp + 1, 1), len(route)):  # insert before route[pos]
+        end_limit = len(route)
+        for i, node in enumerate(route):
+            if _is_depot(node, depot_node_ids) and i > 0:
+                end_limit = i
+                break
+        for pos in range(max(fp + 1, 1), end_limit):  # insert before route[pos]
             prev_node = route[pos - 1]
             next_node = route[pos]
             delta = (
@@ -97,7 +110,7 @@ def insert_stop_best_position(
             )
 
             # Capacity check
-            weight, volume = _route_load(route, capacity_matrix, loading_matrix)
+            weight, volume = _route_load(route, capacity_matrix, loading_matrix, depot_node_ids)
             weight += capacity_matrix[new_stop]
             volume += loading_matrix[new_stop]
             if weight > max_capacity_kg or volume > max_ldms_vc:
@@ -142,7 +155,8 @@ def insert_stop_best_position(
         }
 
     if allow_new_route:
-        new_routes.append([Depot, new_stop, Depot])
+        fallback_depot = (depot_node_ids or [Depot])[0]
+        new_routes.append([Depot, new_stop, fallback_depot])
         return {
             "success": True,
             "routes": new_routes,

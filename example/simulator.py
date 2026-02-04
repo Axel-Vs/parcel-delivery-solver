@@ -208,7 +208,7 @@ for w in [0.5]:
 
         # Read data and create Graph for the given period
         try:
-            complete_coordinates, vendors_df = net.read_data([period[0], period[1]], df_geocoded)
+            complete_coordinates, vendors_df, depots_df = net.read_data([period[0], period[1]], df_geocoded)
         except Exception as e:
             print('Error while reading data for period:', e)
             continue

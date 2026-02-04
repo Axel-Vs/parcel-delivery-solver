@@ -43,9 +43,13 @@ def _solve_alns_group(payload):
         allowed_early_hours=payload['allowed_early_hours'],
         allowed_late_hours=payload['allowed_late_hours'],
         vendor_ids=payload['vendor_ids'],
+        depot_node_ids=payload.get('depot_node_ids'),
+        vendor_node_ids=payload.get('vendor_ids'),
+        vendor_depot_map=payload.get('vendor_depot_map')
     )
     group_solution = group_solver.solve(verbose=payload['verbose'])
-    group_solution = LocalSearchOperators.improve_solution(group_solution, max_iterations=payload['ls_iters'])
+    if not getattr(group_solver, 'initial_feasible', False):
+        group_solution = LocalSearchOperators.improve_solution(group_solution, max_iterations=payload['ls_iters'])
     feasible = group_solution.is_feasible(check_all=True)
     return {
         'routes': group_solution.routes,
@@ -58,7 +62,8 @@ class DeliveryOptimizer:
     def __init__(self, evaluation_period, discretization_constant, time_expanded_network, time_expanded_network_index,
                  Tau_hours, distance_matrix, time_distance_matrix, disc_time_distance_matrix, capacity_matrix, loading_matrix,
                  max_capacity, max_volume, max_linear_length, max_driving, is_gap, mip_gap, maximum_minutes,
-                 service_time_matrix=None, vendors_df=None, allowed_early_hours=12, allowed_late_hours=12):
+                 service_time_matrix=None, vendors_df=None, allowed_early_hours=12, allowed_late_hours=12,
+                 depots_df=None, depot_node_ids=None, vendor_node_ids=None, vendor_depot_map=None):
         # Log information about the MIP model setup
         log.info('Defining MIP model... ')
 
@@ -77,6 +82,10 @@ class DeliveryOptimizer:
         self.vendors_df = vendors_df
         self.allowed_early_hours = allowed_early_hours
         self.allowed_late_hours = allowed_late_hours
+        self.depots_df = depots_df
+        self.depot_node_ids = depot_node_ids or []
+        self.vendor_node_ids = vendor_node_ids or []
+        self.vendor_depot_map = vendor_depot_map or {}
 
         # Calculate derived attributes
         self.max_driving_hours = max_driving
@@ -211,7 +220,8 @@ class DeliveryOptimizer:
                 raw_bucket = self.vendors_df.iloc[i].get('time_bucket', '')
                 bucket = str(raw_bucket).strip()
                 if bucket:
-                    group_map.setdefault(bucket, []).append(i + 1)
+                    node_id = self.vendors_df.iloc[i].get('node_id', i + 1)
+                    group_map.setdefault(bucket, []).append(int(node_id))
 
         if len(group_map) > 1:
             if verbose:
@@ -220,6 +230,19 @@ class DeliveryOptimizer:
 
             payloads = []
             for vendor_ids in group_map.values():
+                group_size = len(vendor_ids)
+                if group_size <= 3:
+                    group_max_iterations = min(max_iterations, 400)
+                    group_ls_iters = 30
+                elif group_size <= 6:
+                    group_max_iterations = min(max_iterations, 700)
+                    group_ls_iters = 60
+                elif group_size <= 10:
+                    group_max_iterations = min(max_iterations, 1200)
+                    group_ls_iters = 120
+                else:
+                    group_max_iterations = max_iterations
+                    group_ls_iters = ls_iters
                 payloads.append({
                     'vendors_df': self.vendors_df,
                     'distance_matrix': self.distance_matrix,
@@ -233,17 +256,25 @@ class DeliveryOptimizer:
                     'discretization_constant': self.discretization_constant,
                     'min_date': self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
                     'max_driving_hours': self.max_driving_hours,
-                    'alns_config': alns_config,
+                    'alns_config': {**alns_config, 'max_iterations': group_max_iterations},
                     'evaluation_period': self.evaluation_period,
                     'allowed_early_hours': self.allowed_early_hours,
                     'allowed_late_hours': self.allowed_late_hours,
                     'vendor_ids': vendor_ids,
                     'verbose': verbose,
-                    'ls_iters': ls_iters,
+                    'ls_iters': group_ls_iters,
+                    'depot_node_ids': self.depot_node_ids,
+                    'vendor_node_ids': self.vendor_node_ids,
+                    'vendor_depot_map': self.vendor_depot_map
                 })
 
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                group_results = list(executor.map(_solve_alns_group, payloads))
+            try:
+                with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    group_results = list(executor.map(_solve_alns_group, payloads))
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️ Parallel ALNS failed ({type(e).__name__}: {e}); retrying sequentially")
+                group_results = [_solve_alns_group(p) for p in payloads]
 
             combined_routes = []
             combined_violations = []
@@ -270,6 +301,9 @@ class DeliveryOptimizer:
                 evaluation_period=self.evaluation_period,
                 allowed_early_hours=self.allowed_early_hours,
                 allowed_late_hours=self.allowed_late_hours,
+                depot_node_ids=self.depot_node_ids,
+                vendor_node_ids=self.vendor_node_ids,
+                vendor_depot_map=self.vendor_depot_map
             )
             is_feasible = solution.is_feasible(check_all=True) if feasible else False
             solution._constraint_violations = combined_violations if combined_violations else list(solution._constraint_violations)
@@ -292,16 +326,20 @@ class DeliveryOptimizer:
                 config=alns_config,
                 evaluation_period=self.evaluation_period,
                 allowed_early_hours=self.allowed_early_hours,
-                allowed_late_hours=self.allowed_late_hours
+                allowed_late_hours=self.allowed_late_hours,
+                depot_node_ids=self.depot_node_ids,
+                vendor_node_ids=self.vendor_node_ids,
+                vendor_depot_map=self.vendor_depot_map
             )
             
             # Solve with ALNS
             solution = alns.solve(verbose=verbose)
             
-            # Apply local search improvement
-            if verbose:
-                print('   - Applying local search improvement...')
-            solution = LocalSearchOperators.improve_solution(solution, max_iterations=ls_iters)
+            # Apply local search improvement only if initial solution was not feasible
+            if not getattr(alns, 'initial_feasible', False):
+                if verbose:
+                    print('   - Applying local search improvement...')
+                solution = LocalSearchOperators.improve_solution(solution, max_iterations=ls_iters)
             
             # Check feasibility
             is_feasible = solution.is_feasible(check_all=True)
@@ -330,16 +368,190 @@ class DeliveryOptimizer:
                         except:
                             pass
                 
+                def _vendor_row(node_id):
+                    if self.vendors_df is None:
+                        return None
+                    if 'node_id' in self.vendors_df.columns:
+                        match = self.vendors_df[self.vendors_df['node_id'] == int(node_id)]
+                        return match.iloc[0] if not match.empty else None
+                    idx = int(node_id) - 1
+                    if 0 <= idx < len(self.vendors_df):
+                        return self.vendors_df.iloc[idx]
+                    return None
+
+                def _vendor_window(node_id):
+                    row = _vendor_row(node_id)
+                    if row is None:
+                        return None, None
+                    for raw in [row.get('Requested Loading', None), row.get('Requested Loading Date', None)]:
+                        parsed = pd.to_datetime(raw, errors='coerce')
+                        if pd.notna(parsed):
+                            requested = parsed.to_pydatetime()
+                            start = requested - timedelta(hours=float(self.allowed_early_hours))
+                            end = requested + timedelta(hours=float(self.allowed_late_hours))
+                            return start, end
+                    return None, None
+
+                def _split_by_overlap(vendor_nodes):
+                    entries = []
+                    for v in vendor_nodes:
+                        s, e = _vendor_window(v)
+                        if s is None or e is None:
+                            continue
+                        entries.append((v, s, e))
+                    if not entries:
+                        return []
+                    entries.sort(key=lambda x: x[1])
+                    groups = []
+                    current_end = None
+                    current_group = []
+                    for v, s, e in entries:
+                        if current_end is None or s <= current_end:
+                            current_end = e if current_end is None else max(current_end, e)
+                            current_group.append(v)
+                        else:
+                            groups.append(list(current_group))
+                            current_group = [v]
+                            current_end = e
+                    if current_group:
+                        groups.append(list(current_group))
+                    # Preserve original route order inside each group
+                    ordered_groups = []
+                    for group in groups:
+                        ordered = [v for v in vendor_nodes if v in group]
+                        if ordered:
+                            ordered_groups.append(ordered)
+
+                    # Verify disjoint group intervals by time; merge if overlapping
+                    def _group_interval(group):
+                        starts = []
+                        ends = []
+                        for v in group:
+                            s, e = _vendor_window(v)
+                            if s is None or e is None:
+                                continue
+                            starts.append(s)
+                            ends.append(e)
+                        if not starts or not ends:
+                            return None, None
+                        return min(starts), max(ends)
+
+                    merged_groups = []
+                    prev_start = None
+                    prev_end = None
+                    for group in ordered_groups:
+                        g_start, g_end = _group_interval(group)
+                        if g_start is None or g_end is None:
+                            merged_groups.append(group)
+                            prev_start, prev_end = g_start, g_end
+                            continue
+                        if prev_end is None or g_start > prev_end:
+                            merged_groups.append(group)
+                            prev_start, prev_end = g_start, g_end
+                        else:
+                            if verbose:
+                                print(
+                                    f"      ⚠️ Overlap detected between groups "
+                                    f"[{prev_start}..{prev_end}] and [{g_start}..{g_end}]; merging"
+                                )
+                            merged_groups[-1].extend(group)
+                            prev_start, prev_end = _group_interval(merged_groups[-1])
+
+                    return merged_groups
+
+                def _route_depots(vendor_nodes):
+                    depot_deadlines = {}
+                    for v in vendor_nodes:
+                        depot_node = self.vendor_depot_map.get(v)
+                        if depot_node is None:
+                            continue
+                        row = _vendor_row(v)
+                        if row is None:
+                            continue
+                        for raw in [row.get('Requested Delivery', None), row.get('Requested Delivery Date', None)]:
+                            parsed = pd.to_datetime(raw, errors='coerce')
+                            if pd.notna(parsed):
+                                delivery_time = parsed.to_pydatetime()
+                                if depot_node not in depot_deadlines:
+                                    depot_deadlines[depot_node] = delivery_time
+                                else:
+                                    depot_deadlines[depot_node] = min(depot_deadlines[depot_node], delivery_time)
+                                break
+                    depots = list(depot_deadlines.keys())
+                    depots.sort(key=lambda d: depot_deadlines.get(d))
+                    return depots
+
                 # Rebuild solution: keep good routes, split violated ones
                 new_routes = []
                 for route_idx, route in enumerate(solution.routes):
                     if route_idx in violated_route_ids:
-                        # Split violated route into single-vendor routes
-                        vendors_in_route = [v for v in route if v != 0]
-                        for vendor in vendors_in_route:
-                            new_routes.append([0, vendor, 0])
+                        vendors_in_route = [v for v in route if v in self.vendor_node_ids]
+                        grouped = _split_by_overlap(vendors_in_route)
+                        if not grouped and vendors_in_route:
+                            grouped = [[v] for v in vendors_in_route]
+                        for group in grouped:
+                            # Re-run ALNS on each overlap group
+                            group_solver = ALNSSolver(
+                                vendors_df=self.vendors_df,
+                                distance_matrix=self.distance_matrix,
+                                time_matrix=self.time_distance_matrix,
+                                capacity_matrix=self.capacity_matrix,
+                                loading_matrix=self.loading_matrix,
+                                service_time_matrix=self.service_time_matrix,
+                                max_capacity_kg=self.max_capacity_kg,
+                                max_volume=self.max_volume_vc,
+                                max_linear_length=self.max_linear_length_vc,
+                                discretization_constant=self.discretization_constant,
+                                min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
+                                max_driving_hours=self.max_driving_hours,
+                                config=alns_config,
+                                evaluation_period=self.evaluation_period,
+                                allowed_early_hours=self.allowed_early_hours,
+                                allowed_late_hours=self.allowed_late_hours,
+                                vendor_ids=group,
+                                depot_node_ids=self.depot_node_ids,
+                                vendor_node_ids=group,
+                                vendor_depot_map=self.vendor_depot_map
+                            )
+                            group_solution = group_solver.solve(verbose=verbose)
+                            if not getattr(group_solver, 'initial_feasible', False):
+                                group_solution = LocalSearchOperators.improve_solution(group_solution, max_iterations=ls_iters)
+                            if group_solution.is_feasible(check_all=True):
+                                for r in group_solution.routes:
+                                    new_routes.append(list(r))
+                            else:
+                                if verbose:
+                                    print(f'      ⚠️ Group infeasible, splitting into single-vendor routes')
+                                for v in group:
+                                    single_solver = ALNSSolver(
+                                        vendors_df=self.vendors_df,
+                                        distance_matrix=self.distance_matrix,
+                                        time_matrix=self.time_distance_matrix,
+                                        capacity_matrix=self.capacity_matrix,
+                                        loading_matrix=self.loading_matrix,
+                                        service_time_matrix=self.service_time_matrix,
+                                        max_capacity_kg=self.max_capacity_kg,
+                                        max_volume=self.max_volume_vc,
+                                        max_linear_length=self.max_linear_length_vc,
+                                        discretization_constant=self.discretization_constant,
+                                        min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
+                                        max_driving_hours=self.max_driving_hours,
+                                        config=alns_config,
+                                        evaluation_period=self.evaluation_period,
+                                        allowed_early_hours=self.allowed_early_hours,
+                                        allowed_late_hours=self.allowed_late_hours,
+                                        vendor_ids=[v],
+                                        depot_node_ids=self.depot_node_ids,
+                                        vendor_node_ids=[v],
+                                        vendor_depot_map=self.vendor_depot_map
+                                    )
+                                    single_solution = single_solver.solve(verbose=verbose)
+                                    if not getattr(single_solver, 'initial_feasible', False):
+                                        single_solution = LocalSearchOperators.improve_solution(single_solution, max_iterations=ls_iters)
+                                    for r in single_solution.routes:
+                                        new_routes.append(list(r))
                         if verbose:
-                            print(f'      → Split Route {route_idx}: {len(vendors_in_route)} vendors → {len(vendors_in_route)} routes')
+                            print(f'      → Split Route {route_idx}: {len(vendors_in_route)} vendors → {len(grouped)} routes')
                     else:
                         # Keep feasible route as is
                         new_routes.append(route)
@@ -360,7 +572,10 @@ class DeliveryOptimizer:
                     max_driving_hours=self.max_driving_hours,
                     evaluation_period=self.evaluation_period,
                     allowed_early_hours=self.allowed_early_hours,
-                    allowed_late_hours=self.allowed_late_hours
+                    allowed_late_hours=self.allowed_late_hours,
+                    depot_node_ids=self.depot_node_ids,
+                    vendor_node_ids=self.vendor_node_ids,
+                    vendor_depot_map=self.vendor_depot_map
                 )
                 is_feasible = solution.is_feasible(check_all=True)
                 if is_feasible:
@@ -690,25 +905,27 @@ class DeliveryOptimizer:
                         # Display detailed route with departure/arrival times and travel durations
                         for idx, (node, depart_str, arrival_str, travel_hours) in enumerate(segment_times):
                             if node == 0:
-                                node_name = 'Depot'
+                                node_name = 'Start'
                                 location_info = ''
                             else:
-                                node_name = f'Vendor {int(node)}'
-                                # Get city and postcode from vendors_df
+                                node_name = f'Node {int(node)}'
                                 location_info = ''
-                                if vendors_df is not None and int(node) <= len(vendors_df):
+                                if vendors_df is not None:
                                     try:
-                                        vendor_row = vendors_df.iloc[int(node) - 1]
-                                        # Try multiple ways to access the columns
-                                        city = ''
-                                        postcode = ''
-                                        if 'Vendor City' in vendor_row.index:
-                                            city = str(vendor_row['Vendor City']).strip()
-                                        if 'Vendor Postcode' in vendor_row.index:
-                                            postcode = str(vendor_row['Vendor Postcode']).strip()
-                                        if city and postcode:
-                                            location_info = f' ({city}, PLZ {postcode})'
-                                    except Exception as e:
+                                        vendor_row = None
+                                        if 'node_id' in vendors_df.columns:
+                                            match = vendors_df[vendors_df['node_id'] == int(node)]
+                                            if not match.empty:
+                                                vendor_row = match.iloc[0]
+                                        elif int(node) <= len(vendors_df):
+                                            vendor_row = vendors_df.iloc[int(node) - 1]
+                                        if vendor_row is not None:
+                                            node_name = str(vendor_row.get('vendor Name', node_name)).strip()
+                                            city = str(vendor_row.get('Vendor City', '')).strip()
+                                            postcode = str(vendor_row.get('Vendor Postcode', '')).strip()
+                                            if city and postcode:
+                                                location_info = f' ({city}, PLZ {postcode})'
+                                    except Exception:
                                         pass
                             
                             if idx == 0:
@@ -1178,31 +1395,40 @@ class DeliveryOptimizer:
         # Build coordinate mapping: node_id -> (lat, lon) and node info
         coords = {}
         node_info = {}
-        
-        # Depot is node 0 - get from first vendor's recipient coordinates
-        depot_lat = None
-        depot_lon = None
-        
-        if len(self.vendors_df) > 0:
-            depot_lat = self.vendors_df.iloc[0].get('recipient_latitude', None)
-            depot_lon = self.vendors_df.iloc[0].get('recipient_longitude', None)
-            
-            # If recipient coordinates not available, use Seattle as default depot
-            if depot_lat is None or depot_lon is None:
-                print('⚠️  Depot coordinates not found, using Seattle as default')
-                depot_lat = 47.6062  # Seattle
-                depot_lon = -122.3321
-            
-            coords[0] = (depot_lat, depot_lon)
-            node_info[0] = {'name': 'Depot (Seattle)', 'type': 'depot'}
-            print(f'📍 Depot coordinates: {depot_lat}, {depot_lon}')
-        
-        # Vendors are nodes 1, 2, 3, ...
-        index_min = int(self.vendors_df.index.min()) if len(self.vendors_df.index) > 0 else 0
-        index_max = int(self.vendors_df.index.max()) if len(self.vendors_df.index) > 0 else 0
-        use_df_index = index_min == 1 and index_max == len(self.vendors_df)
-        for df_idx, row in self.vendors_df.iterrows():
-            node_id = int(df_idx) if use_df_index else int(df_idx) + 1
+
+        # Dummy start node (0)
+        dummy_lat = None
+        dummy_lon = None
+        if self.depots_df is not None and len(self.depots_df) > 0:
+            dummy_lat = self.depots_df.iloc[0].get('recipient_latitude', None)
+            dummy_lon = self.depots_df.iloc[0].get('recipient_longitude', None)
+        if dummy_lat is None or dummy_lon is None:
+            dummy_lat = 47.6062  # Seattle
+            dummy_lon = -122.3321
+        coords[0] = (dummy_lat, dummy_lon)
+        node_info[0] = {'name': 'Route Start', 'city': '', 'country': '', 'type': 'start'}
+
+        # Depots (multiple)
+        if self.depots_df is not None:
+            for _, row in self.depots_df.iterrows():
+                node_id = int(row.get('node_id', 0))
+                depot_lat = row.get('recipient_latitude', None)
+                depot_lon = row.get('recipient_longitude', None)
+                if depot_lat is None or depot_lon is None:
+                    continue
+                depot_city = row.get('Recipient City', 'Depot')
+                depot_country = row.get('Recipient Country Name', '')
+                coords[node_id] = (depot_lat, depot_lon)
+                node_info[node_id] = {
+                    'name': f"Depot ({depot_city})",
+                    'city': depot_city,
+                    'country': depot_country,
+                    'type': 'depot'
+                }
+
+        # Vendors
+        for _, row in self.vendors_df.iterrows():
+            node_id = int(row.get('node_id', 0))
             vendor_lat = row.get('vendor_latitude', None)
             vendor_lon = row.get('vendor_longitude', None)
             vendor_name = row.get('vendor Name', f'Vendor {node_id}')
@@ -1217,9 +1443,23 @@ class DeliveryOptimizer:
                     'plz': vendor_plz,
                     'type': 'vendor'
                 }
-                print(f'📍 Vendor {node_id} ({vendor_city}): {vendor_lat}, {vendor_lon}')
+
+        depot_count = len(self.depots_df) if self.depots_df is not None else 0
+        print(f'📊 Total nodes with coordinates: {len(coords)} (Depots: {depot_count}, Vendors: {len(self.vendors_df)})')
         
-        print(f'📊 Total nodes with coordinates: {len(coords)} (Depot + {len(coords)-1} vendors)')
+        vendor_nodes = set(self.vendor_node_ids or [])
+        depot_nodes = set(self.depot_node_ids or [])
+        vendor_row_by_node = {}
+        for _, row in self.vendors_df.iterrows():
+            node_id = row.get('node_id', None)
+            if pd.notna(node_id):
+                vendor_row_by_node[int(node_id)] = row
+        depot_row_by_node = {}
+        if self.depots_df is not None:
+            for _, row in self.depots_df.iterrows():
+                node_id = row.get('node_id', None)
+                if pd.notna(node_id):
+                    depot_row_by_node[int(node_id)] = row
         
         if len(coords) < 2:
             print('⚠️  Insufficient coordinate data for plotting')
@@ -1285,7 +1525,7 @@ class DeliveryOptimizer:
             raw_routes = {k: list(route) for k, route in enumerate(self.metaheuristic_solution.routes)}
             routes = {
                 k: route for k, route in raw_routes.items()
-                if route and any(node != 0 for node in route)
+                if route and any(node in vendor_nodes for node in route)
             }
             vehicles_used = list(routes.keys())
             log.info(f"📊 DEBUG: meta routes count={len(routes)}, vehicles_used set to {vehicles_used}")
@@ -1308,8 +1548,6 @@ class DeliveryOptimizer:
                 route_path = routes.get(k, [])
                 if route_path and route_path[0] != 0:
                     route_path = [0] + route_path
-                if route_path and route_path[-1] != 0:
-                    route_path = route_path + [0]
                 # Display routes should start at first vendor (no depot start)
                 display_path = route_path[1:] if route_path and route_path[0] == 0 else route_path
                 routes[k] = display_path
@@ -1376,10 +1614,10 @@ class DeliveryOptimizer:
                 continue
                 
             # Calculate vehicle statistics
-            if not route_path or route_path == [0, 0]:
+            if not route_path or not any(n in vendor_nodes for n in route_path):
                 continue
 
-            vendors_visited = [n for n in route_path if n != 0]
+            vendors_visited = [n for n in route_path if n in vendor_nodes] if vendor_nodes else [n for n in route_path if n != 0]
             unique_vendors = []
             seen_vendors = set()
             for v in vendors_visited:
@@ -1404,10 +1642,12 @@ class DeliveryOptimizer:
 
             # Determine route baseline time: optimize within vendor + depot windows
             base_dt = None
-            first_vendor_id = next((n for n in route_path if n != 0), None)
+            first_vendor_id = next((n for n in route_path if n in vendor_nodes), None)
             if first_vendor_id is not None and self.vendors_df is not None:
                 try:
-                    vendor_row = self.vendors_df.iloc[int(first_vendor_id) - 1]
+                    vendor_row = vendor_row_by_node.get(int(first_vendor_id))
+                    if vendor_row is None:
+                        raise ValueError("Vendor row not found for node")
                     raw_candidates = [
                         vendor_row.get('Requested Loading', None),
                         vendor_row.get('Requested Loading Date', None),
@@ -1428,15 +1668,17 @@ class DeliveryOptimizer:
                         node = route_path[i]
                         if prev_node < len(self.time_distance_matrix) and node < len(self.time_distance_matrix[prev_node]):
                             route_duration_seconds += self.time_distance_matrix[prev_node][node]
-                        if node != 0 and self.service_time_matrix is not None and node < len(self.service_time_matrix):
+                        if node in vendor_nodes and self.service_time_matrix is not None and node < len(self.service_time_matrix):
                             route_duration_seconds += self.service_time_matrix[node] * 60
 
                     # Latest requested delivery in this route (for depot window)
                     route_latest_delivery = None
                     for node in route_path:
-                        if node == 0:
+                        if node not in vendor_nodes:
                             continue
-                        vendor_row = self.vendors_df.iloc[int(node) - 1]
+                        vendor_row = vendor_row_by_node.get(int(node))
+                        if vendor_row is None:
+                            continue
                         raw_delivery_candidates = [
                             vendor_row.get('Requested Delivery', None),
                             vendor_row.get('Requested Delivery Date', None),
@@ -1540,9 +1782,11 @@ class DeliveryOptimizer:
                     arrival_hours = cumulative_time_hours + seg_duration
                     arrival_iso = None
                     vendor_dt = None
-                    if node_to != 0 and self.vendors_df is not None:
+                    if node_to in vendor_nodes and self.vendors_df is not None:
                         try:
-                            vendor_row = self.vendors_df.iloc[int(node_to) - 1]
+                            vendor_row = vendor_row_by_node.get(int(node_to))
+                            if vendor_row is None:
+                                raise ValueError("Vendor row not found")
                             raw_candidates = [
                                 vendor_row.get('Requested Loading', None),
                                 vendor_row.get('Requested Loading Date', None),
@@ -1606,7 +1850,8 @@ class DeliveryOptimizer:
                 'total_distance': total_distance,
                 'num_vendors': len(unique_vendors),
                 'vendors': unique_vendors,
-                'segments': segments  # Add segment details
+                'segments': segments,  # Add segment details
+                'route_path': route_path
             }
         
         print('🗺️  Generating route visualization with actual road routing...')
@@ -1621,10 +1866,15 @@ class DeliveryOptimizer:
         for vehicle_id, route in routes.items():
             step_num = 0
             for i, node in enumerate(route):
-                if node != 0:  # Not depot
+                if node in vendor_nodes:  # Vendor node
                     step_num += 1
                     if node not in vendor_visits:
-                        vendor_visits[node] = {'vehicle': vehicle_id, 'route_number': route_mapping[vehicle_id], 'step': step_num, 'total_steps': len([n for n in route if n != 0])}
+                        vendor_visits[node] = {
+                            'vehicle': vehicle_id,
+                            'route_number': route_mapping[vehicle_id],
+                            'step': step_num,
+                            'total_steps': len([n for n in route if n in vendor_nodes])
+                        }
         
         # Plot routes using OSRM for actual street routing
         osrm_failures = []
@@ -1650,7 +1900,7 @@ class DeliveryOptimizer:
                 # Get cargo and loading for this specific segment (from node_from)
                 segment_cargo = 0
                 segment_loading = 0
-                if node_from != 0:  # Not depot
+                if node_from in vendor_nodes:  # Vendor
                     segment_cargo = self.capacity_matrix[node_from] if node_from < len(self.capacity_matrix) else 0
                     segment_loading = self.loading_matrix[node_from] if node_from < len(self.loading_matrix) else 0
                 
@@ -1884,16 +2134,19 @@ class DeliveryOptimizer:
                     </svg>
                 </div>
                 '''
+                tooltip_city = info.get("city", "")
+                tooltip_name = info.get("name", f"Vendor {node_id}")
                 folium.Marker(
                     location=[lat, lon],
-                    tooltip=folium.Tooltip(f'<b>{info["name"]}</b><br>{info["city"]}', direction='top'),
+                    tooltip=folium.Tooltip(f'<b>{tooltip_name}</b><br>{tooltip_city}', direction='top'),
                     icon=folium.DivIcon(html=pin_html, icon_size=(20, 28), icon_anchor=(10, 28))
                 ).add_to(m)
                 
                 log.info(f'✅ Vendor marker added to map: {info["name"]} at ({lat}, {lon})')
                 vendor_markers_added += 1
         
-        log.info(f'✅ COMPLETE: All node markers processed (1 depot + {vendor_markers_added} vendors added)')
+        depot_marker_count = len(self.depots_df) if self.depots_df is not None else 1
+        log.info(f'✅ COMPLETE: All node markers processed ({depot_marker_count} depots + {vendor_markers_added} vendors added)')
 
         # Expose OSRM failures (if any) for API/UI warnings
         self.osrm_failures = osrm_failures
@@ -1919,7 +2172,8 @@ class DeliveryOptimizer:
         
         # Mini map removed per user request
         
-        log.info(f'✅ COMPLETE: All node markers added to map (1 depot + {vendor_markers_added} vendors)')
+        depot_marker_count = len(self.depots_df) if self.depots_df is not None else 1
+        log.info(f'✅ COMPLETE: All node markers added to map ({depot_marker_count} depots + {vendor_markers_added} vendors)')
         
         # Calculate total distance across all routes
         total_distance = sum(stats['total_distance'] for stats in route_stats.values())
@@ -1928,7 +2182,7 @@ class DeliveryOptimizer:
         # Get solver info
         solver_type = 'Metaheuristic (ALNS)' if is_metaheuristic else 'Exact (MIP)'
         solving_time = getattr(self, 'secs_taken', 0)
-        num_depots = 1
+        num_depots = len(self.depots_df) if self.depots_df is not None else 1
         num_routes = len(vehicles_used)
         num_vendors = len(coords) - 1
         
