@@ -185,6 +185,24 @@ class DeliveryOptimizer:
         if verbose:
             print('\n🚀 Using ALNS metaheuristic solver (fast mode)')
             print(f'   - Network size: {len(self.time_expanded_network)} arcs, {self.length} nodes')
+
+        # Normalize requested loading columns to avoid missing vendor windows
+        if self.vendors_df is not None:
+            self.vendors_df.columns = [str(c).strip() for c in self.vendors_df.columns]
+            if 'Requested Loading' not in self.vendors_df.columns and 'Requested Loading Date' in self.vendors_df.columns:
+                self.vendors_df['Requested Loading'] = self.vendors_df['Requested Loading Date']
+            if 'Requested Loading Date' not in self.vendors_df.columns and 'Requested Loading' in self.vendors_df.columns:
+                self.vendors_df['Requested Loading Date'] = self.vendors_df['Requested Loading']
+            if 'Requested Loading' in self.vendors_df.columns and 'Requested Loading Date' in self.vendors_df.columns:
+                self.vendors_df['Requested Loading'] = self.vendors_df['Requested Loading'].fillna(
+                    self.vendors_df['Requested Loading Date']
+                )
+            for col in ['Requested Loading', 'Requested Loading Date']:
+                if col in self.vendors_df.columns:
+                    self.vendors_df[col] = (
+                        self.vendors_df[col]
+                        .apply(lambda v: v.strip() if isinstance(v, str) else v)
+                    )
         
         # Create ALNS solver with dynamically tuned parameters based on problem size
         vendors = max(0, self.length - 1)
@@ -210,7 +228,11 @@ class DeliveryOptimizer:
             'min_removal_size': min_removal,
             'max_removal_size': max_removal,
             'initial_temperature': initial_T,
-            'cooling_rate': cooling
+            'cooling_rate': cooling,
+            'merge_debug': bool(verbose),
+            'depot_debug': bool(verbose),
+            'enable_merge': False,
+            'enable_split': False
         }
         
         # Parallel solve by time-window groups when available
@@ -356,234 +378,242 @@ class DeliveryOptimizer:
                 if len(solution._constraint_violations) > 5:
                     print(f'     ... and {len(solution._constraint_violations) - 5} more')
                 
-                # Smart fallback: Split only violated routes, keep feasible ones
-                print(f'   🔧 Fixing {len(solution._constraint_violations)} violated routes...')
-                violated_route_ids = set()
-                for violation in solution._constraint_violations:
-                    # Extract route number from violation message
-                    if 'Route' in violation:
-                        try:
-                            route_id = int(violation.split('Route')[1].split(':')[0].strip())
-                            violated_route_ids.add(route_id)
-                        except:
-                            pass
-                
-                def _vendor_row(node_id):
-                    if self.vendors_df is None:
+                if alns_config.get('enable_split', False):
+                    # Smart fallback: Split only violated routes, keep feasible ones
+                    print(f'   🔧 Fixing {len(solution._constraint_violations)} violated routes...')
+                    violated_route_ids = set()
+                    for violation in solution._constraint_violations:
+                        # Extract route number from violation message
+                        if 'Route' in violation:
+                            try:
+                                route_id = int(violation.split('Route')[1].split(':')[0].strip())
+                                violated_route_ids.add(route_id)
+                            except:
+                                pass
+
+                    def _vendor_row(node_id):
+                        if self.vendors_df is None:
+                            return None
+                        if 'node_id' in self.vendors_df.columns:
+                            match = self.vendors_df[self.vendors_df['node_id'] == int(node_id)]
+                            return match.iloc[0] if not match.empty else None
+                        idx = int(node_id) - 1
+                        if 0 <= idx < len(self.vendors_df):
+                            return self.vendors_df.iloc[idx]
                         return None
-                    if 'node_id' in self.vendors_df.columns:
-                        match = self.vendors_df[self.vendors_df['node_id'] == int(node_id)]
-                        return match.iloc[0] if not match.empty else None
-                    idx = int(node_id) - 1
-                    if 0 <= idx < len(self.vendors_df):
-                        return self.vendors_df.iloc[idx]
-                    return None
 
-                def _vendor_window(node_id):
-                    row = _vendor_row(node_id)
-                    if row is None:
+                    def _vendor_window(node_id):
+                        row = _vendor_row(node_id)
+                        if row is None:
+                            return None, None
+                        for raw in [row.get('Requested Loading', None), row.get('Requested Loading Date', None)]:
+                            parsed = pd.to_datetime(raw, errors='coerce')
+                            if pd.notna(parsed):
+                                requested = parsed.to_pydatetime()
+                                start = requested - timedelta(hours=float(self.allowed_early_hours))
+                                end = requested + timedelta(hours=float(self.allowed_late_hours))
+                                return start, end
                         return None, None
-                    for raw in [row.get('Requested Loading', None), row.get('Requested Loading Date', None)]:
-                        parsed = pd.to_datetime(raw, errors='coerce')
-                        if pd.notna(parsed):
-                            requested = parsed.to_pydatetime()
-                            start = requested - timedelta(hours=float(self.allowed_early_hours))
-                            end = requested + timedelta(hours=float(self.allowed_late_hours))
-                            return start, end
-                    return None, None
 
-                def _split_by_overlap(vendor_nodes):
-                    entries = []
-                    for v in vendor_nodes:
-                        s, e = _vendor_window(v)
-                        if s is None or e is None:
-                            continue
-                        entries.append((v, s, e))
-                    if not entries:
-                        return []
-                    entries.sort(key=lambda x: x[1])
-                    groups = []
-                    current_end = None
-                    current_group = []
-                    for v, s, e in entries:
-                        if current_end is None or s <= current_end:
-                            current_end = e if current_end is None else max(current_end, e)
-                            current_group.append(v)
-                        else:
-                            groups.append(list(current_group))
-                            current_group = [v]
-                            current_end = e
-                    if current_group:
-                        groups.append(list(current_group))
-                    # Preserve original route order inside each group
-                    ordered_groups = []
-                    for group in groups:
-                        ordered = [v for v in vendor_nodes if v in group]
-                        if ordered:
-                            ordered_groups.append(ordered)
-
-                    # Verify disjoint group intervals by time; merge if overlapping
-                    def _group_interval(group):
-                        starts = []
-                        ends = []
-                        for v in group:
+                    def _split_by_overlap(vendor_nodes):
+                        entries = []
+                        for v in vendor_nodes:
                             s, e = _vendor_window(v)
                             if s is None or e is None:
                                 continue
-                            starts.append(s)
-                            ends.append(e)
-                        if not starts or not ends:
-                            return None, None
-                        return min(starts), max(ends)
+                            entries.append((v, s, e))
+                        if not entries:
+                            return []
+                        entries.sort(key=lambda x: x[1])
+                        groups = []
+                        current_end = None
+                        current_group = []
+                        for v, s, e in entries:
+                            if current_end is None or s <= current_end:
+                                current_end = e if current_end is None else max(current_end, e)
+                                current_group.append(v)
+                            else:
+                                groups.append(list(current_group))
+                                current_group = [v]
+                                current_end = e
+                        if current_group:
+                            groups.append(list(current_group))
+                        # Preserve original route order inside each group
+                        ordered_groups = []
+                        for group in groups:
+                            ordered = [v for v in vendor_nodes if v in group]
+                            if ordered:
+                                ordered_groups.append(ordered)
 
-                    merged_groups = []
-                    prev_start = None
-                    prev_end = None
-                    for group in ordered_groups:
-                        g_start, g_end = _group_interval(group)
-                        if g_start is None or g_end is None:
-                            merged_groups.append(group)
-                            prev_start, prev_end = g_start, g_end
-                            continue
-                        if prev_end is None or g_start > prev_end:
-                            merged_groups.append(group)
-                            prev_start, prev_end = g_start, g_end
-                        else:
-                            if verbose:
-                                print(
-                                    f"      ⚠️ Overlap detected between groups "
-                                    f"[{prev_start}..{prev_end}] and [{g_start}..{g_end}]; merging"
-                                )
-                            merged_groups[-1].extend(group)
-                            prev_start, prev_end = _group_interval(merged_groups[-1])
+                        # Verify disjoint group intervals by time; merge if overlapping
+                        def _group_interval(group):
+                            starts = []
+                            ends = []
+                            for v in group:
+                                s, e = _vendor_window(v)
+                                if s is None or e is None:
+                                    continue
+                                starts.append(s)
+                                ends.append(e)
+                            if not starts or not ends:
+                                return None, None
+                            return min(starts), max(ends)
 
-                    return merged_groups
-
-                def _route_depots(vendor_nodes):
-                    depot_deadlines = {}
-                    for v in vendor_nodes:
-                        depot_node = self.vendor_depot_map.get(v)
-                        if depot_node is None:
-                            continue
-                        row = _vendor_row(v)
-                        if row is None:
-                            continue
-                        for raw in [row.get('Requested Delivery', None), row.get('Requested Delivery Date', None)]:
-                            parsed = pd.to_datetime(raw, errors='coerce')
-                            if pd.notna(parsed):
-                                delivery_time = parsed.to_pydatetime()
-                                if depot_node not in depot_deadlines:
-                                    depot_deadlines[depot_node] = delivery_time
-                                else:
-                                    depot_deadlines[depot_node] = min(depot_deadlines[depot_node], delivery_time)
-                                break
-                    depots = list(depot_deadlines.keys())
-                    depots.sort(key=lambda d: depot_deadlines.get(d))
-                    return depots
-
-                # Rebuild solution: keep good routes, split violated ones
-                new_routes = []
-                for route_idx, route in enumerate(solution.routes):
-                    if route_idx in violated_route_ids:
-                        vendors_in_route = [v for v in route if v in self.vendor_node_ids]
-                        grouped = _split_by_overlap(vendors_in_route)
-                        if not grouped and vendors_in_route:
-                            grouped = [[v] for v in vendors_in_route]
-                        for group in grouped:
-                            # Re-run ALNS on each overlap group
-                            group_solver = ALNSSolver(
-                                vendors_df=self.vendors_df,
-                                distance_matrix=self.distance_matrix,
-                                time_matrix=self.time_distance_matrix,
-                                capacity_matrix=self.capacity_matrix,
-                                loading_matrix=self.loading_matrix,
-                                service_time_matrix=self.service_time_matrix,
-                                max_capacity_kg=self.max_capacity_kg,
-                                max_volume=self.max_volume_vc,
-                                max_linear_length=self.max_linear_length_vc,
-                                discretization_constant=self.discretization_constant,
-                                min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
-                                max_driving_hours=self.max_driving_hours,
-                                config=alns_config,
-                                evaluation_period=self.evaluation_period,
-                                allowed_early_hours=self.allowed_early_hours,
-                                allowed_late_hours=self.allowed_late_hours,
-                                vendor_ids=group,
-                                depot_node_ids=self.depot_node_ids,
-                                vendor_node_ids=group,
-                                vendor_depot_map=self.vendor_depot_map
-                            )
-                            group_solution = group_solver.solve(verbose=verbose)
-                            if not getattr(group_solver, 'initial_feasible', False):
-                                group_solution = LocalSearchOperators.improve_solution(group_solution, max_iterations=ls_iters)
-                            if group_solution.is_feasible(check_all=True):
-                                for r in group_solution.routes:
-                                    new_routes.append(list(r))
+                        merged_groups = []
+                        prev_start = None
+                        prev_end = None
+                        for group in ordered_groups:
+                            g_start, g_end = _group_interval(group)
+                            if g_start is None or g_end is None:
+                                merged_groups.append(group)
+                                prev_start, prev_end = g_start, g_end
+                                continue
+                            if prev_end is None or g_start > prev_end:
+                                merged_groups.append(group)
+                                prev_start, prev_end = g_start, g_end
                             else:
                                 if verbose:
-                                    print(f'      ⚠️ Group infeasible, splitting into single-vendor routes')
-                                for v in group:
-                                    single_solver = ALNSSolver(
-                                        vendors_df=self.vendors_df,
-                                        distance_matrix=self.distance_matrix,
-                                        time_matrix=self.time_distance_matrix,
-                                        capacity_matrix=self.capacity_matrix,
-                                        loading_matrix=self.loading_matrix,
-                                        service_time_matrix=self.service_time_matrix,
-                                        max_capacity_kg=self.max_capacity_kg,
-                                        max_volume=self.max_volume_vc,
-                                        max_linear_length=self.max_linear_length_vc,
-                                        discretization_constant=self.discretization_constant,
-                                        min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
-                                        max_driving_hours=self.max_driving_hours,
-                                        config=alns_config,
-                                        evaluation_period=self.evaluation_period,
-                                        allowed_early_hours=self.allowed_early_hours,
-                                        allowed_late_hours=self.allowed_late_hours,
-                                        vendor_ids=[v],
-                                        depot_node_ids=self.depot_node_ids,
-                                        vendor_node_ids=[v],
-                                        vendor_depot_map=self.vendor_depot_map
+                                    print(
+                                        f"      ⚠️ Overlap detected between groups "
+                                        f"[{prev_start}..{prev_end}] and [{g_start}..{g_end}]; merging"
                                     )
-                                    single_solution = single_solver.solve(verbose=verbose)
-                                    if not getattr(single_solver, 'initial_feasible', False):
-                                        single_solution = LocalSearchOperators.improve_solution(single_solution, max_iterations=ls_iters)
-                                    for r in single_solution.routes:
+                                merged_groups[-1].extend(group)
+                                prev_start, prev_end = _group_interval(merged_groups[-1])
+
+                        return merged_groups
+
+                    def _route_depots(vendor_nodes):
+                        depot_deadlines = {}
+                        for v in vendor_nodes:
+                            depot_node = self.vendor_depot_map.get(v)
+                            if depot_node is None:
+                                continue
+                            row = _vendor_row(v)
+                            if row is None:
+                                continue
+                            for raw in [row.get('Requested Delivery', None), row.get('Requested Delivery Date', None)]:
+                                parsed = pd.to_datetime(raw, errors='coerce')
+                                if pd.notna(parsed):
+                                    delivery_time = parsed.to_pydatetime()
+                                    if depot_node not in depot_deadlines:
+                                        depot_deadlines[depot_node] = delivery_time
+                                    else:
+                                        depot_deadlines[depot_node] = min(depot_deadlines[depot_node], delivery_time)
+                                    break
+                        depots = list(depot_deadlines.keys())
+                        depots.sort(key=lambda d: depot_deadlines.get(d))
+                        return depots
+
+                    # Rebuild solution: keep good routes, split violated ones
+                    new_routes = []
+                    for route_idx, route in enumerate(solution.routes):
+                        if route_idx in violated_route_ids:
+                            vendors_in_route = [v for v in route if v in self.vendor_node_ids]
+                            grouped = _split_by_overlap(vendors_in_route)
+                            if not grouped and vendors_in_route:
+                                grouped = [[v] for v in vendors_in_route]
+                            for group in grouped:
+                                # Re-run ALNS on each overlap group
+                                group_solver = ALNSSolver(
+                                    vendors_df=self.vendors_df,
+                                    distance_matrix=self.distance_matrix,
+                                    time_matrix=self.time_distance_matrix,
+                                    capacity_matrix=self.capacity_matrix,
+                                    loading_matrix=self.loading_matrix,
+                                    service_time_matrix=self.service_time_matrix,
+                                    max_capacity_kg=self.max_capacity_kg,
+                                    max_volume=self.max_volume_vc,
+                                    max_linear_length=self.max_linear_length_vc,
+                                    discretization_constant=self.discretization_constant,
+                                    min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
+                                    max_driving_hours=self.max_driving_hours,
+                                    config=alns_config,
+                                    evaluation_period=self.evaluation_period,
+                                    allowed_early_hours=self.allowed_early_hours,
+                                    allowed_late_hours=self.allowed_late_hours,
+                                    vendor_ids=group,
+                                    depot_node_ids=self.depot_node_ids,
+                                    vendor_node_ids=group,
+                                    vendor_depot_map=self.vendor_depot_map
+                                )
+                                group_solution = group_solver.solve(verbose=verbose)
+                                if not getattr(group_solver, 'initial_feasible', False):
+                                    group_solution = LocalSearchOperators.improve_solution(group_solution, max_iterations=ls_iters)
+                                if group_solution.is_feasible(check_all=True):
+                                    for r in group_solution.routes:
                                         new_routes.append(list(r))
-                        if verbose:
-                            print(f'      → Split Route {route_idx}: {len(vendors_in_route)} vendors → {len(grouped)} routes')
-                    else:
-                        # Keep feasible route as is
-                        new_routes.append(route)
-                
-                solution = RouteSolution(
-                    routes=new_routes,
-                    vendors_df=self.vendors_df,
-                    distance_matrix=self.distance_matrix,
-                    time_matrix=self.time_distance_matrix,
-                    capacity_matrix=self.capacity_matrix,
-                    loading_matrix=self.loading_matrix,
-                    service_time_matrix=self.service_time_matrix,
-                    max_capacity_kg=self.max_capacity_kg,
-                    max_volume=self.max_volume_vc,
-                    max_linear_length=self.max_linear_length_vc,
-                    discretization_constant=self.discretization_constant,
-                    min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
-                    max_driving_hours=self.max_driving_hours,
-                    evaluation_period=self.evaluation_period,
-                    allowed_early_hours=self.allowed_early_hours,
-                    allowed_late_hours=self.allowed_late_hours,
-                    depot_node_ids=self.depot_node_ids,
-                    vendor_node_ids=self.vendor_node_ids,
-                    vendor_depot_map=self.vendor_depot_map
-                )
-                is_feasible = solution.is_feasible(check_all=True)
-                if is_feasible:
-                    status = 0
-                    print(f'   ✓ Fixed solution: {solution.get_num_routes()} routes (kept {len(solution.routes) - len(violated_route_ids) * 10} good routes)')
+                                else:
+                                    if verbose:
+                                        print(f'      ⚠️ Group infeasible, splitting into single-vendor routes')
+                                    for v in group:
+                                        single_solver = ALNSSolver(
+                                            vendors_df=self.vendors_df,
+                                            distance_matrix=self.distance_matrix,
+                                            time_matrix=self.time_distance_matrix,
+                                            capacity_matrix=self.capacity_matrix,
+                                            loading_matrix=self.loading_matrix,
+                                            service_time_matrix=self.service_time_matrix,
+                                            max_capacity_kg=self.max_capacity_kg,
+                                            max_volume=self.max_volume_vc,
+                                            max_linear_length=self.max_linear_length_vc,
+                                            discretization_constant=self.discretization_constant,
+                                            min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
+                                            max_driving_hours=self.max_driving_hours,
+                                            config=alns_config,
+                                            evaluation_period=self.evaluation_period,
+                                            allowed_early_hours=self.allowed_early_hours,
+                                            allowed_late_hours=self.allowed_late_hours,
+                                            vendor_ids=[v],
+                                            depot_node_ids=self.depot_node_ids,
+                                            vendor_node_ids=[v],
+                                            vendor_depot_map=self.vendor_depot_map
+                                        )
+                                        single_solution = single_solver.solve(verbose=verbose)
+                                        if not getattr(single_solver, 'initial_feasible', False):
+                                            single_solution = LocalSearchOperators.improve_solution(single_solution, max_iterations=ls_iters)
+                                        for r in single_solution.routes:
+                                            new_routes.append(list(r))
+                            if verbose:
+                                print(f'      → Split Route {route_idx}: {len(vendors_in_route)} vendors → {len(grouped)} routes')
+                        else:
+                            # Keep feasible route as is
+                            new_routes.append(route)
+
+                    solution = RouteSolution(
+                        routes=new_routes,
+                        vendors_df=self.vendors_df,
+                        distance_matrix=self.distance_matrix,
+                        time_matrix=self.time_distance_matrix,
+                        capacity_matrix=self.capacity_matrix,
+                        loading_matrix=self.loading_matrix,
+                        service_time_matrix=self.service_time_matrix,
+                        max_capacity_kg=self.max_capacity_kg,
+                        max_volume=self.max_volume_vc,
+                        max_linear_length=self.max_linear_length_vc,
+                        discretization_constant=self.discretization_constant,
+                        min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
+                        max_driving_hours=self.max_driving_hours,
+                        evaluation_period=self.evaluation_period,
+                        allowed_early_hours=self.allowed_early_hours,
+                        allowed_late_hours=self.allowed_late_hours,
+                        depot_node_ids=self.depot_node_ids,
+                        vendor_node_ids=self.vendor_node_ids,
+                        vendor_depot_map=self.vendor_depot_map
+                    )
                 else:
-                    status = 2
-                    print(f'   ✗ Still infeasible after fix!')
+                    if verbose:
+                        print('   ⚠️ Splitting disabled; returning infeasible solution as-is')
+
+                is_feasible = solution.is_feasible(check_all=True)
+                if alns_config.get('enable_split', False):
+                    if is_feasible:
+                        status = 0
+                        print(f'   ✓ Fixed solution: {solution.get_num_routes()} routes')
+                    else:
+                        status = 2
+                        print(f'   ✗ Still infeasible after fix!')
+                else:
+                    status = 0 if is_feasible else 2
                 self.last_constraint_violations = list(solution._constraint_violations)
         
         # Convert route solution to MIP-style x and y matrices for compatibility
@@ -1548,11 +1578,39 @@ class DeliveryOptimizer:
                 route_path = routes.get(k, [])
                 if route_path and route_path[0] != 0:
                     route_path = [0] + route_path
+                # Remove dummy start node if it appears mid-route
+                if route_path:
+                    route_path = [
+                        n for idx, n in enumerate(route_path)
+                        if not (n == 0 and idx > 0)
+                    ]
                 # Display routes should start at first vendor (no depot start)
                 display_path = route_path[1:] if route_path and route_path[0] == 0 else route_path
                 routes[k] = display_path
                 log.info(f"📊 DEBUG: route_path for vehicle {k} = {route_path}")
                 log.info(f"📊 DEBUG: display_path for vehicle {k} = {display_path}")
+                # Enhanced depot visit logging (detect repeats and mid-route depot/start usage)
+                try:
+                    depot_nodes_set = set(self.depot_node_ids or [])
+                    depot_visits = [n for n in route_path if n in depot_nodes_set]
+                    depot_names = [node_info.get(n, {}).get('name', f'Depot {n}') for n in depot_visits]
+                    if depot_visits:
+                        counts = {}
+                        for n in depot_visits:
+                            counts[n] = counts.get(n, 0) + 1
+                        repeated = {n: c for n, c in counts.items() if c > 1}
+                        if repeated:
+                            repeated_names = ", ".join(
+                                f"{node_info.get(n, {}).get('name', f'Depot {n}')} x{c}"
+                                for n, c in repeated.items()
+                            )
+                            log.warning(f"⚠️  Route {k}: depot visited multiple times: {repeated_names}")
+                        log.info(f"📦 Route {k}: depot visits in order: {depot_names}")
+                    # Dummy start node should only be at route start
+                    if len(route_path) > 1 and 0 in route_path[1:]:
+                        log.warning(f"⚠️  Route {k}: dummy start node appears mid-route: {route_path}")
+                except Exception as _:
+                    pass
                 route_path = display_path
             elif is_metaheuristic:
                 # For metaheuristic: iterate through all node pairs at time 0

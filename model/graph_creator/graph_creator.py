@@ -258,9 +258,11 @@ class Graph:
             vendors_df.loc[:, 'depot_id'] = vendor_depot_ids
             vendors_df.loc[:, 'depot_node_id'] = vendors_df['depot_id']
 
-        # Assign node_id for vendors after depot nodes
+        # Assign node_id for vendors after dummy + depot nodes
+        # Reset index to keep node IDs within matrix bounds
+        vendors_df = vendors_df.reset_index(drop=True)
         depot_count = len(depots_df)
-        vendors_df.loc[:, 'node_id'] = vendors_df.index + depot_count
+        vendors_df.loc[:, 'node_id'] = vendors_df.index + depot_count + 1
 
         # Consolidation: [dummy_start] + depots + vendors
         depots_coords = []

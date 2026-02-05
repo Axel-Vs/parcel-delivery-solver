@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import random
 import copy
+import itertools
 from datetime import datetime, timedelta
 from .route_solution import RouteSolution
 
@@ -76,6 +77,11 @@ class ALNSSolver:
         
         # ALNS parameters
         self.config = config or {}
+        self.merge_debug = bool(self.config.get('merge_debug', False))
+        self.depot_debug = bool(self.config.get('depot_debug', False) or self.merge_debug)
+        self.depot_debug_verbose = bool(self.config.get('depot_debug_verbose', False))
+        self._depot_debug_seen = set()
+        self.enable_merge = bool(self.config.get('enable_merge', False))
         self.max_iterations = self.config.get('max_iterations', 1000)
         self.min_removal_size = self.config.get('min_removal_size', 0.1)  # 10% of vendors
         self.max_removal_size = self.config.get('max_removal_size', 0.4)  # 40% of vendors
@@ -192,8 +198,8 @@ class ALNSSolver:
             # Cool down temperature
             temperature *= self.cooling_rate
             
-            # Periodically try to merge routes
-            if iteration % 250 == 0 and iteration > 0:
+            # Periodically try to merge routes (optional)
+            if self.enable_merge and iteration % 250 == 0 and iteration > 0:
                 merged = self.try_merge_routes(best)
                 if merged.evaluate() < best.evaluate() and merged.is_feasible(check_all=False):
                     best = merged
@@ -203,16 +209,18 @@ class ALNSSolver:
             if no_improvement_count > self.no_improvement_limit:
                 break
         
-        # Final route merging attempt
+        # Final route merging attempt (optional)
         if verbose:
             print(f'   - Final solution: {best.get_num_routes()} routes, {best.evaluate():.0f} km')
-            print(f'   - Attempting route merging...')
         
-        merged = self.try_merge_routes(best)
-        if merged.evaluate() <= best.evaluate() and merged.is_feasible(check_all=False):
-            best = merged
+        if self.enable_merge:
             if verbose:
-                print(f'   - After merging: {best.get_num_routes()} routes, {best.evaluate():.0f} km')
+                print(f'   - Attempting route merging...')
+            merged = self.try_merge_routes(best)
+            if merged.evaluate() <= best.evaluate() and merged.is_feasible(check_all=False):
+                best = merged
+                if verbose:
+                    print(f'   - After merging: {best.get_num_routes()} routes, {best.evaluate():.0f} km')
         
         # Final feasibility check
         best_feasible = best.is_feasible(check_all=True)  # Get ALL violations
@@ -383,6 +391,12 @@ class ALNSSolver:
 
     def _get_route_depots(self, vendor_nodes):
         depot_deadlines = {}
+        debug_key = None
+        if self.depot_debug and self.depot_debug_verbose:
+            debug_key = tuple(sorted(int(v) for v in vendor_nodes))
+            if debug_key not in self._depot_debug_seen:
+                self._depot_debug_seen.add(debug_key)
+                print(f"🧭 Depot order debug: vendors={list(vendor_nodes)}")
         for v in vendor_nodes:
             depot_node = self.vendor_depot_map.get(v)
             if depot_node is None:
@@ -390,13 +404,115 @@ class ALNSSolver:
             delivery_time = self._get_vendor_delivery_time(v)
             if delivery_time is None:
                 continue
+            if self.depot_debug and self.depot_debug_verbose and debug_key in self._depot_debug_seen:
+                vendor_row = self._vendor_row_by_node.get(v)
+                vendor_name = None
+                if vendor_row is not None:
+                    vendor_name = str(vendor_row.get('vendor Name', vendor_row.get('Vendor Name', f'Vendor {v}'))).strip()
+                vendor_label = vendor_name or f"Vendor {v}"
+                print(f"   - {vendor_label} ({v}) -> depot {depot_node}, delivery={delivery_time}")
             if depot_node not in depot_deadlines:
                 depot_deadlines[depot_node] = delivery_time
             else:
                 depot_deadlines[depot_node] = min(depot_deadlines[depot_node], delivery_time)
         depots = list(depot_deadlines.keys())
         depots.sort(key=lambda d: depot_deadlines.get(d))
-        return depots
+        if self.depot_debug and self.depot_debug_verbose and debug_key in self._depot_debug_seen:
+            deadline_summary = ", ".join(
+                f"{d}:{depot_deadlines.get(d)}" for d in depots
+            )
+            print(f"   -> depot deadlines (min): {deadline_summary}")
+
+        if len(depots) <= 1:
+            return depots
+
+        # Heuristic: start with deadline order, then try limited swaps
+        def _order_feasibility(order):
+            test_route = [0] + list(vendor_nodes) + list(order)
+            temp_solution = RouteSolution(
+                routes=[test_route],
+                vendors_df=self.vendors_df,
+                distance_matrix=self.distance_matrix,
+                time_matrix=self.time_matrix,
+                capacity_matrix=self.capacity_matrix,
+                loading_matrix=self.loading_matrix,
+                service_time_matrix=self.service_time_matrix,
+                max_capacity_kg=self.max_capacity_kg,
+                max_volume=self.max_volume_vc,
+                max_linear_length=self.max_linear_length_vc,
+                discretization_constant=self.discretization_constant,
+                min_date=self.min_date,
+                max_driving_hours=self.max_driving_hours,
+                evaluation_period=self.evaluation_period,
+                allowed_early_hours=self.allowed_early_hours,
+                allowed_late_hours=self.allowed_late_hours,
+                depot_node_ids=list(self.depot_node_ids),
+                vendor_node_ids=list(vendor_nodes),
+                vendor_depot_map=self.vendor_depot_map
+            )
+            feasible = temp_solution.is_feasible(check_all=True)
+            return feasible, list(temp_solution._constraint_violations)
+
+        base_order = depots
+        candidates = []
+        # Deadline order and its reverse
+        candidates.append(list(base_order))
+        candidates.append(list(reversed(base_order)))
+
+        # Try a small set of adjacent swaps
+        max_swaps = min(6, len(base_order) - 1)
+        for i in range(max_swaps):
+            swapped = list(base_order)
+            swapped[i], swapped[i + 1] = swapped[i + 1], swapped[i]
+            candidates.append(swapped)
+
+        # Deduplicate candidates while preserving order
+        seen = set()
+        unique_candidates = []
+        for cand in candidates:
+            key = tuple(cand)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_candidates.append(cand)
+
+        best_order = None
+        best_distance = None
+        rejection_counts = {}
+        for cand in unique_candidates:
+            feasible, violations = _order_feasibility(cand)
+            if not feasible:
+                if self.depot_debug:
+                    reason = violations[0] if violations else "infeasible (no details)"
+                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                continue
+            test_route = [0] + list(vendor_nodes) + list(cand)
+            route_distance = self._route_distance(test_route)
+            if best_distance is None or route_distance < best_distance:
+                best_distance = route_distance
+                best_order = list(cand)
+
+        if best_order is not None:
+            if self.depot_debug and self.depot_debug_verbose and debug_key in self._depot_debug_seen:
+                if rejection_counts:
+                    top_reasons = sorted(rejection_counts.items(), key=lambda x: -x[1])[:3]
+                    reason_summary = "; ".join(
+                        f"{count}x {reason}" for reason, count in top_reasons
+                    )
+                    print(f"   -> depot order rejections: {reason_summary}")
+                print(f"   -> depot order chosen (distance): {best_order} (km={best_distance:.1f})")
+            return best_order
+
+        # If still infeasible, keep deadline order (fast fallback)
+        if self.depot_debug and self.depot_debug_verbose and debug_key in self._depot_debug_seen:
+            if rejection_counts:
+                top_reasons = sorted(rejection_counts.items(), key=lambda x: -x[1])[:3]
+                reason_summary = "; ".join(
+                    f"{count}x {reason}" for reason, count in top_reasons
+                )
+                print(f"   -> depot order rejections: {reason_summary}")
+            print(f"   -> depot order fallback (deadline): {base_order}")
+        return base_order
 
     def _route_vendors(self, route):
         return [n for n in route if self._is_vendor(n)]
@@ -440,6 +556,36 @@ class ALNSSolver:
             vendor_depot_map=self.vendor_depot_map
         )
         return temp_solution.is_feasible(check_all=False)
+
+    def _get_route_violations(self, vendor_nodes):
+        if not vendor_nodes:
+            return ['empty vendor set']
+        route = self._build_route_with_depots(list(vendor_nodes))
+        if not route:
+            return ['empty route']
+        temp_solution = RouteSolution(
+            routes=[route],
+            vendors_df=self.vendors_df,
+            distance_matrix=self.distance_matrix,
+            time_matrix=self.time_matrix,
+            capacity_matrix=self.capacity_matrix,
+            loading_matrix=self.loading_matrix,
+            service_time_matrix=self.service_time_matrix,
+            max_capacity_kg=self.max_capacity_kg,
+            max_volume=self.max_volume_vc,
+            max_linear_length=self.max_linear_length_vc,
+            discretization_constant=self.discretization_constant,
+            min_date=self.min_date,
+            max_driving_hours=self.max_driving_hours,
+            evaluation_period=self.evaluation_period,
+            allowed_early_hours=self.allowed_early_hours,
+            allowed_late_hours=self.allowed_late_hours,
+            depot_node_ids=list(self.depot_node_ids),
+            vendor_node_ids=list(vendor_nodes),
+            vendor_depot_map=self.vendor_depot_map
+        )
+        temp_solution.is_feasible(check_all=False)
+        return list(temp_solution._constraint_violations)
 
     def _to_naive(self, dt_value):
         if dt_value is None:
@@ -922,6 +1068,8 @@ class ALNSSolver:
                     route_i_bucket = self._get_route_time_bucket(route_i)
                     route_j_bucket = self._get_route_time_bucket(route_j)
                     if route_i_bucket is not None and route_j_bucket is not None and route_i_bucket != route_j_bucket:
+                        if self.merge_debug:
+                            print(f'   - Merge rejected (time bucket mismatch): {route_i_bucket} vs {route_j_bucket}')
                         continue
                     
                     # Get vendors from both routes (exclude depot)
@@ -937,31 +1085,45 @@ class ALNSSolver:
                     if self.max_driving_hours is not None:
                         span_hours = self._get_route_time_span_hours(test_route)
                         if span_hours > self.max_driving_hours:
+                            if self.merge_debug:
+                                print(f'   - Merge rejected (time span {span_hours:.1f}h > max {self.max_driving_hours}h)')
                             continue
-                    
+
                     # Check capacity constraints
                     total_weight = sum(self.capacity_matrix[v] for v in combined_vendors)
                     total_volume = sum(self.loading_matrix[v] for v in combined_vendors)
                     max_weight = max(self.max_capacity_kg) if self.max_capacity_kg else float('inf')
                     max_volume = max(self.max_ldms_vc) if self.max_ldms_vc else float('inf')
-                    
+
                     if total_weight > max_weight or total_volume > max_volume:
+                        if self.merge_debug:
+                            print(f'   - Merge rejected (capacity): {total_weight:.0f}kg/{max_weight:.0f}kg, {total_volume:.2f}m³/{max_volume:.2f}m³')
                         continue
-                    
+
                     # Check max_driving constraint
                     if self.max_driving_hours is not None:
                         route_travel_seconds = 0
                         for k in range(0, len(test_route) - 1):
                             route_travel_seconds += self.time_matrix[test_route[k]][test_route[k + 1]]
-                        
+
                         route_travel_hours = route_travel_seconds / 3600.0
                         num_stops = len(combined_vendors)
                         service_time_per_stop = self.service_time_matrix[1] / 60.0 if len(self.service_time_matrix) > 1 else 0
                         route_service_hours = num_stops * service_time_per_stop
                         total_time = route_travel_hours + route_service_hours
-                        
+
                         if total_time > self.max_driving_hours:
+                            if self.merge_debug:
+                                print(f'   - Merge rejected (max driving): {total_time:.1f}h > {self.max_driving_hours}h')
                             continue
+
+                    # Check route feasibility with time windows/depot rules
+                    if not self._is_route_feasible(combined_vendors):
+                        if self.merge_debug:
+                            violations = self._get_route_violations(combined_vendors)
+                            preview = '; '.join(violations[:3]) if violations else 'no details'
+                            print(f'   - Merge rejected (route infeasible): {preview}')
+                        continue
                     
                     # Merge is feasible! Replace routes
                     new_routes = []

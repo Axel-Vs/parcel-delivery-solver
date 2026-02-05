@@ -1137,7 +1137,7 @@
 
                         <div class="param-group">
                             <label class="param-label">Max Driving <span style="color: #9A9892;">Hours</span><span class="tooltip">ⓘ<span class="tooltiptext">Maximum driving time per vehicle (travel + service)</span></span></label>
-                            <input type="number" class="param-input" id="maxDriving" value="67" min="1">
+                            <input type="number" class="param-input" id="maxDriving" value="70" min="1">
                         </div>
 
 
@@ -1549,8 +1549,9 @@
                     
                     if (data.calculated_max_driving) {
                         const maxDrivingInput = document.getElementById('maxDriving');
-                        maxDrivingInput.value = data.calculated_max_driving;
-                        paramUpdates.push(`max driving: ${data.calculated_max_driving}h`);
+                        const maxDrivingValue = Math.max(70, data.calculated_max_driving);
+                        maxDrivingInput.value = maxDrivingValue;
+                        paramUpdates.push(`max driving: ${maxDrivingValue}h`);
                     }
                     
                     if (data.calculated_max_weight) {
@@ -1970,10 +1971,10 @@
 
             // Check max_driving threshold
             const maxDrivingValue = parseInt(document.getElementById('maxDriving').value);
-            if (maxDrivingValue < 69) {
+            if (maxDrivingValue < 70) {
                 // Show warning popup and update values
                 document.getElementById('travelTimeValue').textContent = Math.max(65, maxDrivingValue - 4);
-                document.getElementById('minDrivingValue').textContent = '69 hours';
+                document.getElementById('minDrivingValue').textContent = '70 hours';
                 showMaxDrivingInfo();
                 return;  // Don't proceed with optimization
             }
@@ -2065,11 +2066,18 @@
                         </div>
                     </div>
                 `;
-                document.getElementById('statsGrid').innerHTML = '';
-                document.getElementById('routeSummary').innerHTML = '';
-                const mapFrame = document.getElementById('mapFrame');
-                mapFrame.removeAttribute('src');
-                return;
+                const hasRoutes = Array.isArray(data.routes) && data.routes.length > 0;
+                if (!hasRoutes) {
+                    document.getElementById('statsGrid').innerHTML = '';
+                    document.getElementById('routeSummary').innerHTML = '';
+                    const mapFrame = document.getElementById('mapFrame');
+                    if (data.map_url) {
+                        mapFrame.src = data.map_url;
+                    } else {
+                        mapFrame.removeAttribute('src');
+                    }
+                    return;
+                }
             }
             
             // Store current solution
@@ -2468,7 +2476,7 @@
                         </div>
                         <div style="display: flex; justify-content: space-between;">
                             <span>Driving hours:</span>
-                            <span><strong>${getUtilizationIndicator(route.time_utilization || 0)} ${(route.time_utilization || 0).toFixed(1)}%</strong> (${formatHours(route.total_time_hours)} / ${formatHours(route.max_driving_hours || 69)})</span>
+                            <span><strong>${getUtilizationIndicator(route.time_utilization || 0)} ${(route.time_utilization || 0).toFixed(1)}%</strong> (${formatHours(route.total_time_hours)} / ${formatHours(route.max_driving_hours || 70)})</span>
                         </div>
                         <div style="display: flex; justify-content: space-between; padding-top: 4px; border-top: 1px solid rgba(0,0,0,0.1);">
                             <span>Stops:</span>

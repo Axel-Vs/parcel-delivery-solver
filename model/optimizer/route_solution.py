@@ -222,9 +222,7 @@ class RouteSolution:
             route_travel_time_hours = route_travel_time_seconds / 3600.0
             
             # Debug: Check if time values seem reasonable
-            if route_idx == 0 and route_travel_time_hours > 100 and not self._warned_long_travel:
-                print(f"⚠️  WARNING: Route 0 travel time suspiciously high: {route_travel_time_hours:.2f}h ({route_travel_time_seconds:.0f}s)")
-                print(f"   Sample time values from matrix (excluding depot->first): {[self.time_matrix[route[i]][route[i+1]] for i in range(1, min(3, len(route)-1))]}")
+            if route_idx == 0 and route_travel_time_hours > 100:
                 self._warned_long_travel = True
             
             # Add service time: loading at vendors + unloading at depots
@@ -307,9 +305,20 @@ class RouteSolution:
                 vendor_row = _vendor_row(node_id)
                 if vendor_row is None:
                     return None
+
+                def _get_row_value(row, key_name):
+                    if key_name in row:
+                        return row.get(key_name, None)
+                    # Fallback: case/space-insensitive match on column names
+                    target = str(key_name).strip().lower()
+                    for col in row.index:
+                        if str(col).strip().lower() == target:
+                            return row.get(col, None)
+                    return None
+
                 for raw in [
-                    vendor_row.get('Requested Loading', None),
-                    vendor_row.get('Requested Loading Date', None),
+                    _get_row_value(vendor_row, 'Requested Loading'),
+                    _get_row_value(vendor_row, 'Requested Loading Date'),
                 ]:
                     parsed = pd.to_datetime(raw, errors='coerce')
                     if pd.notna(parsed):
@@ -365,6 +374,9 @@ class RouteSolution:
                         return False
 
                 route_vendor_nodes = [n for n in route if self._is_vendor(n)]
+                if not route_vendor_nodes:
+                    # No vendors in this route; skip vendor window checks
+                    continue
                 picked_vendors = []
                 depot_deliveries = {}
                 for node in route:
@@ -532,8 +544,37 @@ class RouteSolution:
                 else:
                     current_time = start_min if start_min is not None else _vendor_requested_loading(route_vendor_nodes[0]) if route_vendor_nodes else None
                 if current_time is None or not found_vendor_window:
+                    if not found_vendor_window and route_vendor_nodes:
+                        debug_details = []
+                        for v in route_vendor_nodes:
+                            row = _vendor_row(v)
+                            if row is None:
+                                debug_details.append(f"{self._vendor_name(v)}: row=None")
+                                continue
+                            cols_preview = [str(c) for c in list(row.index)[:8]]
+                            raw_loading = row.get('Requested Loading', None)
+                            raw_loading_date = row.get('Requested Loading Date', None)
+                            if raw_loading is None:
+                                # Case/space-insensitive fallback
+                                for col in row.index:
+                                    if str(col).strip().lower() == 'requested loading':
+                                        raw_loading = row.get(col, None)
+                                    if str(col).strip().lower() == 'requested loading date':
+                                        raw_loading_date = row.get(col, None)
+                            debug_details.append(
+                                f"{self._vendor_name(v)}: Requested Loading={raw_loading} "
+                                f"Requested Loading Date={raw_loading_date} cols={cols_preview}"
+                            )
+                        detail_text = " | ".join(debug_details)
+                    else:
+                        route_nodes = [str(n) for n in route]
+                        sample_vendors = sorted(list(self.vendor_node_ids))[:10]
+                        detail_text = (
+                            "no vendor windows found; "
+                            f"route_nodes={route_nodes} vendor_nodes_sample={sample_vendors}"
+                        )
                     self._constraint_violations.append(
-                        f"Route {route_idx}: missing vendor window for start time"
+                        f"Route {route_idx}: missing vendor window for start time ({detail_text})"
                     )
                     if not check_all:
                         return False

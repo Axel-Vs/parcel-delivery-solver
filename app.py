@@ -190,6 +190,7 @@ def upload_csv():
         
         # Calculate dynamic parameters based on data
         calculated_max_driving = None
+        min_default_max_driving = 70.0
         calculated_max_weight = None
         calculated_max_volume = None
         calculated_max_linear_length = None
@@ -226,6 +227,7 @@ def upload_csv():
                 # Calculate minimum max_driving needed for trivial solution:
                 # = one-way travel to farthest vendor + service_time + buffer
                 calculated_max_driving = estimated_max_travel + service_time_per_stop + 2.0
+                calculated_max_driving = max(calculated_max_driving, min_default_max_driving)
                 print(f"✅ Estimated min max_driving: {calculated_max_driving:.1f}h for {vendor_count} vendors (trivial solution: travel {estimated_max_travel:.1f}h + service {service_time_per_stop:.1f}h + 2h buffer)")
                 
                 # Calculate max_weight based on heaviest vendor (with 20% safety margin)
@@ -619,7 +621,7 @@ def optimize_routes():
             'loading': params.get('loading', 2),
             'earl_arv': params.get('earl_arv', 24),
             'late_arv': params.get('late_arv', 24),
-            'max_driving': 50,  # Placeholder - will be recalculated dynamically
+            'max_driving': 70,  # Default - may be recalculated dynamically
             'max_weight': params.get('max_weight', 30),
             'max_volume': params.get('max_volume', 90),
             'max_linear_length': params.get('max_linear_length', 16.1),
@@ -746,6 +748,7 @@ def optimize_routes():
         # Calculate dynamic max_driving based on actual travel times
         # Always calculate, then decide whether to use it
         calculated_max_driving = None
+        min_default_max_driving = 70.0
         if net.time_distance_matrix is not None and len(net.time_distance_matrix) > 1:
             # Get max time from any vendor to its delivery depot (node indices in matrix)
             vendor_to_depot_times = []
@@ -763,9 +766,12 @@ def optimize_routes():
                 # Estimate multi-stop route requirement to avoid over-splitting
                 vendor_count = len(vendor_node_ids)
                 vendor_to_vendor_times = []
+                matrix_len = len(net.time_distance_matrix)
                 for i in vendor_node_ids:
+                    if i >= matrix_len:
+                        continue
                     for j in vendor_node_ids:
-                        if i != j:
+                        if i != j and j < matrix_len:
                             vendor_to_vendor_times.append(net.time_distance_matrix[i][j])
                 max_vendor_to_vendor_hours = (max(vendor_to_vendor_times) / 3600.0) if vendor_to_vendor_times else 0.0
 
@@ -784,8 +790,9 @@ def optimize_routes():
                     max_vendor_depot_time_hours + service_time_hours + 2.0,
                     estimated_multi_stop
                 )
+                calculated_max_driving = max(calculated_max_driving, min_default_max_driving)
                 
-                # Use calculated value (user can still override by changing the form from default 67)
+                # Use calculated value (user can still override by changing the form from default 70)
                 user_max_driving = params.get('max_driving', None)
                 
                 # If user-provided max_driving is too low, auto-raise to minimum
@@ -796,7 +803,7 @@ def optimize_routes():
                     )
                     user_max_driving = calculated_max_driving
                 
-                if user_max_driving is None or user_max_driving == 67:  # 67 is the new UI default
+                if user_max_driving is None or user_max_driving == 70:  # 70 is the UI default
                     network_params['max_driving'] = calculated_max_driving
                     print(f"✅ Max driving time set: {calculated_max_driving:.1f}h (farthest vendor: {max_vendor_depot_time_hours:.1f}h travel + {service_time_hours:.1f}h service + 2h buffer)")
                 else:
@@ -939,44 +946,29 @@ def optimize_routes():
         
         solving_time = (datetime.now() - start_time).total_seconds()
         
-        # Check if solution was found
-        if status not in (0, 1):
-            violations = []
-            violation_count = 0
+        # Check if solution was found (collect warnings but continue for summaries/maps)
+        infeasible_status = status not in (0, 1)
+        violations = []
+        violation_count = 0
+        vendor_depot_violations = []
+        warning_text = None
+        osrm_failures = getattr(optimizer, 'osrm_failures', None)
+        if infeasible_status:
             if hasattr(optimizer, 'last_constraint_violations'):
                 violations = optimizer.last_constraint_violations or []
                 violation_count = len(violations)
-            osrm_failures = getattr(optimizer, 'osrm_failures', None)
             warning_text = f'Infeasible solution (status {status})'
             if violations:
-                warning_text = f'{warning_text}: {violations[0]}'
-            # Try to generate a map even for infeasible solutions
-            map_path = None
-            try:
-                map_filename = f'routes_{datetime.now().strftime("%Y%m%d_%H%M%S")}.html'
-                map_path = os.path.join('results/optimization', map_filename)
-                os.makedirs('results/optimization', exist_ok=True)
-                logging.info(f'🗺️  Starting map generation (infeasible) at {map_path}...')
-                optimizer.plot_routes(x, y, show_plot=False, save_path=map_path)
-                APP_STATE['map_path'] = map_path
-                logging.info(f'✅ Map generated (infeasible) at {map_path}')
-            except Exception as e:
-                logging.error(f'❌ Error during plot_routes (infeasible): {e}', exc_info=True)
-            return jsonify({
-                'success': False,
-                'status': status,
-                'warning': warning_text,
-                'constraint_violation_count': violation_count,
-                'constraint_violations': violations[:50],
-                'preprocessing_warnings': preprocessing_warnings,
-                'time_groups': time_groups if 'time_groups' in locals() else [],
-                'osrm_failures': osrm_failures[:50] if osrm_failures else [],
-                'map_path': map_path
-            }), 200
+                vendor_depot_violations = [
+                    v for v in violations
+                    if 'vendor' in str(v).lower() or 'depot' in str(v).lower()
+                ]
+                primary_violation = vendor_depot_violations[0] if vendor_depot_violations else violations[0]
+                warning_text = f'{warning_text}: {primary_violation}'
         if status == 1:
             logging.info('⚠️ Optimization returned feasible (status=1); proceeding with best found solution')
         
-        # Generate map
+        # Generate map (even if infeasible, to render route breakdowns)
         map_filename = f'routes_{datetime.now().strftime("%Y%m%d_%H%M%S")}.html'
         map_path = os.path.join('results/optimization', map_filename)
         os.makedirs('results/optimization', exist_ok=True)
@@ -1068,9 +1060,22 @@ def optimize_routes():
                 depot_country_map[node_id] = country
                 depot_name_map[node_id] = f"Depot, {city}, {country}"
         
+        name_counts = {}
+        for _, row in vendors_df.iterrows():
+            base_name = str(row.get('vendor Name', row.get('Vendor Name', ''))).strip()
+            if base_name:
+                name_counts[base_name] = name_counts.get(base_name, 0) + 1
+
         for idx, row in vendors_df.iterrows():
             vendor_id = int(row.get('node_id', idx))
-            vendor_name_map[vendor_id] = str(row.get('vendor Name', row.get('Vendor Name', f'Vendor {vendor_id}'))).strip()
+            vendor_name = str(row.get('vendor Name', row.get('Vendor Name', f'Vendor {vendor_id}'))).strip()
+            if vendor_name and name_counts.get(vendor_name, 0) > 1:
+                raw_load = row.get('Requested Loading', row.get('Requested Loading Date', None))
+                parsed_load = pd.to_datetime(raw_load, errors='coerce')
+                if pd.notna(parsed_load):
+                    load_label = parsed_load.to_pydatetime().strftime('%Y-%m-%d %H:%M')
+                    vendor_name = f"{vendor_name} (load {load_label})"
+            vendor_name_map[vendor_id] = vendor_name
             
             # Extract city information
             city = str(row.get('Vendor City', 'Unknown')).strip() if pd.notna(row.get('Vendor City')) else 'Unknown'
@@ -1376,7 +1381,7 @@ def optimize_routes():
             max_weight_kg = float(network_params.get('max_weight', 5000)) * 1000.0  # Convert tons to kg
             max_volume_m3 = float(network_params.get('max_volume', 90))
             max_linear_length_m = float(network_params.get('max_linear_length', 16.1))
-            max_driving_hours = float(network_params.get('max_driving', 69))
+            max_driving_hours = float(network_params.get('max_driving', 70))
             
             weight_utilization = (stats['total_cargo'] / max_weight_kg * 100.0) if max_weight_kg > 0 else 0.0
             volume_utilization = (stats['total_loading'] / max_volume_m3 * 100.0) if max_volume_m3 > 0 else 0.0
@@ -1426,7 +1431,14 @@ def optimize_routes():
             use_df_index = index_min == 1 and index_max == len(vendors_df)
             for idx, row in vendors_df.iterrows():
                 vendor_id = int(idx) if use_df_index else int(idx) + 1
-                vendor_name_map[vendor_id] = str(row.get('vendor Name', row.get('Vendor Name', f'Vendor {vendor_id}')))
+                vendor_name = str(row.get('vendor Name', row.get('Vendor Name', f'Vendor {vendor_id}'))).strip()
+                if vendor_name and name_counts.get(vendor_name, 0) > 1:
+                    raw_load = row.get('Requested Loading', row.get('Requested Loading Date', None))
+                    parsed_load = pd.to_datetime(raw_load, errors='coerce')
+                    if pd.notna(parsed_load):
+                        load_label = parsed_load.to_pydatetime().strftime('%Y-%m-%d %H:%M')
+                        vendor_name = f"{vendor_name} (load {load_label})"
+                vendor_name_map[vendor_id] = vendor_name
 
                 raw_date = row.get('Requested Delivery', row.get('Requested Delivery Date', ''))
                 parsed_date = pd.to_datetime(raw_date, errors='coerce')
@@ -1631,7 +1643,15 @@ def optimize_routes():
             final_total_cargo = final_total_cargo / 1000.0
         
         return jsonify({
-            'success': True,
+            'success': not infeasible_status,
+            'status': status,
+            'warning': warning_text,
+            'constraint_violation_count': violation_count,
+            'constraint_violations': violations[:50],
+            'vendor_depot_violations': vendor_depot_violations[:50],
+            'preprocessing_warnings': preprocessing_warnings,
+            'time_groups': time_groups if 'time_groups' in locals() else [],
+            'osrm_failures': osrm_failures[:50] if osrm_failures else [],
             'map_url': f'/results/optimization/{map_filename}',
             'statistics': {
                 'total_distance': float(round(total_distance, 1)),
