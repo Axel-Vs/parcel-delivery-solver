@@ -2,6 +2,9 @@
 
 This guide explains the end‑to‑end flow in order, focusing on what happens and why, without low‑level details.
 
+## Overall Summary
+We solve a **multi‑depot pickup‑and‑delivery problem with time windows (MD‑PDPTW)**. Given vendor pickups, depot deliveries, time windows, and vehicle capacity limits, the system builds feasible routes that respect pickup‑before‑delivery, service times, and max‑driving constraints. The output includes optimized routes, a map visualization, and route summaries (distance, time, cargo, volume, and utilization) for fast operational use.
+
 ## 1) Input & Upload
 - User uploads a CSV in the web UI.
 - Server stores the file and returns basic vendor metadata for the UI list.
