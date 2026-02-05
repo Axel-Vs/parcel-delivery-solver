@@ -157,7 +157,7 @@ python app.py
    - **Depot Hours**: Start (8) and Close (18) times
    - **Vendor Hours**: Start (6) and Pickup End (14) times
    - **Time Windows**: Early Arrival (24h) and Late Arrival (24h) penalties
-   - **Loading & Driving**: Loading Time (2h), Max Driving (15h), Driving Start/Stop (6-21)
+  - **Loading & Driving**: Loading Time (2h), Max Driving (70h), Driving Start/Stop (6-21)
    - **Vehicle Capacity**: Max Weight (30 kg), Max Loading Meters (70 m³)
 
 5. **Run optimization**
@@ -259,7 +259,7 @@ The web interface provides 12 configurable network parameters in an elegant 2-co
 | **Early Arrival** | Early arrival penalty window | 24 | Hours |
 | **Late Arrival** | Late arrival penalty window | 24 | Hours |
 | **Loading Time** | Time required for loading | 2 | Hours |
-| **Max Driving** | Maximum driving hours per vehicle | 15 | Hours |
+| **Max Driving** | Maximum driving hours per vehicle | 70 | Hours |
 | **Driving Start** | Earliest driving start time | 6 | Hour |
 | **Driving Stop** | Latest driving end time | 21 | Hour |
 | **Max Weight** | Maximum vehicle cargo weight | 30 | kg |
@@ -287,7 +287,7 @@ pickup_end_hr = 14               # Latest pickup time
 earl_arv = 24                    # Early arrival penalty window
 late_arv = 24                    # Late arrival penalty window
 loading = 2                      # Loading time in hours
-max_driving = 15                 # Maximum driving hours
+max_driving = 70                 # Maximum driving hours
 driving_starts = 6               # Earliest driving start
 driving_stop = 21                # Latest driving end
 max_weight = 30                  # Maximum cargo weight (kg)
