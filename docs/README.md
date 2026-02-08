@@ -99,18 +99,6 @@ Comprehensive route details with 14 columns per stop:
 - Distance/time matrix calculation via OSRM
 - Time discretization for optimization
 
-## � Documentation Guide
-
-**New users?** Start here in this order:
-1. **[GETTING_STARTED.md](GETTING_STARTED.md)** ← Begin here! (5-minute quick start)
-2. **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** ← Handy cheat sheet
-3. **[README.md](README.md)** (this file) ← Features and installation
-4. **[ARCHITECTURE.md](ARCHITECTURE.md)** ← How the algorithm works (deep dive)
-5. **[FEATURES.md](FEATURES.md)** ← Detailed feature descriptions
-6. **[DEPLOYMENT.md](DEPLOYMENT.md)** ← Production deployment
-
----
-
 ## �📋 Prerequisites
 
 - Python 3.8 or higher
