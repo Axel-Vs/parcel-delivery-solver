@@ -47,8 +47,8 @@ The weight of the package in kilograms.
 ## Package Dimensions in m3
 The volume of the package in cubic meters.
 
-## Package Loading Meters
-The length of loading space required for the package in meters.
+## Vendor Linear Length
+The linear loading length required for the package in meters.
 
 ## Requested Loading Date
 The date and time when the package is requested to be loaded for shipment.

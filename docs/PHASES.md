@@ -40,7 +40,7 @@ We solve a **multi‑depot pickup‑and‑delivery problem with time windows (MD
 - If user input is lower than minimum feasible, it is auto‑raised.
 
 ## 7) Solver Selection
-- If vendor count is below the threshold → CBC MIP.
+- Solve with ALNS metaheuristic.
 - Otherwise → ALNS metaheuristic.
 - ALNS is the primary path for larger or time‑windowed batches.
 

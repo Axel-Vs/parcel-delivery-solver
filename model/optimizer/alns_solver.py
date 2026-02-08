@@ -16,16 +16,18 @@ class ALNSSolver:
     """
     Adaptive Large Neighborhood Search for Vehicle Routing Problem.
     
-    Much faster than MIP for large instances (50+ vendors).
-    Uses route-based representation instead of time-expanded binary tensors.
+    Designed for large instances (50+ vendors).
+    Uses route-based representation.
     """
     
     def __init__(self, vendors_df, distance_matrix, time_matrix, 
-                 capacity_matrix, loading_matrix, max_capacity_kg, max_ldms_vc=None,
+                 capacity_matrix, loading_matrix, linear_length_matrix, max_capacity_kg, max_ldms_vc=None,
                  discretization_constant=None, min_date=None, max_driving_hours=None,
                  service_time_matrix=None, config=None, evaluation_period=None,
                  max_volume=None, max_linear_length=None, allowed_early_hours=12, allowed_late_hours=12,
-                 vendor_ids=None, depot_node_ids=None, vendor_node_ids=None, vendor_depot_map=None):
+                 vendor_ids=None, depot_node_ids=None, vendor_node_ids=None, vendor_depot_map=None,
+                 vendor_start_hr=None, pickup_end_hr=None, starting_depot=None, closing_depot=None,
+                 allow_night_wait=True):
         """
         Initialize ALNS solver.
         
@@ -35,6 +37,7 @@ class ALNSSolver:
             time_matrix: Time matrix [seconds]
             capacity_matrix: Cargo weight per vendor [kg]
             loading_matrix: Loading volume per vendor [m³]
+            linear_length_matrix: Linear length per vendor [m]
             max_capacity_kg: Max weight capacity per vehicle [kg]
             max_ldms_vc: Max volume capacity per vehicle [m³] (DEPRECATED, use max_volume)
             max_volume: Max volume capacity per vehicle [m³]
@@ -50,6 +53,7 @@ class ALNSSolver:
         self.time_matrix = time_matrix
         self.capacity_matrix = capacity_matrix
         self.loading_matrix = loading_matrix
+        self.linear_length_matrix = linear_length_matrix if linear_length_matrix is not None else np.zeros(len(distance_matrix))
         self.service_time_matrix = service_time_matrix if service_time_matrix is not None else np.zeros(len(distance_matrix))
         self.max_capacity_kg = max_capacity_kg
         
@@ -68,12 +72,21 @@ class ALNSSolver:
         self.depot_node_ids = set(depot_node_ids or [])
         self.vendor_node_ids = set(vendor_node_ids or [])
         self.vendor_depot_map = vendor_depot_map or {}
+        self.vendor_start_hr = vendor_start_hr
+        self.pickup_end_hr = pickup_end_hr
+        self.starting_depot = starting_depot
+        self.closing_depot = closing_depot
+        self.allow_night_wait = bool(allow_night_wait)
         self._vendor_row_by_node = {}
         if self.vendors_df is not None and 'node_id' in self.vendors_df.columns:
             for _, row in self.vendors_df.iterrows():
                 node_id = row.get('node_id', None)
                 if pd.notna(node_id):
                     self._vendor_row_by_node[int(node_id)] = row
+        self._vendor_requested_cache = {}
+        self._vendor_delivery_cache = {}
+        self._feasible_cache = {}
+        self._time_span_cache = {}
         
         # ALNS parameters
         self.config = config or {}
@@ -88,6 +101,7 @@ class ALNSSolver:
         self.initial_temperature = self.config.get('initial_temperature', 1000)
         self.cooling_rate = self.config.get('cooling_rate', 0.995)
         self.no_improvement_limit = self.config.get('no_improvement_limit', 200)
+        self.insertion_top_k = self.config.get('insertion_top_k', None)
         self.initial_feasible = False
         
         # Operator weights (adaptive)
@@ -126,6 +140,8 @@ class ALNSSolver:
         # Generate initial solution using time-window-aware routing
         current = self.generate_initial_solution()
         best = current.copy()
+        current_cost = current.evaluate()
+        best_cost = current_cost
         
         # Check if initial solution is feasible
         current_feasible = current.is_feasible(check_all=True)  # Get ALL violations
@@ -170,7 +186,6 @@ class ALNSSolver:
             repaired = self.repair(destroyed, removed_vendors, repair_op)
             
             # Acceptance criterion (simulated annealing)
-            current_cost = current.evaluate()
             repaired_cost = repaired.evaluate()
             delta = repaired_cost - current_cost
             
@@ -186,12 +201,14 @@ class ALNSSolver:
             
             if accept:
                 current = repaired
+                current_cost = repaired_cost
                 no_improvement_count = 0
                 
-                if repaired_cost < best.evaluate():
+                if repaired_cost < best_cost:
                     best = repaired.copy()
+                    best_cost = repaired_cost
                     if verbose and iteration % 100 == 0:
-                        print(f'   - Iteration {iteration}: New best {best.evaluate():.0f} km ({best.get_num_routes()} routes)')
+                        print(f'   - Iteration {iteration}: New best {best_cost:.0f} km ({best.get_num_routes()} routes)')
             else:
                 no_improvement_count += 1
             
@@ -201,9 +218,12 @@ class ALNSSolver:
             # Periodically try to merge routes (optional)
             if self.enable_merge and iteration % 250 == 0 and iteration > 0:
                 merged = self.try_merge_routes(best)
-                if merged.evaluate() < best.evaluate() and merged.is_feasible(check_all=False):
+                merged_cost = merged.evaluate()
+                if merged_cost < best_cost and merged.is_feasible(check_all=False):
                     best = merged
                     current = merged.copy()
+                    best_cost = merged_cost
+                    current_cost = merged_cost
             
             # Early stopping if no improvement for long time
             if no_improvement_count > self.no_improvement_limit:
@@ -217,10 +237,12 @@ class ALNSSolver:
             if verbose:
                 print(f'   - Attempting route merging...')
             merged = self.try_merge_routes(best)
-            if merged.evaluate() <= best.evaluate() and merged.is_feasible(check_all=False):
+            merged_cost = merged.evaluate()
+            if merged_cost <= best_cost and merged.is_feasible(check_all=False):
                 best = merged
+                best_cost = merged_cost
                 if verbose:
-                    print(f'   - After merging: {best.get_num_routes()} routes, {best.evaluate():.0f} km')
+                    print(f'   - After merging: {best.get_num_routes()} routes, {best_cost:.0f} km')
         
         # Final feasibility check
         best_feasible = best.is_feasible(check_all=True)  # Get ALL violations
@@ -263,6 +285,7 @@ class ALNSSolver:
         # Capacity limits
         max_weight = max(self.max_capacity_kg) if self.max_capacity_kg else float('inf')
         max_volume = max(self.max_ldms_vc) if self.max_ldms_vc else float('inf')
+        max_linear = max(self.max_linear_length_vc) if self.max_linear_length_vc else float('inf')
         
         # Sort vendors by requested time (earliest to latest)
         unrouted_sorted = sorted(
@@ -275,7 +298,7 @@ class ALNSSolver:
         )
 
         # Build routes greedily with time-window feasibility
-        routes = self._build_time_feasible_routes(unrouted_sorted, max_weight, max_volume)
+        routes = self._build_time_feasible_routes(unrouted_sorted, max_weight, max_volume, max_linear)
         
         # Build RouteSolution
         return RouteSolution(
@@ -285,6 +308,7 @@ class ALNSSolver:
             time_matrix=self.time_matrix,
             capacity_matrix=self.capacity_matrix,
             loading_matrix=self.loading_matrix,
+            linear_length_matrix=self.linear_length_matrix,
             service_time_matrix=self.service_time_matrix,
             max_capacity_kg=self.max_capacity_kg,
             max_volume=self.max_volume_vc,
@@ -297,10 +321,17 @@ class ALNSSolver:
             allowed_late_hours=self.allowed_late_hours,
             depot_node_ids=list(self.depot_node_ids),
             vendor_node_ids=list(self.vendor_node_ids),
-            vendor_depot_map=self.vendor_depot_map
+            vendor_depot_map=self.vendor_depot_map,
+            vendor_start_hr=self.vendor_start_hr,
+            pickup_end_hr=self.pickup_end_hr,
+            starting_depot=self.starting_depot,
+            closing_depot=self.closing_depot,
+            allow_night_wait=self.allow_night_wait
         )
     
     def _get_vendor_requested_time(self, vendor_id):
+        if vendor_id in self._vendor_requested_cache:
+            return self._vendor_requested_cache[vendor_id]
         if self.vendors_df is None:
             return None
         vendor_row = self._vendor_row_by_node.get(vendor_id)
@@ -315,7 +346,10 @@ class ALNSSolver:
         ]:
             parsed = pd.to_datetime(raw, errors='coerce', utc=True)
             if pd.notna(parsed):
-                return self._to_naive(parsed)
+                result = self._to_naive(parsed)
+                self._vendor_requested_cache[vendor_id] = result
+                return result
+        self._vendor_requested_cache[vendor_id] = None
         return None
 
     def _get_vendor_time_window(self, vendor_id):
@@ -330,6 +364,8 @@ class ALNSSolver:
         return earliest, latest
 
     def _get_vendor_delivery_time(self, vendor_id):
+        if vendor_id in self._vendor_delivery_cache:
+            return self._vendor_delivery_cache[vendor_id]
         if self.vendors_df is None:
             return None
         vendor_row = self._vendor_row_by_node.get(vendor_id)
@@ -344,7 +380,10 @@ class ALNSSolver:
         ]:
             parsed = pd.to_datetime(raw, errors='coerce', utc=True)
             if pd.notna(parsed):
-                return self._to_naive(parsed)
+                result = self._to_naive(parsed)
+                self._vendor_delivery_cache[vendor_id] = result
+                return result
+        self._vendor_delivery_cache[vendor_id] = None
         return None
 
     def _get_vendor_time_bucket(self, vendor_id):
@@ -375,6 +414,9 @@ class ALNSSolver:
         return None
 
     def _get_route_time_span_hours(self, route):
+        key = tuple(route)
+        if key in self._time_span_cache:
+            return self._time_span_cache[key]
         earliest = None
         latest = None
         for node in route:
@@ -386,8 +428,11 @@ class ALNSSolver:
             earliest = node_earliest if earliest is None else min(earliest, node_earliest)
             latest = node_latest if latest is None else max(latest, node_latest)
         if earliest is None or latest is None:
+            self._time_span_cache[key] = 0.0
             return 0.0
-        return (latest - earliest).total_seconds() / 3600.0
+        span = (latest - earliest).total_seconds() / 3600.0
+        self._time_span_cache[key] = span
+        return span
 
     def _get_route_depots(self, vendor_nodes):
         depot_deadlines = {}
@@ -436,6 +481,7 @@ class ALNSSolver:
                 time_matrix=self.time_matrix,
                 capacity_matrix=self.capacity_matrix,
                 loading_matrix=self.loading_matrix,
+                linear_length_matrix=self.linear_length_matrix,
                 service_time_matrix=self.service_time_matrix,
                 max_capacity_kg=self.max_capacity_kg,
                 max_volume=self.max_volume_vc,
@@ -448,7 +494,12 @@ class ALNSSolver:
                 allowed_late_hours=self.allowed_late_hours,
                 depot_node_ids=list(self.depot_node_ids),
                 vendor_node_ids=list(vendor_nodes),
-                vendor_depot_map=self.vendor_depot_map
+                vendor_depot_map=self.vendor_depot_map,
+                vendor_start_hr=self.vendor_start_hr,
+                pickup_end_hr=self.pickup_end_hr,
+                starting_depot=self.starting_depot,
+                closing_depot=self.closing_depot,
+                allow_night_wait=self.allow_night_wait
             )
             feasible = temp_solution.is_feasible(check_all=True)
             return feasible, list(temp_solution._constraint_violations)
@@ -527,10 +578,24 @@ class ALNSSolver:
             return 0.0
         return sum(self.distance_matrix[route[i]][route[i + 1]] for i in range(len(route) - 1))
 
+    def _route_travel_seconds(self, route, exclude_dummy_start=True):
+        if not route or len(route) < 2:
+            return 0.0
+        total = 0.0
+        for i in range(0, len(route) - 1):
+            if exclude_dummy_start and route[i] == 0:
+                continue
+            total += self.time_matrix[route[i]][route[i + 1]]
+        return total
+
     def _is_route_feasible(self, vendor_nodes):
         """Check feasibility for a single route (vendor + depot windows)."""
         if not vendor_nodes:
             return False
+        key = (tuple(vendor_nodes), tuple(self._get_route_depots(list(vendor_nodes))))
+        cached = self._feasible_cache.get(key)
+        if cached is not None:
+            return cached
         route = self._build_route_with_depots(list(vendor_nodes))
         if not route:
             return False
@@ -541,6 +606,7 @@ class ALNSSolver:
             time_matrix=self.time_matrix,
             capacity_matrix=self.capacity_matrix,
             loading_matrix=self.loading_matrix,
+            linear_length_matrix=self.linear_length_matrix,
             service_time_matrix=self.service_time_matrix,
             max_capacity_kg=self.max_capacity_kg,
             max_volume=self.max_volume_vc,
@@ -553,9 +619,18 @@ class ALNSSolver:
             allowed_late_hours=self.allowed_late_hours,
             depot_node_ids=list(self.depot_node_ids),
             vendor_node_ids=list(vendor_nodes),
-            vendor_depot_map=self.vendor_depot_map
+            vendor_depot_map=self.vendor_depot_map,
+            vendor_start_hr=self.vendor_start_hr,
+            pickup_end_hr=self.pickup_end_hr,
+            starting_depot=self.starting_depot,
+            closing_depot=self.closing_depot,
+            allow_night_wait=self.allow_night_wait
         )
-        return temp_solution.is_feasible(check_all=False)
+        feasible = temp_solution.is_feasible(check_all=False)
+        if len(self._feasible_cache) > 5000:
+            self._feasible_cache.clear()
+        self._feasible_cache[key] = feasible
+        return feasible
 
     def _get_route_violations(self, vendor_nodes):
         if not vendor_nodes:
@@ -570,6 +645,7 @@ class ALNSSolver:
             time_matrix=self.time_matrix,
             capacity_matrix=self.capacity_matrix,
             loading_matrix=self.loading_matrix,
+            linear_length_matrix=self.linear_length_matrix,
             service_time_matrix=self.service_time_matrix,
             max_capacity_kg=self.max_capacity_kg,
             max_volume=self.max_volume_vc,
@@ -582,7 +658,12 @@ class ALNSSolver:
             allowed_late_hours=self.allowed_late_hours,
             depot_node_ids=list(self.depot_node_ids),
             vendor_node_ids=list(vendor_nodes),
-            vendor_depot_map=self.vendor_depot_map
+            vendor_depot_map=self.vendor_depot_map,
+            vendor_start_hr=self.vendor_start_hr,
+            pickup_end_hr=self.pickup_end_hr,
+            starting_depot=self.starting_depot,
+            closing_depot=self.closing_depot,
+            allow_night_wait=self.allow_night_wait
         )
         temp_solution.is_feasible(check_all=False)
         return list(temp_solution._constraint_violations)
@@ -615,7 +696,7 @@ class ALNSSolver:
     def _is_depot(self, node_id):
         return node_id == 0 or node_id in self.depot_node_ids
 
-    def _build_time_feasible_routes(self, vendors, max_weight, max_volume):
+    def _build_time_feasible_routes(self, vendors, max_weight, max_volume, max_linear_length):
         """Build routes considering vendor earliest/latest arrival windows."""
         routes = []
         unrouted = vendors.copy()
@@ -629,6 +710,7 @@ class ALNSSolver:
             route = [0]  # Start from dummy node
             current_weight = 0
             current_volume = 0
+            current_linear = 0
             current_time = self._to_naive(self.min_date) if self.min_date is not None else None
             route_bucket = None
             if current_time is None and self.evaluation_period:
@@ -658,8 +740,10 @@ class ALNSSolver:
                     vendor_volume = float(self.loading_matrix[vendor])
                     
                     # Check capacity
+                    vendor_linear = float(self.linear_length_matrix[vendor])
                     if (current_weight + vendor_weight <= max_weight and 
-                        current_volume + vendor_volume <= max_volume):
+                        current_volume + vendor_volume <= max_volume and
+                        current_linear + vendor_linear <= max_linear_length):
                         # Check time window feasibility
                         earliest, latest = self._get_vendor_time_window(vendor)
                         if current_time is not None and earliest is not None:
@@ -695,10 +779,7 @@ class ALNSSolver:
                         best_vendor = None
                         break
 
-                    route_travel_seconds = 0
-                    for i in range(0, len(test_route) - 1):
-                        route_travel_seconds += self.time_matrix[test_route[i]][test_route[i + 1]]
-                    
+                    route_travel_seconds = self._route_travel_seconds(test_route, exclude_dummy_start=True)
                     route_travel_hours = route_travel_seconds / 3600.0
                     
                     num_stops = len([v for v in test_route if self._is_vendor(v)])
@@ -716,6 +797,7 @@ class ALNSSolver:
                     route_bucket = self._get_vendor_time_bucket(best_vendor)
                 current_weight += float(self.capacity_matrix[best_vendor])
                 current_volume += float(self.loading_matrix[best_vendor])
+                current_linear += float(self.linear_length_matrix[best_vendor])
                 if current_time is not None:
                     travel_seconds = self.time_matrix[last_node][best_vendor]
                     current_time = self._to_naive(current_time + timedelta(seconds=travel_seconds))
@@ -871,6 +953,31 @@ class ALNSSolver:
     
     def repair_greedy(self, solution, removed_vendors):
         """Greedy insertion: insert each vendor at best position."""
+        service_time_per_stop = self.service_time_matrix[1] / 60.0 if len(self.service_time_matrix) > 1 else 0
+        route_cache = []
+        def _refresh_route_cache(route_idx):
+            route = solution.routes[route_idx]
+            route_vendors = self._route_vendors(route)
+            depots = self._get_route_depots(route_vendors) if route_vendors else []
+            route_full = route if len(route) > 1 else self._build_route_with_depots(route_vendors)
+            route_travel_seconds = 0.0
+            route_distance = 0.0
+            for i in range(0, len(route_full) - 1):
+                route_travel_seconds += self.time_matrix[route_full[i]][route_full[i + 1]]
+                route_distance += self.distance_matrix[route_full[i]][route_full[i + 1]]
+            route_weight, route_volume, route_linear = solution.get_route_capacity_usage(route_idx)
+            route_cache[route_idx] = {
+                'vendors': route_vendors,
+                'depots': depots,
+                'travel_seconds': route_travel_seconds,
+                'distance': route_distance,
+                'weight': route_weight,
+                'volume': route_volume,
+                'linear': route_linear,
+            }
+        for route_idx in range(len(solution.routes)):
+            route_cache.append({})
+            _refresh_route_cache(route_idx)
         for vendor in removed_vendors:
             best_cost = float('inf')
             best_route_idx = -1
@@ -879,48 +986,78 @@ class ALNSSolver:
             
             # Try inserting in existing routes
             for route_idx, route in enumerate(solution.routes):
+                cache = route_cache[route_idx]
                 route_bucket = self._get_route_time_bucket(route)
                 if route_bucket is not None and vendor_bucket is not None and vendor_bucket != route_bucket:
                     continue
 
-                route_vendors = self._route_vendors(route)
-                current_cost = self._route_distance(route)
-                for pos in range(0, len(route_vendors) + 1):
+                route_vendors = cache['vendors']
+                depots = cache['depots']
+                current_cost = cache['distance']
+                # Limit insertion positions to nearest K (optional)
+                positions = list(range(0, len(route_vendors) + 1))
+                if self.insertion_top_k is not None and len(route_vendors) + 1 > self.insertion_top_k:
+                    scored = []
+                    for pos in positions:
+                        prev_node = 0 if pos == 0 else route_vendors[pos - 1]
+                        if pos < len(route_vendors):
+                            next_node = route_vendors[pos]
+                        else:
+                            next_node = depots[0] if depots else 0
+                        delta_distance = (
+                            self.distance_matrix[prev_node][vendor]
+                            + self.distance_matrix[vendor][next_node]
+                            - self.distance_matrix[prev_node][next_node]
+                        )
+                        scored.append((delta_distance, pos))
+                    scored.sort(key=lambda x: x[0])
+                    positions = [p for _, p in scored[:self.insertion_top_k]]
+                for pos in positions:
                     candidate_vendors = route_vendors[:pos] + [vendor] + route_vendors[pos:]
-                    candidate_route = self._build_route_with_depots(candidate_vendors)
-
-                    # Enforce vendor + depot window feasibility
-                    if not self._is_route_feasible(candidate_vendors):
-                        continue
+                    prev_node = 0 if pos == 0 else route_vendors[pos - 1]
+                    if pos < len(route_vendors):
+                        next_node = route_vendors[pos]
+                    else:
+                        next_node = depots[0] if depots else 0
+                    delta_distance = (
+                        self.distance_matrix[prev_node][vendor]
+                        + self.distance_matrix[vendor][next_node]
+                        - self.distance_matrix[prev_node][next_node]
+                    )
 
                     # Check capacity
-                    route_weight, route_volume = solution.get_route_capacity_usage(route_idx)
+                    route_weight, route_volume, route_linear = cache['weight'], cache['volume'], cache.get('linear', 0.0)
                     vehicle_idx = route_idx
                     max_weight = self.max_capacity_kg[vehicle_idx] if vehicle_idx < len(self.max_capacity_kg) else float('inf')
                     max_volume = self.max_ldms_vc[vehicle_idx] if vehicle_idx < len(self.max_ldms_vc) else float('inf')
+                    max_linear = self.max_linear_length_vc[vehicle_idx] if vehicle_idx < len(self.max_linear_length_vc) else float('inf')
                     if route_weight + self.capacity_matrix[vendor] > max_weight:
                         continue
                     if route_volume + self.loading_matrix[vendor] > max_volume:
                         continue
+                    if route_linear + self.linear_length_matrix[vendor] > max_linear:
+                        continue
+                    
+                    # Enforce vendor + depot window feasibility
+                    if not self._is_route_feasible(candidate_vendors):
+                        continue
 
                     # Check max_driving constraint
                     if self.max_driving_hours is not None:
+                        candidate_route = self._build_route_with_depots(candidate_vendors)
                         span_hours = self._get_route_time_span_hours(candidate_route)
                         if span_hours > self.max_driving_hours:
                             continue
 
-                        route_travel_seconds = 0
-                        for i in range(0, len(candidate_route) - 1):
-                            route_travel_seconds += self.time_matrix[candidate_route[i]][candidate_route[i + 1]]
+                        route_travel_seconds = self._route_travel_seconds(candidate_route, exclude_dummy_start=True)
                         route_travel_hours = route_travel_seconds / 3600.0
                         num_stops = len([v for v in candidate_route if self._is_vendor(v)])
-                        service_time_per_stop = self.service_time_matrix[1] / 60.0 if len(self.service_time_matrix) > 1 else 0
                         route_service_hours = num_stops * service_time_per_stop
                         total_time = route_travel_hours + route_service_hours
                         if total_time > self.max_driving_hours:
                             continue
 
-                    insertion_cost = self._route_distance(candidate_route) - current_cost
+                    insertion_cost = delta_distance
                     if insertion_cost < best_cost:
                         best_cost = insertion_cost
                         best_route_idx = route_idx
@@ -931,9 +1068,12 @@ class ALNSSolver:
                 current_vendors = self._route_vendors(solution.routes[best_route_idx])
                 updated_vendors = current_vendors[:best_position] + [vendor] + current_vendors[best_position:]
                 solution.routes[best_route_idx] = self._build_route_with_depots(updated_vendors)
+                _refresh_route_cache(best_route_idx)
             else:
                 # Create new route
                 solution.routes.append(self._build_route_with_depots([vendor]))
+                route_cache.append({})
+                _refresh_route_cache(len(solution.routes) - 1)
         
         solution.invalidate_cache()
         return solution
@@ -941,6 +1081,31 @@ class ALNSSolver:
     def repair_regret2(self, solution, removed_vendors):
         """Regret-2 insertion: prioritize vendors with large regret."""
         uninserted = set(removed_vendors)
+        service_time_per_stop = self.service_time_matrix[1] / 60.0 if len(self.service_time_matrix) > 1 else 0
+        route_cache = []
+        def _refresh_route_cache(route_idx):
+            route = solution.routes[route_idx]
+            route_vendors = self._route_vendors(route)
+            depots = self._get_route_depots(route_vendors) if route_vendors else []
+            route_full = route if len(route) > 1 else self._build_route_with_depots(route_vendors)
+            route_travel_seconds = 0.0
+            route_distance = 0.0
+            for i in range(0, len(route_full) - 1):
+                route_travel_seconds += self.time_matrix[route_full[i]][route_full[i + 1]]
+                route_distance += self.distance_matrix[route_full[i]][route_full[i + 1]]
+            route_weight, route_volume, route_linear = solution.get_route_capacity_usage(route_idx)
+            route_cache[route_idx] = {
+                'vendors': route_vendors,
+                'depots': depots,
+                'travel_seconds': route_travel_seconds,
+                'distance': route_distance,
+                'weight': route_weight,
+                'volume': route_volume,
+                'linear': route_linear,
+            }
+        for route_idx in range(len(solution.routes)):
+            route_cache.append({})
+            _refresh_route_cache(route_idx)
         
         while uninserted:
             best_regret = -float('inf')
@@ -954,48 +1119,78 @@ class ALNSSolver:
                 vendor_bucket = self._get_vendor_time_bucket(vendor)
                 
                 for route_idx, route in enumerate(solution.routes):
+                    cache = route_cache[route_idx]
                     route_bucket = self._get_route_time_bucket(route)
                     if route_bucket is not None and vendor_bucket is not None and vendor_bucket != route_bucket:
                         continue
 
-                    route_vendors = self._route_vendors(route)
-                    current_cost = self._route_distance(route)
-                    for pos in range(0, len(route_vendors) + 1):
+                    route_vendors = cache['vendors']
+                    depots = cache['depots']
+                    current_cost = cache['distance']
+                    # Limit insertion positions to nearest K (optional)
+                    positions = list(range(0, len(route_vendors) + 1))
+                    if self.insertion_top_k is not None and len(route_vendors) + 1 > self.insertion_top_k:
+                        scored = []
+                        for pos in positions:
+                            prev_node = 0 if pos == 0 else route_vendors[pos - 1]
+                            if pos < len(route_vendors):
+                                next_node = route_vendors[pos]
+                            else:
+                                next_node = depots[0] if depots else 0
+                            delta_distance = (
+                                self.distance_matrix[prev_node][vendor]
+                                + self.distance_matrix[vendor][next_node]
+                                - self.distance_matrix[prev_node][next_node]
+                            )
+                            scored.append((delta_distance, pos))
+                        scored.sort(key=lambda x: x[0])
+                        positions = [p for _, p in scored[:self.insertion_top_k]]
+                    for pos in positions:
                         candidate_vendors = route_vendors[:pos] + [vendor] + route_vendors[pos:]
-                        candidate_route = self._build_route_with_depots(candidate_vendors)
-
-                        # Enforce vendor + depot window feasibility
-                        if not self._is_route_feasible(candidate_vendors):
-                            continue
+                        prev_node = 0 if pos == 0 else route_vendors[pos - 1]
+                        if pos < len(route_vendors):
+                            next_node = route_vendors[pos]
+                        else:
+                            next_node = depots[0] if depots else 0
+                        delta_distance = (
+                            self.distance_matrix[prev_node][vendor]
+                            + self.distance_matrix[vendor][next_node]
+                            - self.distance_matrix[prev_node][next_node]
+                        )
 
                         # Check capacity
-                        route_weight, route_volume = solution.get_route_capacity_usage(route_idx)
+                        route_weight, route_volume, route_linear = cache['weight'], cache['volume'], cache.get('linear', 0.0)
                         vehicle_idx = route_idx
                         max_weight = self.max_capacity_kg[vehicle_idx] if vehicle_idx < len(self.max_capacity_kg) else float('inf')
                         max_volume = self.max_ldms_vc[vehicle_idx] if vehicle_idx < len(self.max_ldms_vc) else float('inf')
+                        max_linear = self.max_linear_length_vc[vehicle_idx] if vehicle_idx < len(self.max_linear_length_vc) else float('inf')
                         if route_weight + self.capacity_matrix[vendor] > max_weight:
                             continue
                         if route_volume + self.loading_matrix[vendor] > max_volume:
                             continue
+                        if route_linear + self.linear_length_matrix[vendor] > max_linear:
+                            continue
+                        
+                        # Enforce vendor + depot window feasibility
+                        if not self._is_route_feasible(candidate_vendors):
+                            continue
 
                         # Check max_driving constraint
                         if self.max_driving_hours is not None:
+                            candidate_route = self._build_route_with_depots(candidate_vendors)
                             span_hours = self._get_route_time_span_hours(candidate_route)
                             if span_hours > self.max_driving_hours:
                                 continue
 
-                            route_travel_seconds = 0
-                            for i in range(0, len(candidate_route) - 1):
-                                route_travel_seconds += self.time_matrix[candidate_route[i]][candidate_route[i + 1]]
+                            route_travel_seconds = self._route_travel_seconds(candidate_route, exclude_dummy_start=True)
                             route_travel_hours = route_travel_seconds / 3600.0
                             num_stops = len([v for v in candidate_route if self._is_vendor(v)])
-                            service_time_per_stop = self.service_time_matrix[1] / 60.0 if len(self.service_time_matrix) > 1 else 0
                             route_service_hours = num_stops * service_time_per_stop
                             total_time = route_travel_hours + route_service_hours
                             if total_time > self.max_driving_hours:
                                 continue
 
-                        insertion_cost = self._route_distance(candidate_route) - current_cost
+                        insertion_cost = delta_distance
                         costs.append((insertion_cost, route_idx, pos))
                 
                 if len(costs) >= 2:
@@ -1022,6 +1217,7 @@ class ALNSSolver:
             current_vendors = self._route_vendors(solution.routes[best_route_idx])
             updated_vendors = current_vendors[:best_position] + [best_vendor] + current_vendors[best_position:]
             solution.routes[best_route_idx] = self._build_route_with_depots(updated_vendors)
+            _refresh_route_cache(best_route_idx)
             uninserted.remove(best_vendor)
         
         solution.invalidate_cache()
@@ -1092,20 +1288,24 @@ class ALNSSolver:
                     # Check capacity constraints
                     total_weight = sum(self.capacity_matrix[v] for v in combined_vendors)
                     total_volume = sum(self.loading_matrix[v] for v in combined_vendors)
+                    total_linear = sum(self.linear_length_matrix[v] for v in combined_vendors)
                     max_weight = max(self.max_capacity_kg) if self.max_capacity_kg else float('inf')
                     max_volume = max(self.max_ldms_vc) if self.max_ldms_vc else float('inf')
+                    max_linear = max(self.max_linear_length_vc) if self.max_linear_length_vc else float('inf')
 
-                    if total_weight > max_weight or total_volume > max_volume:
+                    if total_weight > max_weight or total_volume > max_volume or total_linear > max_linear:
                         if self.merge_debug:
-                            print(f'   - Merge rejected (capacity): {total_weight:.0f}kg/{max_weight:.0f}kg, {total_volume:.2f}m³/{max_volume:.2f}m³')
+                            print(
+                                f'   - Merge rejected (capacity): '
+                                f'{total_weight:.0f}kg/{max_weight:.0f}kg, '
+                                f'{total_volume:.2f}m³/{max_volume:.2f}m³, '
+                                f'{total_linear:.2f}m/{max_linear:.2f}m'
+                            )
                         continue
 
                     # Check max_driving constraint
                     if self.max_driving_hours is not None:
-                        route_travel_seconds = 0
-                        for k in range(0, len(test_route) - 1):
-                            route_travel_seconds += self.time_matrix[test_route[k]][test_route[k + 1]]
-
+                        route_travel_seconds = self._route_travel_seconds(test_route, exclude_dummy_start=True)
                         route_travel_hours = route_travel_seconds / 3600.0
                         num_stops = len(combined_vendors)
                         service_time_per_stop = self.service_time_matrix[1] / 60.0 if len(self.service_time_matrix) > 1 else 0

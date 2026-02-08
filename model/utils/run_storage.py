@@ -47,7 +47,7 @@ def save_run(run_id: str, name: str, state: Dict[str, Any], metadata: Dict[str, 
 
     # Normalize state types for JSON
     norm_state = {}
-    for key in ['routes', 'distance_matrix', 'capacity_matrix', 'loading_matrix', 'frozen_prefix']:
+    for key in ['routes', 'distance_matrix', 'capacity_matrix', 'loading_matrix', 'linear_length_matrix', 'frozen_prefix']:
         if key in state and state[key] is not None:
             norm_state[key] = state[key]
 

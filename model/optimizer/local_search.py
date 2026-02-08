@@ -147,6 +147,7 @@ class LocalSearchOperators:
     @staticmethod
     def swap_inter(route1, route2, distance_matrix, capacity_matrix=None,
                    loading_matrix=None, max_weights=None, max_volumes=None,
+                   linear_length_matrix=None, max_linear_lengths=None,
                    depot_node_ids=None):
         """
         Swap vendors between two different routes.
@@ -197,6 +198,16 @@ class LocalSearchOperators:
                     if volume1_after > max_volumes[0] or volume2_after > max_volumes[1]:
                         continue
                 
+                if linear_length_matrix is not None and max_linear_lengths is not None:
+                    linear1_before = sum(LocalSearchOperators._get_vendor_linear_length(linear_length_matrix, v, depot_node_ids) for v in route1 if not LocalSearchOperators._is_depot(v, depot_node_ids))
+                    linear2_before = sum(LocalSearchOperators._get_vendor_linear_length(linear_length_matrix, v, depot_node_ids) for v in route2 if not LocalSearchOperators._is_depot(v, depot_node_ids))
+                    
+                    linear1_after = linear1_before - LocalSearchOperators._get_vendor_linear_length(linear_length_matrix, vendor1, depot_node_ids) + LocalSearchOperators._get_vendor_linear_length(linear_length_matrix, vendor2, depot_node_ids)
+                    linear2_after = linear2_before - LocalSearchOperators._get_vendor_linear_length(linear_length_matrix, vendor2, depot_node_ids) + LocalSearchOperators._get_vendor_linear_length(linear_length_matrix, vendor1, depot_node_ids)
+                    
+                    if linear1_after > max_linear_lengths[0] or linear2_after > max_linear_lengths[1]:
+                        continue
+                
                 # Swap vendors
                 new_route1 = route1[:]
                 new_route2 = route2[:]
@@ -217,6 +228,7 @@ class LocalSearchOperators:
     @staticmethod
     def relocate_inter(route1, route2, distance_matrix, capacity_matrix=None,
                        loading_matrix=None, max_weights=None, max_volumes=None,
+                       linear_length_matrix=None, max_linear_lengths=None,
                        depot_node_ids=None):
         """
         Relocate a vendor from one route to another.
@@ -254,6 +266,11 @@ class LocalSearchOperators:
                 volume2 = sum(LocalSearchOperators._get_vendor_volume(loading_matrix, v, depot_node_ids) for v in route2 if not LocalSearchOperators._is_depot(v, depot_node_ids))
                 if volume2 + LocalSearchOperators._get_vendor_volume(loading_matrix, vendor, depot_node_ids) > max_volumes[1]:
                     continue
+                
+                if linear_length_matrix is not None and max_linear_lengths is not None:
+                    linear2 = sum(LocalSearchOperators._get_vendor_linear_length(linear_length_matrix, v, depot_node_ids) for v in route2 if not LocalSearchOperators._is_depot(v, depot_node_ids))
+                    if linear2 + LocalSearchOperators._get_vendor_linear_length(linear_length_matrix, vendor, depot_node_ids) > max_linear_lengths[1]:
+                        continue
             
             # Try inserting at each position in route2
             for j in range(1, len(route2)):
@@ -285,6 +302,11 @@ class LocalSearchOperators:
                 volume1 = sum(LocalSearchOperators._get_vendor_volume(loading_matrix, v, depot_node_ids) for v in route1 if not LocalSearchOperators._is_depot(v, depot_node_ids))
                 if volume1 + LocalSearchOperators._get_vendor_volume(loading_matrix, vendor, depot_node_ids) > max_volumes[0]:
                     continue
+                
+                if linear_length_matrix is not None and max_linear_lengths is not None:
+                    linear1 = sum(LocalSearchOperators._get_vendor_linear_length(linear_length_matrix, v, depot_node_ids) for v in route1 if not LocalSearchOperators._is_depot(v, depot_node_ids))
+                    if linear1 + LocalSearchOperators._get_vendor_linear_length(linear_length_matrix, vendor, depot_node_ids) > max_linear_lengths[0]:
+                        continue
             
             # Try inserting at each position in route1
             for j in range(1, len(route1)):
@@ -390,6 +412,10 @@ class LocalSearchOperators:
                         improved_solution.max_volume[i] if i < len(improved_solution.max_volume) else float('inf'),
                         improved_solution.max_volume[j] if j < len(improved_solution.max_volume) else float('inf')
                     ]
+                    max_linear_lengths = [
+                        improved_solution.max_linear_length[i] if i < len(improved_solution.max_linear_length) else float('inf'),
+                        improved_solution.max_linear_length[j] if j < len(improved_solution.max_linear_length) else float('inf')
+                    ]
                     
                     route1, route2, changed = LocalSearchOperators.swap_inter(
                         improved_solution.routes[i],
@@ -397,8 +423,10 @@ class LocalSearchOperators:
                         improved_solution.distance_matrix,
                         improved_solution.capacity_matrix,
                         improved_solution.loading_matrix,
+                        improved_solution.linear_length_matrix,
                         max_weights,
                         max_volumes,
+                        max_linear_lengths,
                         depot_node_ids=depot_node_ids
                     )
                     
@@ -433,9 +461,12 @@ class LocalSearchOperators:
                     max_weight_j = float(improved_solution.max_capacity_kg[j]) if hasattr(improved_solution.max_capacity_kg, '__len__') else float(improved_solution.max_capacity_kg)
                     max_volume_i = float(improved_solution.max_volume[i]) if hasattr(improved_solution.max_volume, '__len__') else float(improved_solution.max_volume)
                     max_volume_j = float(improved_solution.max_volume[j]) if hasattr(improved_solution.max_volume, '__len__') else float(improved_solution.max_volume)
+                    max_linear_i = float(improved_solution.max_linear_length[i]) if hasattr(improved_solution.max_linear_length, '__len__') else float(improved_solution.max_linear_length)
+                    max_linear_j = float(improved_solution.max_linear_length[j]) if hasattr(improved_solution.max_linear_length, '__len__') else float(improved_solution.max_linear_length)
                     
                     max_weights = [max_weight_i, max_weight_j]
                     max_volumes = [max_volume_i, max_volume_j]
+                    max_linear_lengths = [max_linear_i, max_linear_j]
                     
                     route1, route2, changed = LocalSearchOperators.relocate_inter(
                         improved_solution.routes[i],
@@ -443,8 +474,10 @@ class LocalSearchOperators:
                         improved_solution.distance_matrix,
                         improved_solution.capacity_matrix,
                         improved_solution.loading_matrix,
+                        improved_solution.linear_length_matrix,
                         max_weights,
                         max_volumes,
+                        max_linear_lengths,
                         depot_node_ids=depot_node_ids
                     )
                     if changed:
@@ -519,6 +552,18 @@ class LocalSearchOperators:
             return 0
         val = loading_matrix[vendor_id]
         # If it's an array/row, extract the first element
+        if hasattr(val, '__len__') and not isinstance(val, (str, bytes)):
+            return float(val[0]) if len(val) > 0 else float(val)
+        return float(val)
+
+    @staticmethod
+    def _get_vendor_linear_length(linear_length_matrix, vendor_id, depot_node_ids=None):
+        """Safely extract vendor linear length as scalar value."""
+        if linear_length_matrix is None:
+            return 0
+        if LocalSearchOperators._is_depot(vendor_id, depot_node_ids):
+            return 0
+        val = linear_length_matrix[vendor_id]
         if hasattr(val, '__len__') and not isinstance(val, (str, bytes)):
             return float(val[0]) if len(val) > 0 else float(val)
         return float(val)

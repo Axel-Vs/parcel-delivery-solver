@@ -1,6 +1,7 @@
 # Import necessary libraries
 import os
 import sys
+import json
 from pathlib import Path
 from datetime import datetime, timedelta
 import pandas as pd
@@ -11,7 +12,6 @@ sys.path.append(str(project_root))
 
 # Import required modules
 from utils.project_utils import *
-from ortools.linear_solver import pywraplp
 from concurrent.futures import ProcessPoolExecutor
 
 # Import metaheuristic solvers
@@ -31,6 +31,7 @@ def _solve_alns_group(payload):
         time_matrix=payload['time_matrix'],
         capacity_matrix=payload['capacity_matrix'],
         loading_matrix=payload['loading_matrix'],
+        linear_length_matrix=payload.get('linear_length_matrix'),
         service_time_matrix=payload['service_time_matrix'],
         max_capacity_kg=payload['max_capacity_kg'],
         max_volume=payload['max_volume'],
@@ -45,10 +46,15 @@ def _solve_alns_group(payload):
         vendor_ids=payload['vendor_ids'],
         depot_node_ids=payload.get('depot_node_ids'),
         vendor_node_ids=payload.get('vendor_ids'),
-        vendor_depot_map=payload.get('vendor_depot_map')
+        vendor_depot_map=payload.get('vendor_depot_map'),
+        vendor_start_hr=payload.get('vendor_start_hr'),
+        pickup_end_hr=payload.get('pickup_end_hr'),
+        starting_depot=payload.get('starting_depot'),
+        closing_depot=payload.get('closing_depot'),
+        allow_night_wait=payload.get('allow_night_wait')
     )
     group_solution = group_solver.solve(verbose=payload['verbose'])
-    if not getattr(group_solver, 'initial_feasible', False):
+    if not getattr(group_solver, 'initial_feasible', False) and payload.get('ls_iters', 0) > 0:
         group_solution = LocalSearchOperators.improve_solution(group_solution, max_iterations=payload['ls_iters'])
     feasible = group_solution.is_feasible(check_all=True)
     return {
@@ -59,25 +65,22 @@ def _solve_alns_group(payload):
 
 # Define the DeliveryOptimizer class
 class DeliveryOptimizer:
-    def __init__(self, evaluation_period, discretization_constant, time_expanded_network, time_expanded_network_index,
-                 Tau_hours, distance_matrix, time_distance_matrix, disc_time_distance_matrix, capacity_matrix, loading_matrix,
-                 max_capacity, max_volume, max_linear_length, max_driving, is_gap, mip_gap, maximum_minutes,
+    def __init__(self, evaluation_period, discretization_constant, distance_matrix, time_distance_matrix, capacity_matrix, loading_matrix, linear_length_matrix,
+                 max_capacity, max_volume, max_linear_length, max_driving,
                  service_time_matrix=None, vendors_df=None, allowed_early_hours=12, allowed_late_hours=12,
-                 depots_df=None, depot_node_ids=None, vendor_node_ids=None, vendor_depot_map=None):
-        # Log information about the MIP model setup
-        log.info('Defining MIP model... ')
+                 depots_df=None, depot_node_ids=None, vendor_node_ids=None, vendor_depot_map=None,
+                 vendor_start_hr=None, pickup_end_hr=None, starting_depot=None, closing_depot=None,
+                 allow_night_wait=True):
+        log.info('Defining optimizer...')
 
         # Set problem-specific attributes
         self.evaluation_period = evaluation_period
         self.discretization_constant = discretization_constant
-        self.time_expanded_network = time_expanded_network
-        self.time_expanded_network_index = time_expanded_network_index
-        self.Tau_hours = Tau_hours
         self.distance_matrix = distance_matrix
         self.time_distance_matrix = time_distance_matrix
-        self.disc_time_distance_matrix = disc_time_distance_matrix
         self.capacity_matrix = capacity_matrix
         self.loading_matrix = loading_matrix
+        self.linear_length_matrix = linear_length_matrix if linear_length_matrix is not None else np.zeros(len(distance_matrix))
         self.service_time_matrix = service_time_matrix if service_time_matrix is not None else np.zeros(len(distance_matrix))
         self.vendors_df = vendors_df
         self.allowed_early_hours = allowed_early_hours
@@ -86,10 +89,14 @@ class DeliveryOptimizer:
         self.depot_node_ids = depot_node_ids or []
         self.vendor_node_ids = vendor_node_ids or []
         self.vendor_depot_map = vendor_depot_map or {}
+        self.vendor_start_hr = vendor_start_hr
+        self.pickup_end_hr = pickup_end_hr
+        self.starting_depot = starting_depot
+        self.closing_depot = closing_depot
+        self.allow_night_wait = bool(allow_night_wait)
 
         # Calculate derived attributes
         self.max_driving_hours = max_driving
-        self.des_max_driving = max_driving / discretization_constant
         self.length = len(self.distance_matrix)
         self.max_num_vehicles = self.length - 1
 
@@ -118,54 +125,11 @@ class DeliveryOptimizer:
         self.used_metaheuristic = False
         self.last_constraint_violations = []
 
-        # Create a solver instance with specified time limit
-        self.model = pywraplp.Solver('DeliveryOptimizer', pywraplp.Solver.CBC_MIXED_INTEGER_PROGRAMMING)
-        self.model.set_time_limit(maximum_minutes * 60 * 1000)  # milliseconds
-
-        # Configure solver based on MIP gap
-        self.is_gap = is_gap
-        if is_gap == True:
-            log.info('MIP GAP %s and maximum solving minutes %s...' % (mip_gap, maximum_minutes))
-            self.solverParams = pywraplp.MPSolverParameters()
-            self.solverParams.SetDoubleParam(self.solverParams.RELATIVE_MIP_GAP, mip_gap)
-
-
-    def create_model(self, w):
-        A_i, A_j, self.nodes = DeliveryOptimizer.nodes_range(self.time_expanded_network)
-        all_duples, index_out, index_ins, index_zero_ins = DeliveryOptimizer.nodes_expanded_points(self.time_expanded_network)
-
-        self._defining_variables()
-        self._add_constraint_nodes()
-        self._add_constraint_vehicle_routing(A_i, A_j, all_duples, index_out, index_ins, index_zero_ins)
-        self._add_obj_function(w)
-
-    def solve_model(self):        
-        status = 1
-        while status != 0:
-            if  self.max_num_vehicles < self.length + 2 :
-                if self.is_gap:
-                    status = self.model.Solve(self.solverParams)
-                else:
-                    status = self.model.Solve()
-                                
-                self.max_num_vehicles += 2
-
-                self.max_capacity_kg = [self.max_capacity*1000] * self.max_num_vehicles
-                self.max_volume_vc = [self.max_volume] * self.max_num_vehicles
-                self.max_linear_length_vc = [self.max_linear_length] * self.max_num_vehicles
-            else:    
-                print('No solution found, last num. vehicles considered:', self.max_num_vehicles)
-                break
-
-            # self.max_capacity_kg = [self.max_capacity_kg] * self.max_num_vehicles 
-            # self.max_ldms = [self.max_ldms] * self.max_num_vehicles
-
-        return status, self.x, self.y
+        
     
     def solve_with_metaheuristic(self, w=0.5, max_iterations=1000, verbose=True):
         """
-        Solve using ALNS metaheuristic instead of MIP.
-        Much faster for large instances (50+ vendors).
+        Solve using ALNS metaheuristic.
         
         Args:
             w: Weight for objective (0.5 = balanced distance/vehicles)
@@ -179,12 +143,11 @@ class DeliveryOptimizer:
                 - y: Vehicle usage vector
         """
         if not METAHEURISTIC_AVAILABLE:
-            print("⚠️  Metaheuristic solver not available. Using MIP instead.")
-            return self.solve_model()
+            raise RuntimeError("ALNS solver not available.")
         
         if verbose:
             print('\n🚀 Using ALNS metaheuristic solver (fast mode)')
-            print(f'   - Network size: {len(self.time_expanded_network)} arcs, {self.length} nodes')
+            print(f'   - Problem size: {self.length} nodes')
 
         # Normalize requested loading columns to avoid missing vendor windows
         if self.vendors_df is not None:
@@ -223,6 +186,19 @@ class DeliveryOptimizer:
             initial_T, cooling = 1200, 0.996
             ls_iters = 200
 
+        # Optional local search override for simulations
+        skip_local_search = str(os.environ.get('SIM_SKIP_LS', '')).lower() in ('1', 'true', 'yes')
+        override_ls_iters = os.environ.get('SIM_LS_ITERS')
+        if override_ls_iters is not None:
+            try:
+                ls_iters = int(override_ls_iters)
+            except ValueError:
+                pass
+        if skip_local_search:
+            ls_iters = 0
+
+        # Full insertion search for consistent quality.
+        insertion_top_k = None
         alns_config = {
             'max_iterations': max_iterations,
             'min_removal_size': min_removal,
@@ -232,7 +208,8 @@ class DeliveryOptimizer:
             'merge_debug': bool(verbose),
             'depot_debug': bool(verbose),
             'enable_merge': False,
-            'enable_split': False
+            'enable_split': True,
+            'insertion_top_k': insertion_top_k
         }
         
         # Parallel solve by time-window groups when available
@@ -248,6 +225,9 @@ class DeliveryOptimizer:
         if len(group_map) > 1:
             if verbose:
                 print(f'🔀 Parallel ALNS groups: {len(group_map)}')
+                for bucket, vendor_ids in group_map.items():
+                    bucket_vendors = sorted(list(vendor_ids))
+                    print(f'   - Group {bucket}: {len(bucket_vendors)} vendors {bucket_vendors}')
             max_workers = min(len(group_map), max(1, (os.cpu_count() or 2) // 2))
 
             payloads = []
@@ -265,12 +245,15 @@ class DeliveryOptimizer:
                 else:
                     group_max_iterations = max_iterations
                     group_ls_iters = ls_iters
+                if skip_local_search:
+                    group_ls_iters = 0
                 payloads.append({
                     'vendors_df': self.vendors_df,
                     'distance_matrix': self.distance_matrix,
                     'time_matrix': self.time_distance_matrix,
                     'capacity_matrix': self.capacity_matrix,
                     'loading_matrix': self.loading_matrix,
+                    'linear_length_matrix': self.linear_length_matrix,
                     'service_time_matrix': self.service_time_matrix,
                     'max_capacity_kg': self.max_capacity_kg,
                     'max_volume': self.max_volume_vc,
@@ -287,8 +270,19 @@ class DeliveryOptimizer:
                     'ls_iters': group_ls_iters,
                     'depot_node_ids': self.depot_node_ids,
                     'vendor_node_ids': self.vendor_node_ids,
-                    'vendor_depot_map': self.vendor_depot_map
+                    'vendor_depot_map': self.vendor_depot_map,
+                    'vendor_start_hr': self.vendor_start_hr,
+                    'pickup_end_hr': self.pickup_end_hr,
+                    'starting_depot': self.starting_depot,
+                        'closing_depot': self.closing_depot,
+                        'allow_night_wait': self.allow_night_wait
                 })
+                if verbose:
+                    print(
+                        f'   - Group solve: vendors={sorted(list(vendor_ids))}, '
+                        f'max_driving={self.max_driving_hours}h, '
+                        f'iter={group_max_iterations}, ls={group_ls_iters}'
+                    )
 
             try:
                 with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -313,6 +307,7 @@ class DeliveryOptimizer:
                 time_matrix=self.time_distance_matrix,
                 capacity_matrix=self.capacity_matrix,
                 loading_matrix=self.loading_matrix,
+                linear_length_matrix=self.linear_length_matrix,
                 service_time_matrix=self.service_time_matrix,
                 max_capacity_kg=self.max_capacity_kg,
                 max_volume=self.max_volume_vc,
@@ -325,7 +320,12 @@ class DeliveryOptimizer:
                 allowed_late_hours=self.allowed_late_hours,
                 depot_node_ids=self.depot_node_ids,
                 vendor_node_ids=self.vendor_node_ids,
-                vendor_depot_map=self.vendor_depot_map
+                vendor_depot_map=self.vendor_depot_map,
+                vendor_start_hr=self.vendor_start_hr,
+                pickup_end_hr=self.pickup_end_hr,
+                starting_depot=self.starting_depot,
+                closing_depot=self.closing_depot,
+                allow_night_wait=self.allow_night_wait
             )
             is_feasible = solution.is_feasible(check_all=True) if feasible else False
             solution._constraint_violations = combined_violations if combined_violations else list(solution._constraint_violations)
@@ -338,6 +338,7 @@ class DeliveryOptimizer:
                 time_matrix=self.time_distance_matrix,
                 capacity_matrix=self.capacity_matrix,
                 loading_matrix=self.loading_matrix,
+                linear_length_matrix=self.linear_length_matrix,
                 service_time_matrix=self.service_time_matrix,
                 max_capacity_kg=self.max_capacity_kg,
                 max_volume=self.max_volume_vc,
@@ -351,14 +352,19 @@ class DeliveryOptimizer:
                 allowed_late_hours=self.allowed_late_hours,
                 depot_node_ids=self.depot_node_ids,
                 vendor_node_ids=self.vendor_node_ids,
-                vendor_depot_map=self.vendor_depot_map
+                vendor_depot_map=self.vendor_depot_map,
+                vendor_start_hr=self.vendor_start_hr,
+                pickup_end_hr=self.pickup_end_hr,
+                starting_depot=self.starting_depot,
+                closing_depot=self.closing_depot,
+                allow_night_wait=self.allow_night_wait
             )
             
             # Solve with ALNS
             solution = alns.solve(verbose=verbose)
             
             # Apply local search improvement only if initial solution was not feasible
-            if not getattr(alns, 'initial_feasible', False):
+            if not getattr(alns, 'initial_feasible', False) and ls_iters > 0:
                 if verbose:
                     print('   - Applying local search improvement...')
                 solution = LocalSearchOperators.improve_solution(solution, max_iterations=ls_iters)
@@ -382,12 +388,18 @@ class DeliveryOptimizer:
                     # Smart fallback: Split only violated routes, keep feasible ones
                     print(f'   🔧 Fixing {len(solution._constraint_violations)} violated routes...')
                     violated_route_ids = set()
+                    violation_types_by_route = {}
                     for violation in solution._constraint_violations:
                         # Extract route number from violation message
                         if 'Route' in violation:
                             try:
                                 route_id = int(violation.split('Route')[1].split(':')[0].strip())
                                 violated_route_ids.add(route_id)
+                                bucket = violation_types_by_route.setdefault(route_id, set())
+                                if 'Total time' in violation or 'max driving' in violation:
+                                    bucket.add('max_driving')
+                                if 'late' in violation or 'early' in violation:
+                                    bucket.add('time_window')
                             except:
                                 pass
 
@@ -412,18 +424,32 @@ class DeliveryOptimizer:
                                 requested = parsed.to_pydatetime()
                                 start = requested - timedelta(hours=float(self.allowed_early_hours))
                                 end = requested + timedelta(hours=float(self.allowed_late_hours))
+                                if self.vendor_start_hr is not None and self.pickup_end_hr is not None:
+                                    try:
+                                        start_hr = int(self.vendor_start_hr)
+                                        end_hr = int(self.pickup_end_hr)
+                                        open_start = requested.replace(hour=start_hr, minute=0, second=0, microsecond=0)
+                                        open_end = requested.replace(hour=end_hr, minute=0, second=0, microsecond=0)
+                                        if open_end < open_start:
+                                            open_end = open_end + timedelta(days=1)
+                                        start = max(start, open_start)
+                                        end = min(end, open_end)
+                                    except (TypeError, ValueError):
+                                        pass
                                 return start, end
                         return None, None
 
                     def _split_by_overlap(vendor_nodes):
                         entries = []
+                        missing = []
                         for v in vendor_nodes:
                             s, e = _vendor_window(v)
                             if s is None or e is None:
+                                missing.append(v)
                                 continue
                             entries.append((v, s, e))
                         if not entries:
-                            return []
+                            return [[v] for v in vendor_nodes]
                         entries.sort(key=lambda x: x[1])
                         groups = []
                         current_end = None
@@ -444,6 +470,8 @@ class DeliveryOptimizer:
                             ordered = [v for v in vendor_nodes if v in group]
                             if ordered:
                                 ordered_groups.append(ordered)
+                        for v in missing:
+                            ordered_groups.append([v])
 
                         # Verify disjoint group intervals by time; merge if overlapping
                         def _group_interval(group):
@@ -504,12 +532,68 @@ class DeliveryOptimizer:
                         depots.sort(key=lambda d: depot_deadlines.get(d))
                         return depots
 
+                    def _route_total_hours(vendor_nodes):
+                        if not vendor_nodes:
+                            return 0.0
+                        depots = _route_depots(vendor_nodes)
+                        route = [0] + list(vendor_nodes) + list(depots)
+                        travel_seconds = 0.0
+                        for i in range(0, len(route) - 1):
+                            if route[i] == 0:
+                                continue
+                            travel_seconds += self.time_distance_matrix[route[i]][route[i + 1]]
+                        travel_hours = travel_seconds / 3600.0
+                        if self.service_time_matrix is None or len(self.service_time_matrix) <= 1:
+                            return travel_hours
+                        load_minutes = sum(float(self.service_time_matrix[v]) for v in vendor_nodes)
+                        unload_minutes = load_minutes
+                        service_hours = (load_minutes + unload_minutes) / 60.0
+                        return travel_hours + service_hours
+
+                    def _split_by_max_driving(vendor_nodes):
+                        if not vendor_nodes:
+                            return []
+                        groups = []
+                        current = []
+                        for v in vendor_nodes:
+                            candidate = current + [v]
+                            if self.max_driving_hours is None:
+                                current = candidate
+                                continue
+                            if _route_total_hours(candidate) <= self.max_driving_hours:
+                                current = candidate
+                            else:
+                                if current:
+                                    groups.append(list(current))
+                                current = [v]
+                        if current:
+                            groups.append(list(current))
+                        return groups
+
                     # Rebuild solution: keep good routes, split violated ones
                     new_routes = []
                     for route_idx, route in enumerate(solution.routes):
                         if route_idx in violated_route_ids:
-                            vendors_in_route = [v for v in route if v in self.vendor_node_ids]
-                            grouped = _split_by_overlap(vendors_in_route)
+                            vendors_in_route = [
+                                v for v in route
+                                if v != 0 and v not in self.depot_node_ids
+                                and (not self.vendor_node_ids or v in self.vendor_node_ids)
+                            ]
+                            if not vendors_in_route:
+                                if verbose:
+                                    print(f'      ⚠️ Route {route_idx} has no vendor nodes; keeping route')
+                                new_routes.append(route)
+                                continue
+                            violation_types = violation_types_by_route.get(route_idx, set())
+                            if 'max_driving' in violation_types and self.max_driving_hours is not None:
+                                grouped = _split_by_max_driving(vendors_in_route)
+                                if verbose:
+                                    print(
+                                        f'      ⚠️ Route {route_idx} over max driving; '
+                                        f'splitting by driving time into {len(grouped)} groups'
+                                    )
+                            else:
+                                grouped = _split_by_overlap(vendors_in_route)
                             if not grouped and vendors_in_route:
                                 grouped = [[v] for v in vendors_in_route]
                             for group in grouped:
@@ -520,6 +604,7 @@ class DeliveryOptimizer:
                                     time_matrix=self.time_distance_matrix,
                                     capacity_matrix=self.capacity_matrix,
                                     loading_matrix=self.loading_matrix,
+                                    linear_length_matrix=self.linear_length_matrix,
                                     service_time_matrix=self.service_time_matrix,
                                     max_capacity_kg=self.max_capacity_kg,
                                     max_volume=self.max_volume_vc,
@@ -534,10 +619,15 @@ class DeliveryOptimizer:
                                     vendor_ids=group,
                                     depot_node_ids=self.depot_node_ids,
                                     vendor_node_ids=group,
-                                    vendor_depot_map=self.vendor_depot_map
+                                    vendor_depot_map=self.vendor_depot_map,
+                                    vendor_start_hr=self.vendor_start_hr,
+                                    pickup_end_hr=self.pickup_end_hr,
+                                    starting_depot=self.starting_depot,
+                                        closing_depot=self.closing_depot,
+                                        allow_night_wait=self.allow_night_wait
                                 )
                                 group_solution = group_solver.solve(verbose=verbose)
-                                if not getattr(group_solver, 'initial_feasible', False):
+                                if not getattr(group_solver, 'initial_feasible', False) and ls_iters > 0:
                                     group_solution = LocalSearchOperators.improve_solution(group_solution, max_iterations=ls_iters)
                                 if group_solution.is_feasible(check_all=True):
                                     for r in group_solution.routes:
@@ -552,6 +642,7 @@ class DeliveryOptimizer:
                                             time_matrix=self.time_distance_matrix,
                                             capacity_matrix=self.capacity_matrix,
                                             loading_matrix=self.loading_matrix,
+                                            linear_length_matrix=self.linear_length_matrix,
                                             service_time_matrix=self.service_time_matrix,
                                             max_capacity_kg=self.max_capacity_kg,
                                             max_volume=self.max_volume_vc,
@@ -566,10 +657,15 @@ class DeliveryOptimizer:
                                             vendor_ids=[v],
                                             depot_node_ids=self.depot_node_ids,
                                             vendor_node_ids=[v],
-                                            vendor_depot_map=self.vendor_depot_map
+                                            vendor_depot_map=self.vendor_depot_map,
+                                            vendor_start_hr=self.vendor_start_hr,
+                                            pickup_end_hr=self.pickup_end_hr,
+                                            starting_depot=self.starting_depot,
+                                            closing_depot=self.closing_depot,
+                                            allow_night_wait=self.allow_night_wait
                                         )
                                         single_solution = single_solver.solve(verbose=verbose)
-                                        if not getattr(single_solver, 'initial_feasible', False):
+                                        if not getattr(single_solver, 'initial_feasible', False) and ls_iters > 0:
                                             single_solution = LocalSearchOperators.improve_solution(single_solution, max_iterations=ls_iters)
                                         for r in single_solution.routes:
                                             new_routes.append(list(r))
@@ -586,6 +682,7 @@ class DeliveryOptimizer:
                         time_matrix=self.time_distance_matrix,
                         capacity_matrix=self.capacity_matrix,
                         loading_matrix=self.loading_matrix,
+                        linear_length_matrix=self.linear_length_matrix,
                         service_time_matrix=self.service_time_matrix,
                         max_capacity_kg=self.max_capacity_kg,
                         max_volume=self.max_volume_vc,
@@ -598,7 +695,11 @@ class DeliveryOptimizer:
                         allowed_late_hours=self.allowed_late_hours,
                         depot_node_ids=self.depot_node_ids,
                         vendor_node_ids=self.vendor_node_ids,
-                        vendor_depot_map=self.vendor_depot_map
+                        vendor_depot_map=self.vendor_depot_map,
+                        vendor_start_hr=self.vendor_start_hr,
+                        pickup_end_hr=self.pickup_end_hr,
+                        starting_depot=self.starting_depot,
+                        closing_depot=self.closing_depot
                     )
                 else:
                     if verbose:
@@ -612,12 +713,83 @@ class DeliveryOptimizer:
                     else:
                         status = 2
                         print(f'   ✗ Still infeasible after fix!')
+                        # Last-resort fallback: build single-vendor routes
+                        fallback_routes = []
+                        forced_vendor_violations = {}
+                        vendor_pool = list(self.vendor_node_ids) if self.vendor_node_ids else list(range(1, self.length))
+                        for v in vendor_pool:
+                            depot_node = self.vendor_depot_map.get(v, 0)
+                            route = [0, v, depot_node] if depot_node != 0 else [0, v, 0]
+                            temp_solution = RouteSolution(
+                                routes=[route],
+                                vendors_df=self.vendors_df,
+                                distance_matrix=self.distance_matrix,
+                                time_matrix=self.time_distance_matrix,
+                                capacity_matrix=self.capacity_matrix,
+                                loading_matrix=self.loading_matrix,
+                                linear_length_matrix=self.linear_length_matrix,
+                                service_time_matrix=self.service_time_matrix,
+                                max_capacity_kg=self.max_capacity_kg,
+                                max_volume=self.max_volume_vc,
+                                max_linear_length=self.max_linear_length_vc,
+                                discretization_constant=self.discretization_constant,
+                                min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
+                                max_driving_hours=self.max_driving_hours,
+                                evaluation_period=self.evaluation_period,
+                                allowed_early_hours=self.allowed_early_hours,
+                                allowed_late_hours=self.allowed_late_hours,
+                                depot_node_ids=self.depot_node_ids,
+                                vendor_node_ids=[v],
+                                vendor_depot_map=self.vendor_depot_map,
+                                vendor_start_hr=self.vendor_start_hr,
+                                pickup_end_hr=self.pickup_end_hr,
+                                starting_depot=self.starting_depot,
+                                closing_depot=self.closing_depot,
+                                allow_night_wait=self.allow_night_wait
+                            )
+                            if temp_solution.is_feasible(check_all=True):
+                                fallback_routes.append(route)
+                            else:
+                                fallback_routes.append(route)
+                                forced_vendor_violations[int(v)] = list(temp_solution._constraint_violations)
+                        if fallback_routes:
+                            solution = RouteSolution(
+                                routes=fallback_routes,
+                                vendors_df=self.vendors_df,
+                                distance_matrix=self.distance_matrix,
+                                time_matrix=self.time_distance_matrix,
+                                capacity_matrix=self.capacity_matrix,
+                                loading_matrix=self.loading_matrix,
+                                linear_length_matrix=self.linear_length_matrix,
+                                service_time_matrix=self.service_time_matrix,
+                                max_capacity_kg=self.max_capacity_kg,
+                                max_volume=self.max_volume_vc,
+                                max_linear_length=self.max_linear_length_vc,
+                                discretization_constant=self.discretization_constant,
+                                min_date=self.evaluation_period[0] if isinstance(self.evaluation_period, list) else self.evaluation_period,
+                                max_driving_hours=self.max_driving_hours,
+                                evaluation_period=self.evaluation_period,
+                                allowed_early_hours=self.allowed_early_hours,
+                                allowed_late_hours=self.allowed_late_hours,
+                                depot_node_ids=self.depot_node_ids,
+                                vendor_node_ids=self.vendor_node_ids,
+                                vendor_depot_map=self.vendor_depot_map,
+                                vendor_start_hr=self.vendor_start_hr,
+                                pickup_end_hr=self.pickup_end_hr,
+                                starting_depot=self.starting_depot,
+                                closing_depot=self.closing_depot,
+                                allow_night_wait=self.allow_night_wait
+                            )
+                            status = 0
+                            self.forced_vendor_violations = forced_vendor_violations
+                            if verbose and forced_vendor_violations:
+                                print(f'   ⚠️ Forced infeasible vendors: {sorted(list(forced_vendor_violations.keys()))}')
                 else:
                     status = 0 if is_feasible else 2
                 self.last_constraint_violations = list(solution._constraint_violations)
         
-        # Convert route solution to MIP-style x and y matrices for compatibility
-        x, y = self._convert_routes_to_mip_format(solution)
+        # Convert route solution to connection matrices for compatibility
+        x, y = self._convert_routes_to_connection_format(solution)
         
         # Store solution and mark as metaheuristic
         self.connections_solution = x
@@ -630,15 +802,15 @@ class DeliveryOptimizer:
         
         return status, x, y
     
-    def _convert_routes_to_mip_format(self, route_solution):
+    def _convert_routes_to_connection_format(self, route_solution):
         """
-        Convert route-based solution to MIP format for compatibility.
+        Convert route-based solution to connection format for compatibility.
         
         Args:
             route_solution: RouteSolution object
             
         Returns:
-            tuple: (x, y) matrices compatible with MIP output format
+            tuple: (x, y) matrices compatible with current output format
         """
         # Initialize connection matrix x[k][i][ti][j][tj]
         # For metaheuristic, use simplified structure with only time index 0
@@ -669,432 +841,6 @@ class DeliveryOptimizer:
         
         return x, y
 
-    def nodes_range(time_expanded_network):
-        """Static function: Gives out the feasible space of the nodes given the Time-Expanded Network.
-        Input: 
-        time_expanded_network: Time-Expanded Network.
-        Output: 
-        A_i: Leaving Nodes to consider.
-        A_j: Arriving Nodes to consider.
-        all_duples: List of of the duples (Node-i,Time-t) on the Time-Expanded Network. Includes arrival and leaving points.
-        index_zero_ins: Extracts the arrival time-network points to the recipient.
-        """
-        A_i=[]
-        A_j=[]
-        for j in range(len(time_expanded_network)):
-            A_i.append(time_expanded_network[j][0][0])
-            A_j.append(time_expanded_network[j][1][0])
-        all_nodes = list(set(A_i+A_j))
-
-        return A_i, A_j, all_nodes
-
-    def nodes_expanded_points(time_expanded_network):
-        duples_1 = []
-        duples_2 = []
-        for j in range(len(time_expanded_network)):
-                duples_1.append( time_expanded_network[j][0] )
-                duples_2.append( time_expanded_network[j][1] )
-        all_duples = duples_1 + duples_2
-        all_duples = list(set(map(tuple, all_duples)))
-
-        index_ins = {}
-        index_out = {}
-        for dups in all_duples:
-            index_ins[dups] = []
-            index_out[dups] = []
-            k = 0
-            for elem in time_expanded_network:
-                if tuple(elem[1]) == dups:
-                    if len(elem[0]) != 0:
-                        index_ins[ dups ].append(k )
-                elif tuple(elem[0]) == dups:
-                    if len(elem[1]) != 0:
-                        index_out[ dups ].append(k )            
-                k += 1        
-        index_zero_ins = []
-        for vals in all_duples:
-            if vals[0] == 0:        
-                for j in index_ins[vals]:
-                    index_zero_ins.append( [ [time_expanded_network[j][0][0], time_expanded_network[j][0][1]], [time_expanded_network[j][1][0], time_expanded_network[j][1][1]]] )
-        
-        return all_duples, index_out, index_ins, index_zero_ins
-
-    def _defining_variables(self):
-        log.info('Defining variables...')
-        self.x = [[[[[self.model.IntVar(0,1,'') for t in self.time_expanded_network_index] for j in range(0, self.length)] for t in self.time_expanded_network_index] for i in range(0, self.length)] for k in range(self.max_num_vehicles)]         
-        self.y = [self.model.IntVar(0,1,'') for k in range(self.max_num_vehicles)] 
-    
-    def _add_constraint_nodes(self):
-        log.info('Adding Nodes Constraints...')        
-        for i in self.nodes:
-            if i != 0:                
-                options_i = A_index(self.time_expanded_network, i, 'delta_out') 
-                self.model.Add( sum( self.x[k][ options_i[j][0][0] ][ options_i[j][0][1] ][ options_i[j][1][0] ][ options_i[j][1][1] ] for j in range(len(options_i)) for k in range(self.max_num_vehicles) ) == 1 )
-
-    def _add_constraint_vehicle_routing(self, A_i, A_j, all_duples, index_out, index_ins, index_zero_ins):       
-        log.info('Adding Vehicle Routing Constraints...')    
-        for k in range(self.max_num_vehicles):
-            self.model.Add( sum( self.x[k][ j[0][0] ][ j[0][1] ][ j[1][0] ][ j[1][1] ] for j in index_zero_ins ) == self.y[k] )  # every vehicle has to be used and return to 0
-            self.model.Add( sum( self.capacity_matrix[self.time_expanded_network[j][0][0]] * self.x[k][ self.time_expanded_network[j][0][0] ][ self.time_expanded_network[j][0][1] ][ self.time_expanded_network[j][1][0] ][ self.time_expanded_network[j][1][1] ] for j in range(0, len(self.time_expanded_network))) <= self.y[k] * self.max_capacity_kg[k] ) 
-            
-            # Driving time cap (hours) per vehicle
-            # Exclude depot→vendor edges (source node = 0) to only count return travel + inter-vendor
-            # Add service time: count non-depot nodes visited
-            travel_time = sum( 
-                ( self.time_distance_matrix[self.time_expanded_network[j][0][0]][self.time_expanded_network[j][1][0]] / 3600.0 ) * 
-                self.x[k][ self.time_expanded_network[j][0][0] ][ self.time_expanded_network[j][0][1] ][ self.time_expanded_network[j][1][0] ][ self.time_expanded_network[j][1][1] ] 
-                for j in range(0, len(self.time_expanded_network)) 
-                if self.time_expanded_network[j][0][0] != 0  # Skip depot→vendor edges
-            )
-            service_time = sum(
-                self.service_time_hours_per_stop * self.x[k][ self.time_expanded_network[j][0][0] ][ self.time_expanded_network[j][0][1] ][ self.time_expanded_network[j][1][0] ][ self.time_expanded_network[j][1][1] ]
-                for j in range(0, len(self.time_expanded_network))
-                if self.time_expanded_network[j][0][0] != 0  # Service time only for non-depot sources
-            )
-            self.model.Add( travel_time + service_time <= self.y[k] * self.max_driving_hours )
-            for vals in all_duples:
-                if vals[0] != 0:
-                    self.model.Add( sum( self.x[k][ self.time_expanded_network[j][0][0] ][ self.time_expanded_network[j][0][1] ][ self.time_expanded_network[j][1][0] ][ self.time_expanded_network[j][1][1] ] for j in index_out[vals]) - sum( self.x[k][ self.time_expanded_network[j][0][0] ][self.time_expanded_network[j][0][1]][self.time_expanded_network[j][1][0]][self.time_expanded_network[j][1][1]] for j in index_ins[vals]) == 0 )                
-
-    def _add_obj_function(self, w):
-        log.info('Number of constraints = ' + str( self.model.NumConstraints() ) ) 
-        log.info('Solving time-extended network MIP model...')
-
-        number_nodes = len(self.distance_matrix)
-        P = 0
-        for i in range(number_nodes):
-            P += self.distance_matrix[i][0]
-        P = P/number_nodes
-        # print('P', P)
-        # print('w',w)
-
-        self.model.Minimize( w * self.model.Sum( self.x[k][ self.time_expanded_network[i][0][0] ][ self.time_expanded_network[i][0][1] ][ self.time_expanded_network[i][1][0] ][ self.time_expanded_network[i][1][1] ]*self.distance_matrix[ self.time_expanded_network[i][0][0] ][ self.time_expanded_network[i][1][0] ] for i in range(len(self.time_expanded_network)) for k in range(self.max_num_vehicles)  ) +
-                    (1 - w) * P *self.model.Sum( self.y[k] for k in range(self.max_num_vehicles))) 
-
-        # self.model.Minimize( self.model.Sum( self.x[k][ self.time_expanded_network[i][0][0] ][ self.time_expanded_network[i][0][1] ][ self.time_expanded_network[i][1][0] ][ self.time_expanded_network[i][1][1] ]*self.distance_matrix[ self.time_expanded_network[i][0][0] ][ self.time_expanded_network[i][1][0] ] for i in range(len(self.time_expanded_network)) for k in range(self.max_num_vehicles)  ) ) 
-
-        # self.model.Minimize( self.model.Sum( self.y[k] for k in range(self.max_num_vehicles)) ) 
-
-
-    def read_solution(self, solution_path):
-        current_solution = np.load(solution_path, allow_pickle=True)
-        re_dict = current_solution.tolist()
-        return re_dict
-
-    def print_solution(self, connections_matrix, index_solution, discretization_constant, min_date, Tau_hours, distance_matrix, 
-                   time_distance_matrix, disc_time_distance_matrix, capacity_matrix, loading_matrix, vendors_df=None):        
-        r = {}
-        index={}
-        dist={}
-        driv={}
-        cargo={}
-        load={}
-
-        total_dist=0
-        total_driv=0
-        total_cargo=0
-        total_load=0
-        vehicle_id=1
-        route_number = 1  # Sequential route counter
-        for k in index_solution:
-            vehicle_id = k
-            
-            # Extract active arcs for this vehicle from time-expanded network
-            active_arcs = []
-            for arc in self.time_expanded_network:
-                i, ti, j, tj = arc[0][0], arc[0][1], arc[1][0], arc[1][1]
-                if connections_matrix[k][i][ti][j][tj] > 0.5:
-                    active_arcs.append([i, ti, j, tj])
-            
-            r[vehicle_id] = np.array(active_arcs)
-
-            # Skip vehicles with no routes
-            if len(r[vehicle_id]) == 0:
-                continue
-            
-            print('Route %i:' % route_number)
-            
-            index[vehicle_id] = []
-            dist[vehicle_id] = []
-            driv[vehicle_id] = []
-            cargo[vehicle_id] = []
-            load[vehicle_id] = []
-            
-            # For pickup problem: find starting vendors (never count depot as starting point)
-            # Check if there are arcs leaving the depot
-            depot_destinations = set()
-            for arc in r[vehicle_id]:
-                if arc[0] == 0:  # Arc leaving depot
-                    depot_destinations.add(arc[2])
-            
-            if depot_destinations:
-                # If depot has outgoing arcs, start from those vendors (not depot)
-                starting_nodes = depot_destinations
-            else:
-                # No depot arcs - find nodes with outgoing but no incoming arcs (excluding depot)
-                all_origins = set([arc[0] for arc in r[vehicle_id] if arc[0] != 0])
-                all_destinations = set([arc[2] for arc in r[vehicle_id] if arc[2] != 0])
-                starting_nodes = all_origins - all_destinations
-                
-                # If still no clear starting nodes, use all non-depot origins
-                if len(starting_nodes) == 0:
-                    starting_nodes = set([arc[0] for arc in r[vehicle_id] if arc[0] != 0])
-            
-            # print(f'  Found {len(starting_nodes)} starting point(s): {sorted([int(n) for n in starting_nodes])}')
-            
-            # Process each starting node as a separate route segment
-            route_segments = []
-            route_segments_with_times = []  # Store (node, departure_time, arrival_time, travel_hours) tuples
-            for start_node in sorted(starting_nodes):
-                segment = []
-                segment_with_times = []
-                prev_index = start_node
-                prev_time = None
-                
-                # Find the time index for the starting node
-                for arc in r[vehicle_id]:
-                    if arc[2] == start_node:
-                        prev_time = arc[3]
-                        break
-                
-                # Get actual departure datetime from the starting node
-                from datetime import datetime, timedelta
-                if prev_time is not None:
-                    current_datetime, time_str = inv_date_index(discretization_constant, prev_time, min_date, Tau_hours)
-                    # For the first node, this is departure time (no arrival since we start here)
-                    segment_with_times.append((prev_index, time_str, None, 0))
-                    # Ensure current_datetime is a proper datetime object
-                    if not isinstance(current_datetime, datetime):
-                        # Parse the time string if needed
-                        current_datetime = datetime.strptime(time_str, '%Y-%m-%d at %H:%M')
-                
-                segment.append(prev_index)
-                
-                # Check if there's an arc from depot to this starting node
-                # If so, add its distance/time to the stats
-                for arc in r[vehicle_id]:
-                    if arc[0] == 0 and arc[2] == start_node:
-                        # Found depot -> starting_node arc, include it in statistics
-                        dist[vehicle_id].append(distance_matrix[0][start_node])
-                        driv[vehicle_id].append(time_distance_matrix[0][start_node] / 3600)  # Convert seconds to hours
-                        break
-                
-                # Follow the route until we reach depot (node 0) or a cycle
-                visited = set()
-                current_time = current_datetime  # Track actual clock time as we travel
-                
-                while prev_index != 0 and prev_index not in visited:
-                    visited.add(prev_index)
-                    
-                    # Add cargo/loading from the current node (where we're picking up)
-                    # This should only be added once per vendor node visited
-                    if prev_index != 0:  # Not depot
-                        cargo[vehicle_id].append(capacity_matrix[prev_index])
-                        load[vehicle_id].append(loading_matrix[prev_index])
-                    
-                    # Find next arc from this node
-                    found_next = False
-                    for arc in r[vehicle_id]:
-                        if arc[0] == prev_index:
-                            forw_index = arc[2]
-                            forw_time = arc[3]
-                            
-                            # Get actual travel time in hours from time_distance_matrix (stored in seconds)
-                            travel_time_hours = time_distance_matrix[prev_index][forw_index] / 3600  # Convert seconds to hours
-                            
-                            # Calculate actual arrival time = departure + travel time
-                            arrival_time = current_time + timedelta(hours=float(travel_time_hours))
-                            arrival_str = arrival_time.strftime('%Y-%m-%d at %H:%M')
-                            
-                            segment.append(forw_index)
-                            segment_with_times.append((forw_index, None, arrival_str, travel_time_hours))
-                            index[vehicle_id].append(forw_index)
-                            dist[vehicle_id].append(distance_matrix[prev_index][forw_index])
-                            driv[vehicle_id].append(travel_time_hours)  # Already converted to hours above
-                            
-                            prev_index = forw_index
-                            current_time = arrival_time  # Update current time for next leg
-                            found_next = True
-                            break
-                    
-                    if not found_next:
-                        break
-                
-                route_segments.append(segment)
-                route_segments_with_times.append(segment_with_times)
-            
-            # Display all route segments and identify valid pickup routes
-            valid_routes = []
-            invalid_routes = []
-            
-            for seg_idx, (segment, segment_times) in enumerate(zip(route_segments, route_segments_with_times), 1):
-                if len(segment) > 1:
-                    if segment[-1] == 0:
-                        valid_routes.append(segment)
-                        print(f'\n  ┌─ 📦 Route Timeline')
-                        # Display detailed route with departure/arrival times and travel durations
-                        for idx, (node, depart_str, arrival_str, travel_hours) in enumerate(segment_times):
-                            if node == 0:
-                                node_name = 'Start'
-                                location_info = ''
-                            else:
-                                node_name = f'Node {int(node)}'
-                                location_info = ''
-                                if vendors_df is not None:
-                                    try:
-                                        vendor_row = None
-                                        if 'node_id' in vendors_df.columns:
-                                            match = vendors_df[vendors_df['node_id'] == int(node)]
-                                            if not match.empty:
-                                                vendor_row = match.iloc[0]
-                                        elif int(node) <= len(vendors_df):
-                                            vendor_row = vendors_df.iloc[int(node) - 1]
-                                        if vendor_row is not None:
-                                            node_name = str(vendor_row.get('vendor Name', node_name)).strip()
-                                            city = str(vendor_row.get('Vendor City', '')).strip()
-                                            postcode = str(vendor_row.get('Vendor Postcode', '')).strip()
-                                            if city and postcode:
-                                                location_info = f' ({city}, PLZ {postcode})'
-                                    except Exception:
-                                        pass
-                            
-                            if idx == 0:
-                                # First node - departure point
-                                print(f'  │  🚚 Pickup: {node_name}{location_info}')
-                                print(f'  │     Departs: {depart_str}')
-                            else:
-                                # Subsequent nodes - show arrival after travel
-                                travel_str = f' ({travel_hours:.1f} hrs travel)' if travel_hours > 0 else ''
-                                if idx < len(segment_times) - 1:
-                                    print(f'  │  ⬇️  Stop at: {node_name}{location_info}')
-                                    print(f'  │     Arrives: {arrival_str}{travel_str}')
-                                else:
-                                    print(f'  │  🏁 Final Destination: {node_name}{location_info}')
-                                    print(f'  └─    Arrives: {arrival_str}{travel_str}')
-                    else:
-                        invalid_routes.append(segment)
-                        print(f'\n  ⚠️  INVALID ROUTE (disconnected):')
-                        for idx, (node, time_str) in enumerate(segment_times):
-                            node_name = 'Depot' if node == 0 else f'Vendor {int(node)}'
-                            if idx == 0:
-                                print(f'     • Start: {node_name} at {time_str}')
-                            else:
-                                print(f'     • Stop: {node_name} at {time_str}')
-                        print(f'     ⚠️  Route does NOT end at depot')
-                else:
-                    print(f'  ⚠️  Isolated node: {segment[0]}')
-            
-            # Summary
-            if valid_routes:
-                vendors_in_valid_routes = set()
-                for route in valid_routes:
-                    vendors_in_valid_routes.update([int(n) for n in route if n != 0])
-                print(f'  Summary: {len(valid_routes)} valid route(s) serving vendors {sorted(vendors_in_valid_routes)}')
-            
-            if invalid_routes:
-                vendors_in_invalid_routes = set()
-                for route in invalid_routes:
-                    vendors_in_invalid_routes.update([int(n) for n in route if n != 0])
-                print(f'  ⚠️  WARNING: {len(invalid_routes)} disconnected cycle(s) involving vendors {sorted(vendors_in_invalid_routes)}')
-            
-            if len(index[vehicle_id]) == 0:
-                index[vehicle_id].append(list(starting_nodes)[0])
-
-            total_dist += sum(dist[vehicle_id])
-            total_driv += sum(driv[vehicle_id])
-            total_cargo += sum(cargo[vehicle_id]) 
-            total_load += sum(load[vehicle_id]) 
-
-            print(f' - Distance Route {route_number}:           {int(sum(dist[vehicle_id]))} km')
-            print(f' - Total Driving Time Route {route_number}: {round(sum(driv[vehicle_id]), 1)} hrs')
-            print(f' - Cargo Route {route_number}:              {int(sum(cargo[vehicle_id]))} kg')
-            print(f' - L. Meters Route {route_number}:          {round(sum(load[vehicle_id]),2)} m3')
-            route_number += 1  # Increment for next route
-            print('')
-
-        print('')
-        if total_dist != 0:
-            total_dist = int(round(total_dist,0))
-            print('Total Distance %i km'%total_dist)
-            print('Total Cargo %i kg'%total_cargo)
-            print('Total Loading Meters %i m3'%round(total_load,2))
-
-        # Compute distance saved compared to trivial solution
-        # Trivial solution: each vendor sends one vehicle directly to depot
-        # All vendor nodes are nodes 1, 2, 3, ... (depot is node 0)
-        num_nodes = len(distance_matrix)
-        vendor_nodes = range(1, num_nodes)  # Exclude depot (node 0)
-        
-        before_dist = 0
-        for vendor_node in vendor_nodes:
-            before_dist += distance_matrix[vendor_node][0]
-        before_dist = int(round(before_dist,0))
-
-        if total_dist == 0:
-            print('No more routes to optimize.')
-        else:
-            print('Trivial distance:', before_dist, 'km')
-            if before_dist > 0:
-                print('Distance reduction achieved:', round(( (before_dist - total_dist) /before_dist) *100,2), '% \n \n \n')
-            else:
-                print('Distance reduction: N/A (trivial distance is 0)\n \n \n')
-
-    def print_status(self, status, x, y):
-        # Handle both CBC solver objects and plain dictionaries
-        if isinstance(x, dict):
-            self.connections_solution = x
-            self.vehicles_solution = y
-        else:
-            self.connections_solution = SolVal(x)
-            self.vehicles_solution = SolVal(y)
-
-        # Check if metaheuristic was used
-        is_metaheuristic = getattr(self, 'used_metaheuristic', False)
-
-        if status != pywraplp.Solver.INFEASIBLE:
-            if not is_metaheuristic and status != pywraplp.Solver.OPTIMAL:
-                logger.warning("Due to time constraint, the closer solution for optimality is given...")
-
-            op_num_vehicles = int(sum(self.vehicles_solution.values()) if isinstance(self.vehicles_solution, dict) else sum(self.vehicles_solution))
-            
-            if is_metaheuristic:
-                obj_value = self.metaheuristic_objective
-                log.info('Metaheuristic solution found.')
-            else:
-                obj_value = round(self.model.Objective().Value(), 2)
-                log.info('Optimal solution found.')
-                
-            log.info('Objective value = ' + str(obj_value))
-            log.info('Number of nodes = ' + str(len(self.distance_matrix)))
-            log.info('Number of vehicles selected = ' + str(op_num_vehicles))
-            log.info('Total Distance = ' + str(obj_value))
-            log.info('Total Cargo = ' + str(int(sum(self.capacity_matrix))))
-            log.info('Total Loading Meters = ' + str(int(sum(self.loading_matrix))))
-            
-            if not is_metaheuristic:
-                self.secs_taken = round(int(self.model.wall_time())/1000, 2)
-                log.info('Problem solved in %s seconds' % self.secs_taken)
-                log.info('Problem solved in %s minutes' % str((self.secs_taken)/60))
-        else:
-            logger.warning("The problem is infeasible.")
-            if not is_metaheuristic:
-                print(self.time_expanded_network)
-                obj_value = round(self.model.Objective().Value(), 2)
-                print(obj_value)           
-
-
-        if status != pywraplp.Solver.INFEASIBLE:
-            # For metaheuristic, extract vehicle indices from the solution
-            if is_metaheuristic:
-                index_solution = [k for k, v in self.vehicles_solution.items() if v > 0.5]
-            else:
-                index_solution = information_index(self.y)
-                
-            DeliveryOptimizer.print_solution(self, self.connections_solution, index_solution, self.discretization_constant, 
-                                    self.min_date, self.Tau_hours, self.distance_matrix,
-                                    self.time_distance_matrix, self.disc_time_distance_matrix, self.capacity_matrix, 
-                                    self.loading_matrix, self.vendors_df)
-
     def save_solution(self, path):
         # Store solution ----------------------------------------------------------------------------------------
         solution_dict = {}
@@ -1102,24 +848,17 @@ class DeliveryOptimizer:
         solution_dict['period'] = self.evaluation_period 
         solution_dict['discretization_constant'] = self.discretization_constant
         solution_dict['distance_matrix'] = self.distance_matrix
-        solution_dict['disc_time_distance_matrix'] = self.disc_time_distance_matrix        
         # Solution
         solution_dict['time_needed'] = self.secs_taken
         
-        # Handle both MIP and metaheuristic solutions
-        if getattr(self, 'used_metaheuristic', False):
-            solution_dict['index_solution'] = [k for k, v in self.vehicles_solution.items() if v > 0.5]
-        else:
-            solution_dict['index_solution'] = information_index(self.y)
+        solution_dict['index_solution'] = [k for k, v in self.vehicles_solution.items() if v > 0.5]
         solution_dict['connections_matrix'] = self.connections_solution
         # Truck
         solution_dict['capacity_matrix'] = self.capacity_matrix
         solution_dict['loading_matrix'] = self.loading_matrix
+        solution_dict['linear_length_matrix'] = self.linear_length_matrix
         # Time 
-        solution_dict['min_date'] = self.min_date 
-        solution_dict['Tau_hours'] = self.Tau_hours 
-        solution_dict['time_expand_network'] = self.time_expanded_network
-        solution_dict['time_expand_network_index'] = self.time_expanded_network_index
+        solution_dict['min_date'] = self.min_date
 
         #moment = datetime.datetime.now().strftime("%Y_%m_%d-%I_%M_%S_%p")        
         if not isinstance(self.evaluation_period, list):
@@ -1144,107 +883,6 @@ class DeliveryOptimizer:
 
 
 
-     # Quantum Annealing:
-    def _defining_hamiltonian_variables(self, A_i, A_j):
-        log.info('Defining Hamiltonian Variables...')
-            
-        self.x_array = Array.create('connection', shape=(self.max_num_vehicles, len(np.unique(A_i)), len(self.time_expanded_network_index), len(np.unique(A_j)), \
-                                        len(self.time_expanded_network_index)), vartype="BINARY")
-        self.y_array = Array.create('vehicle', shape=(self.max_num_vehicles,), vartype="BINARY")
-
-        self.capacity_matrix = np.array(self.capacity_matrix, dtype=np.int)          
-        self.q_range = range(0, math.ceil(1 + math.log(self.max_capacity*1000 -
-                                                       np.min(self.capacity_matrix[np.nonzero(self.capacity_matrix)]) , 2)))       
-                     
-        self.loading_matrix = np.array(self.loading_matrix, dtype=np.float32)
-        self.m_range = range(0, math.ceil(1 + math.log(self.max_ldms -
-                                                       np.min(self.loading_matrix[np.nonzero(self.loading_matrix)]) , 2))) 
-        
-        self.lambda_q = Array.create('slack_q', shape=(max(self.q_range) + 1, self.max_num_vehicles), vartype="BINARY")
-        self.lambda_m = Array.create('slack_m', shape=(max(self.m_range) + 1, self.max_num_vehicles), vartype="BINARY")
-
-
-    def _add_hamiltonian_min_function(self):
-        log.info('Adding Hamiltonian Minimization Function (H0)...')    
-        w=0.9
-        
-        H_0 = w*sum(self.x_array[k][ self.time_expanded_network[i][0][0] ][ int(self.time_expanded_network[i][0][1]) ][ int(self.time_expanded_network[i][1][0]) ][ int(self.time_expanded_network[i][1][1]) ] * \
-                    self.distance_matrix[ self.time_expanded_network[i][0][0] ][ self.time_expanded_network[i][1][0] ] for i in range(len(self.time_expanded_network)) for k in range(self.max_num_vehicles)  ) + \
-        (1-w)*self.P*sum(self.y_array[k] for k in range(self.max_num_vehicles))
-        return H_0
-
-
-    def _add_hamiltonian_constraints_nodes(self):
-        log.info('Adding Hamiltonian Constraints Nodes (H1)...') 
-        Nodes_0 = list(set(self.nodes) - {0})
-        H_1 = {}
-        for i in Nodes_0:
-            options_i = A_index(self.time_expanded_network, i, 'delta_out') 
-            H_1[i] = Constraint( (sum( self.x_array[k][ int(options_i[j][0][0]) ][ int(options_i[j][0][1]) ][ int(options_i[j][1][0]) ][ int(options_i[j][1][1]) ] \
-                                for j in range(len(options_i)) for k in range(self.max_num_vehicles)) - 1 )**2, 'Route_Depo_End_Constraints')
-        # Merging the constraint into one sum
-        H_1 = sum(H_1[i] for i in Nodes_0)
-        return H_1
-
-
-    def _add_hamiltonian_constraint_vehicle_routing(self, all_duples, index_out, index_ins, index_zero_ins):       
-        log.info('Adding Hamiltonian Vehicle Routing Constraints (H2, H3, H4, H5)...')    
-
-        H_2 = {}
-        H_3 = {}
-        H_4 = {}
-        H_5 = {}
-        for k in range(self.max_num_vehicles):
-            H_2[k] = {}
-            for vals in all_duples:
-                if vals[0] != 0:
-                    H_2[k][vals] = Constraint( (sum( self.x_array[k][ int(self.time_expanded_network[j][0][0]) ][ int(self.time_expanded_network[j][0][1]) ][ int(self.time_expanded_network[j][1][0]) ][ int(self.time_expanded_network[j][1][1]) ] \
-                                                for j in index_out[vals]) - \
-                                                sum( self.x_array[k][ int(self.time_expanded_network[j][0][0]) ][ int(self.time_expanded_network[j][0][1]) ][ int(self.time_expanded_network[j][1][0]) ][ int(self.time_expanded_network[j][1][1]) ] \
-                                                    for j in index_ins[vals]) )**2, 'Equilibrium_Constraints')
-                    
-            H_3[k] = Constraint( (sum( self.x_array[k][ int(j[0][0]) ][ int(j[0][1]) ][ int(j[1][0]) ][ int(j[1][1]) ] \
-                                    for j in index_zero_ins) - self.y_array[k])**2, 'Vehicle_Return_Constraints')  # every vehicle has to be used and return to 0    
-
-            H_4[k] = Constraint( (sum(self.capacity_matrix[ int(self.time_expanded_network[j][0][0]) ] * self.x_array[k][ int(self.time_expanded_network[j][0][0]) ][ int(self.time_expanded_network[j][0][1]) ][ int(self.time_expanded_network[j][1][0]) ][ int(self.time_expanded_network[j][1][1]) ] \
-                                           for j in range(0,len(self.time_expanded_network)) ) + \
-                         sum(self.lambda_q[l][k]*(2**((l))) for l in self.q_range) - \
-                                  self.y_array[k]*self.max_capacity*1000 )**2, 'Capacity_Countraints')
-                            
-            H_5[k] = Constraint( (sum( self.loading_matrix[ int(self.time_expanded_network[j][0][0]) ] * self.x_array[k][ int(self.time_expanded_network[j][0][0]) ][ int(self.time_expanded_network[j][0][1]) ][ int(self.time_expanded_network[j][1][0]) ][ int(self.time_expanded_network[j][1][1]) ] \
-                                           for j in range(0,len(self.time_expanded_network)) ) + \
-                         sum(self.lambda_m[l][k]*(2**((l))) for l in self.m_range) - self.y_array[k]*self.max_ldms )**2, 'Loading_Countraints')
-                      
-        
-        # Merging the constraint into sums
-        H_2 = sum(H_2[k][vals] for k in range(self.max_num_vehicles) for vals in all_duples if vals[0] != 0 )
-
-        H_3 = sum(H_3[k] for k in range(self.max_num_vehicles))
-        H_4 = sum(H_4[k] for k in range(self.max_num_vehicles))
-        H_5 = sum(H_5[k] for k in range(self.max_num_vehicles)) 
-        return H_2, H_3, H_4, H_5
-            
-
-    def create_hamiltonian_model(self):
-        log.info('Creating Hamiltonian Model (HF)...')   
-        A_i, A_j, self.nodes = DeliveryOptimizer.nodes_range(self.time_expanded_network)
-        all_duples, index_out, index_ins, index_zero_ins = DeliveryOptimizer.nodes_expanded_points(self.time_expanded_network)
-
-        self._defining_hamiltonian_variables(A_i, A_j)
-        H_0 = self._add_hamiltonian_min_function()
-        H_1 = self._add_hamiltonian_constraints_nodes()
-        H_2, H_3, H_4, H_5 = self._add_hamiltonian_constraint_vehicle_routing(all_duples, index_out, index_ins, index_zero_ins)
-
-        # Penalization Terms
-        B = Placeholder('B')        
-        HF = H_0 + B*(H_1 + H_2 + H_3 + H_4 + H_5)
-
-        log.info('Compiling HF...') 
-        HF_model = HF.compile()
-        
-        log.info('HF Finished...') 
-        return HF_model
-
     def print_solution_summary(self, x, y):
         """Print decision variables x and y in a friendly, readable format."""
         
@@ -1252,7 +890,7 @@ class DeliveryOptimizer:
         print(' '*25 + '📊 OPTIMIZATION SOLUTION SUMMARY')
         print('='*80)
         
-        # Get solution values - handle both CBC solver objects and plain dictionaries
+        # Get solution values - handle both solver objects and dictionaries
         if isinstance(x, dict):
             connections = x
             vehicles = y
@@ -1283,38 +921,24 @@ class DeliveryOptimizer:
             
             active_arcs = []
             
-            # Check if metaheuristic was used (stores arcs at time 0)
-            is_metaheuristic = getattr(self, 'used_metaheuristic', False)
-            
-            if is_metaheuristic:
-                # For metaheuristic: iterate through all node pairs at time 0
-                for i in range(self.length):
-                    for j in range(self.length):
-                        if i != j and connections[k][i][0][j][0] > 0.5:
-                            active_arcs.append((i, 0, j, 0))
-            else:
-                # For MIP: iterate through time-expanded network
-                for arc in self.time_expanded_network:
-                    i, ti, j, tj = arc[0][0], arc[0][1], arc[1][0], arc[1][1]
-                    if connections[k][i][ti][j][tj] > 0.5:
-                        active_arcs.append((i, ti, j, tj))
+            # Metaheuristic: iterate through all node pairs at time 0
+            for i in range(self.length):
+                for j in range(self.length):
+                    if i != j and connections[k][i][0][j][0] > 0.5:
+                        active_arcs.append((i, 0, j, 0))
             
             if not active_arcs:
                 print('   (No active arcs)')
                 continue
             
-            # Display arcs with time conversion
+            # Display arcs (time index is always 0 in metaheuristic)
             for idx, (i, ti, j, tj) in enumerate(active_arcs, 1):
-                # Convert time indices to readable dates
-                _, time_origin = inv_date_index(self.discretization_constant, ti, self.min_date, self.Tau_hours)
-                _, time_dest = inv_date_index(self.discretization_constant, tj, self.min_date, self.Tau_hours)
-                
                 node_origin = "Depot" if i == 0 else f"Vendor {i}"
                 node_dest = "Depot" if j == 0 else f"Vendor {j}"
                 
                 print(f'\n   Arc {idx}: x[{k}][{i}][{ti}][{j}][{tj}] = 1')
-                print(f'   ├─ Origin: {node_origin} at {time_origin}')
-                print(f'   └─ Destination: {node_dest} at {time_dest}')
+                print(f'   ├─ Origin: {node_origin}')
+                print(f'   └─ Destination: {node_dest}')
             
             # Analyze route structure by building the actual path
             print(f'\n   Route Analysis:')
@@ -1404,7 +1028,7 @@ class DeliveryOptimizer:
             print('⚠️  OSMnx not installed. Install with: pip install osmnx')
             return
         
-        # Get solution values - handle both CBC solver objects and plain dictionaries
+        # Get solution values - handle both solver objects and dictionaries
         if isinstance(x, dict):
             connections = x
             vehicles = y
@@ -1620,14 +1244,6 @@ class DeliveryOptimizer:
                             # Skip depot→vendor arcs (vehicles start at vendors, not depot)
                             if not (i == 0 and j != 0):
                                 route_arcs.append((i, j))
-            else:
-                # For MIP: iterate through time-expanded network
-                for arc in self.time_expanded_network:
-                    i, ti, j, tj = arc[0][0], arc[0][1], arc[1][0], arc[1][1]
-                    if connections[k][i][ti][j][tj] > 0.5:
-                        # Skip depot→vendor arcs (vehicles start at vendors, not depot)
-                        if not (i == 0 and j != 0):
-                            route_arcs.append((i, j))
             
             # Build route path by following arcs (starting from vendors)
             if use_direct_routes:
@@ -1685,6 +1301,7 @@ class DeliveryOptimizer:
 
             total_cargo = sum(self.capacity_matrix[v] for v in unique_vendors if v < len(self.capacity_matrix))
             total_loading = sum(self.loading_matrix[v] for v in unique_vendors if v < len(self.loading_matrix))
+            total_linear_length = sum(self.linear_length_matrix[v] for v in unique_vendors if v < len(self.linear_length_matrix))
             total_distance = 0
             segments = []  # Store segment details for route card display
 
@@ -1867,13 +1484,44 @@ class DeliveryOptimizer:
                         # Fall back to vendor requested time if base is unavailable
                         candidate_dt = vendor_dt
 
-                    # Enforce a not-earlier-than window of allowed_early hours (if available)
+                    # Enforce vendor time windows and vendor open hours (if available)
                     if vendor_dt is not None and candidate_dt is not None:
                         vendor_dt = _to_naive(vendor_dt)
                         candidate_dt = _to_naive(candidate_dt)
                         allowed_early_hours = float(getattr(self, 'allowed_early_hours', 12))
+                        allowed_late_hours = float(getattr(self, 'allowed_late_hours', 12))
                         earliest_allowed = vendor_dt - timedelta(hours=allowed_early_hours)
+                        latest_allowed = vendor_dt + timedelta(hours=allowed_late_hours)
+                        if getattr(self, 'vendor_start_hr', None) is not None and getattr(self, 'pickup_end_hr', None) is not None:
+                            try:
+                                start_hr = int(self.vendor_start_hr)
+                                end_hr = int(self.pickup_end_hr)
+                                vendor_open_start = vendor_dt.replace(hour=start_hr, minute=0, second=0, microsecond=0)
+                                vendor_open_end = vendor_dt.replace(hour=end_hr, minute=0, second=0, microsecond=0)
+                                if vendor_open_end < vendor_open_start:
+                                    vendor_open_end = vendor_open_end + timedelta(days=1)
+                                earliest_allowed = max(earliest_allowed, vendor_open_start)
+                            except (TypeError, ValueError):
+                                pass
                         candidate_dt = max(candidate_dt, earliest_allowed)
+                        if getattr(self, 'vendor_start_hr', None) is not None and getattr(self, 'pickup_end_hr', None) is not None:
+                            try:
+                                start_hr = int(self.vendor_start_hr)
+                                end_hr = int(self.pickup_end_hr)
+                                open_start = candidate_dt.replace(hour=start_hr, minute=0, second=0, microsecond=0)
+                                open_end = candidate_dt.replace(hour=end_hr, minute=0, second=0, microsecond=0)
+                                if open_end < open_start:
+                                    open_end = open_end + timedelta(days=1)
+                                if candidate_dt < open_start:
+                                    candidate_dt = open_start
+                                elif candidate_dt > open_end and getattr(self, 'allow_night_wait', True):
+                                    next_open = open_start + timedelta(days=1)
+                                    if next_open <= latest_allowed:
+                                        candidate_dt = next_open
+                            except (TypeError, ValueError):
+                                pass
+                        if candidate_dt > latest_allowed:
+                            candidate_dt = latest_allowed
 
                     if candidate_dt is not None:
                         arrival_iso = candidate_dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -1905,6 +1553,7 @@ class DeliveryOptimizer:
             route_stats[k] = {
                 'total_cargo': total_cargo,
                 'total_loading': total_loading,
+                'total_linear_length': total_linear_length,
                 'total_distance': total_distance,
                 'num_vendors': len(unique_vendors),
                 'vendors': unique_vendors,
@@ -1937,6 +1586,8 @@ class DeliveryOptimizer:
         # Plot routes using OSRM for actual street routing
         osrm_failures = []
         route_feature_groups = {}  # Store feature groups for each route
+        depot_feature_groups = {}  # Store feature groups for each depot
+        unassigned_vendor_group = folium.FeatureGroup(name='📍 Unassigned Vendors', show=True)
         
         for vehicle_id, route in routes.items():
             route_number = route_mapping[vehicle_id]
@@ -2102,6 +1753,10 @@ class DeliveryOptimizer:
             
             if info['type'] == 'depot':
                 # Depot marker - modern design with gradient
+                depot_group = depot_feature_groups.get(node_id)
+                if depot_group is None:
+                    depot_group = folium.FeatureGroup(name=f'🏭 Depot {node_id}', show=True)
+                    depot_feature_groups[node_id] = depot_group
                 popup_html = f"""
                 <div style="font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; width: 280px;">
                     <div style="background: #6B6560; 
@@ -2127,15 +1782,20 @@ class DeliveryOptimizer:
                 """
                 # Concentric red circles for depot (no pin marker)
                 # Outer circle (unfilled)
-                folium.Circle(
+                outer_circle = folium.Circle(
                     location=[lat, lon],
                     radius=15000,
                     color='#E74C3C',
                     fill=False,
                     weight=3,
                     opacity=0.8,
+                    node_id=node_id,
+                    node_type='depot',
                     tooltip=folium.Tooltip('<b style="font-size: 14px;">🏭 Distribution Center</b>', direction='auto')
-                ).add_to(m)
+                ).add_to(depot_group)
+                m.get_root().html.add_child(folium.Element(
+                    f"<script>{outer_circle.get_name()}.on('click', function(e) {{ console.log('[NODE SUMMARY] Depot click', {node_id}); if (window.L && e) {{ L.DomEvent.stop(e); }} if (window.showNodeSummary) {{ window.showNodeSummary({node_id}); }} else {{ window.__pendingNodeSummary = {node_id}; }} }});</script>"
+                ))
                 
                 # Middle circle (unfilled)
                 folium.Circle(
@@ -2145,7 +1805,9 @@ class DeliveryOptimizer:
                     fill=False,
                     weight=3,
                     opacity=0.9,
-                ).add_to(m)
+                    node_id=node_id,
+                    node_type='depot',
+                ).add_to(depot_group)
                 
                 # Inner circle (unfilled)
                 folium.CircleMarker(
@@ -2155,7 +1817,9 @@ class DeliveryOptimizer:
                     fill=False,
                     weight=4,
                     opacity=1.0,
-                ).add_to(m)
+                    node_id=node_id,
+                    node_type='depot',
+                ).add_to(depot_group)
                 
                 # Inner circle (center point)
                 folium.CircleMarker(
@@ -2165,7 +1829,18 @@ class DeliveryOptimizer:
                     fill=False,
                     weight=3,
                     opacity=1.0,
-                ).add_to(m)
+                    node_id=node_id,
+                    node_type='depot',
+                ).add_to(depot_group)
+
+                # Invisible clickable marker to ensure depot clicks are captured
+                depot_click_html = f'<div data-node-id="{node_id}" style="width:30px;height:30px;opacity:0;"></div>'
+                folium.Marker(
+                    location=[lat, lon],
+                    icon=folium.DivIcon(html=depot_click_html, icon_size=(30, 30), icon_anchor=(15, 15)),
+                    node_id=node_id,
+                    node_type='depot'
+                ).add_to(depot_group)
                 
             else:
                 # Vendor marker - modern card design
@@ -2183,8 +1858,8 @@ class DeliveryOptimizer:
                 assigned_vehicle = visit_info.get('vehicle', 'N/A')
                 assigned_route = visit_info.get('route_number', 'N/A')
                 # Create vendor marker with blue teardrop pin
-                pin_html = '''
-                <div style="position: relative; width: 20px; height: 28px;">
+                pin_html = f'''
+                <div data-node-id="{node_id}" style="position: relative; width: 20px; height: 28px;">
                     <svg width="20" height="28" viewBox="0 0 30 40" xmlns="http://www.w3.org/2000/svg">
                         <path d="M15,0 C8.373,0 3,5.373 3,12 C3,20.25 15,40 15,40 C15,40 27,20.25 27,12 C27,5.373 21.627,0 15,0 Z" 
                               fill="#1976D2" stroke="#1565C0" stroke-width="1"/>
@@ -2194,15 +1869,30 @@ class DeliveryOptimizer:
                 '''
                 tooltip_city = info.get("city", "")
                 tooltip_name = info.get("name", f"Vendor {node_id}")
-                folium.Marker(
+                vendor_marker = folium.Marker(
                     location=[lat, lon],
                     tooltip=folium.Tooltip(f'<b>{tooltip_name}</b><br>{tooltip_city}', direction='top'),
-                    icon=folium.DivIcon(html=pin_html, icon_size=(20, 28), icon_anchor=(10, 28))
-                ).add_to(m)
+                    icon=folium.DivIcon(html=pin_html, icon_size=(20, 28), icon_anchor=(10, 28)),
+                    node_id=node_id,
+                    node_type='vendor'
+                )
+                route_num = vendor_visits.get(node_id, {}).get('route_number')
+                if route_num and route_num in route_feature_groups:
+                    vendor_marker.add_to(route_feature_groups[route_num])
+                else:
+                    vendor_marker.add_to(unassigned_vendor_group)
+                m.get_root().html.add_child(folium.Element(
+                    f"<script>{vendor_marker.get_name()}.on('click', function(e) {{ console.log('[NODE SUMMARY] Vendor click', {node_id}); if (window.L && e) {{ L.DomEvent.stop(e); }} if (window.showNodeSummary) {{ window.showNodeSummary({node_id}); }} else {{ window.__pendingNodeSummary = {node_id}; }} }});</script>"
+                ))
                 
                 log.info(f'✅ Vendor marker added to map: {info["name"]} at ({lat}, {lon})')
                 vendor_markers_added += 1
         
+        for depot_group in depot_feature_groups.values():
+            depot_group.add_to(m)
+        if unassigned_vendor_group.get_name():
+            unassigned_vendor_group.add_to(m)
+
         depot_marker_count = len(self.depots_df) if self.depots_df is not None else 1
         log.info(f'✅ COMPLETE: All node markers processed ({depot_marker_count} depots + {vendor_markers_added} vendors added)')
 
@@ -2238,7 +1928,7 @@ class DeliveryOptimizer:
         distance_formatted = f'{total_distance:,.1f}'
         
         # Get solver info
-        solver_type = 'Metaheuristic (ALNS)' if is_metaheuristic else 'Exact (MIP)'
+        solver_type = 'Metaheuristic (ALNS)'
         solving_time = getattr(self, 'secs_taken', 0)
         num_depots = len(self.depots_df) if self.depots_df is not None else 1
         num_routes = len(vehicles_used)
@@ -2472,8 +2162,12 @@ class DeliveryOptimizer:
         layer_map_lines = []
         for route_num, fg in route_feature_groups.items():
             layer_map_lines.append(f"            window.routeLayerGroups[{route_num}] = {fg.get_name()};")
+        depot_layer_lines = []
+        for depot_id, fg in depot_feature_groups.items():
+            depot_layer_lines.append(f"            window.depotLayerGroups[{int(depot_id)}] = {fg.get_name()};")
+        unassigned_group_line = f"            window.unassignedVendorGroup = {unassigned_vendor_group.get_name()};"
 
-        layer_map_js = "\n".join(layer_map_lines)
+        layer_map_js = "\n".join(layer_map_lines + depot_layer_lines + [unassigned_group_line])
 
         expose_layers_js = f"""
         <script>
@@ -2486,6 +2180,7 @@ class DeliveryOptimizer:
                 
                 window.routeMap = {map_var};
                 window.routeLayerGroups = {{}};
+                window.depotLayerGroups = {{}};
 {layer_map_js}
                 
                 console.groupCollapsed('[ROUTE HIGHLIGHT] Layer Exposure');
@@ -2551,6 +2246,7 @@ class DeliveryOptimizer:
                     console.group('[ROUTE HIGHLIGHT] Attachment Attempt #' + attempts);
                     
                     var polylines = [];
+                    var nodeLayers = [];
                     var layerTypes = {{}};
                     
                     // Scan map._layers for polylines
@@ -2561,6 +2257,9 @@ class DeliveryOptimizer:
                             var typeName = layer.constructor ? layer.constructor.name : 'unknown';
                             layerTypes[typeName] = (layerTypes[typeName] || 0) + 1;
                             
+                            if (layer.options && layer.options.node_id !== undefined && layer.options.node_id !== null) {{
+                                nodeLayers.push(layer);
+                            }}
                             if (layer instanceof L.Polyline && !(layer instanceof L.Marker)) {{
                                 polylines.push(layer);
                             }}
@@ -2571,6 +2270,7 @@ class DeliveryOptimizer:
                     
                     console.log('Layer types found:', layerTypes);
                     console.log('Polylines in map._layers:', polylines.length);
+                    console.log('Node layers in map._layers:', nodeLayers.length);
                     
                     // Also scan FeatureGroups
                     try {{
@@ -2791,6 +2491,8 @@ class DeliveryOptimizer:
                                             document.getElementById('routeTime').textContent = (stats.total_time_hours ? formatHours(stats.total_time_hours) : '-');
                                             document.getElementById('routeVolume').textContent = (stats.total_loading ? stats.total_loading.toFixed(2) + ' m³' : '-');
                                             summaryDiv.style.display = 'block';
+                                            var nodeSummaryDiv = document.getElementById('nodeSummary');
+                                            if (nodeSummaryDiv) nodeSummaryDiv.style.display = 'none';
                                             
                                             var popupTime = (performance.now() - popupStart).toFixed(2);
                                             console.log('  └─ Popup Render Time: %c' + popupTime + 'ms', 'color: #9E9E9E;');
@@ -2851,7 +2553,25 @@ class DeliveryOptimizer:
                         console.log('  ✓ Polyline [' + idx + '] (id ' + (layer._leaflet_id || 'n/a') + ') handler attached');
                     }});
                     
-                    console.log('%c✅ SUCCESS - ' + handlerCount + ' handlers attached', 'color: #4CAF50; font-weight: bold; font-size: 12px;');
+                    // Attach node summary handlers
+                    var nodeHandlerCount = 0;
+                    nodeLayers.forEach(function(layer) {{
+                        if (layer._nodeHandlerAttached) return;
+                        layer._nodeHandlerAttached = true;
+                        var nodeId = layer.options ? layer.options.node_id : null;
+                        if (nodeId === null || nodeId === undefined) return;
+                        layer.on('click', function(e) {{
+                            if (window.L && e) {{ L.DomEvent.stop(e); }}
+                            if (window.showNodeSummary) {{
+                                window.showNodeSummary(nodeId);
+                            }} else {{
+                                window.__pendingNodeSummary = nodeId;
+                            }}
+                        }});
+                        nodeHandlerCount++;
+                    }});
+                    console.log('%c✅ SUCCESS - ' + handlerCount + ' route handlers attached', 'color: #4CAF50; font-weight: bold; font-size: 12px;');
+                    console.log('%c✅ SUCCESS - ' + nodeHandlerCount + ' node handlers attached', 'color: #4CAF50; font-weight: bold; font-size: 12px;');
                     attached = true;
                     console.groupEnd();
                 }}
@@ -2895,6 +2615,10 @@ class DeliveryOptimizer:
                         var summaryDiv = document.getElementById('routeSummary');
                         if (summaryDiv) {{
                             summaryDiv.style.display = 'none';
+                        }}
+                        var nodeSummaryDiv = document.getElementById('nodeSummary');
+                        if (nodeSummaryDiv) {{
+                            nodeSummaryDiv.style.display = 'none';
                         }}
                     }}
                 }});
@@ -2950,6 +2674,36 @@ class DeliveryOptimizer:
         </div>
         """
         m.get_root().html.add_child(folium.Element(route_summary_html))
+
+        node_summary_html = """
+        <div id="nodeSummary" style="position: fixed; bottom: 160px; right: 20px; z-index: 999999;
+                    background: rgba(255, 255, 255, 0.95); padding: 12px 14px;
+                    border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+                    font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; line-height: 1.5;
+                    display: none; min-width: 160px;">
+            <div style="font-weight: 700; font-size: 13px; margin-bottom: 8px; color: #2C3E50;">
+                <span id="nodeType">Node</span> <span id="nodeTitle">-</span>
+            </div>
+            <div id="nodeNote" style="margin-bottom: 8px; color: #7F8C8D;"></div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                <span style="color: #7F8C8D;">Vendors:</span>
+                <span style="font-weight: 600;" id="nodeVendors">-</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                <span style="color: #7F8C8D;">Cargo:</span>
+                <span style="font-weight: 600;" id="nodeCargo">-</span>
+            </div>
+            <div style="display: flex; justify-content: space-between;">
+                <span style="color: #7F8C8D;">Volume:</span>
+                <span style="font-weight: 600;" id="nodeVolume">-</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; margin-top: 4px;">
+                <span style="color: #7F8C8D;">Linear:</span>
+                <span style="font-weight: 600;" id="nodeLinear">-</span>
+            </div>
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(node_summary_html))
         
         # Embed route statistics into JavaScript
         # Convert numpy types to native Python types for JSON serialization
@@ -2963,6 +2717,7 @@ class DeliveryOptimizer:
             route_stats_clean[str(k)] = {
                 'total_cargo': float(v.get('total_cargo', 0)),
                 'total_loading': float(v.get('total_loading', 0)),
+                'total_linear_length': float(v.get('total_linear_length', 0)),
                 'total_distance': float(v.get('total_distance', 0)),
                 'total_time_hours': float(total_time_hours),
                 'num_vendors': int(v.get('num_vendors', 0)),
@@ -2970,6 +2725,79 @@ class DeliveryOptimizer:
             }
         
         route_mapping_clean = {str(k): int(v) for k, v in route_mapping.items()}
+
+        # Build node summary data for vendor/depot click summaries
+        node_summary_data = {}
+        route_number_to_vehicle = {v: int(k) for k, v in route_mapping.items()}
+
+        # Vendor summaries: show the route totals for the vendor's assigned route
+        for v_id in vendor_nodes:
+            visit = vendor_visits.get(v_id, {})
+            route_num = visit.get('route_number')
+            vehicle_id = route_number_to_vehicle.get(route_num)
+            stats = route_stats_clean.get(str(vehicle_id), {})
+            node_summary_data[str(v_id)] = {
+                'title': node_info.get(v_id, {}).get('name', f'Vendor {v_id}'),
+                'type': 'Vendor',
+                'vendors': int(stats.get('num_vendors', 0)),
+                'distance': float(stats.get('total_distance', 0.0)),
+                'cargo': float(stats.get('total_cargo', 0.0)),
+                'time_hours': float(stats.get('total_time_hours', 0.0)),
+                'volume': float(stats.get('total_loading', 0.0)),
+                'linear_length': float(stats.get('total_linear_length', 0.0)),
+            }
+
+        # Depot summaries: aggregate route totals for vendors mapped to this depot
+        depot_totals = {int(d): {'vendors': 0, 'distance': 0.0, 'cargo': 0.0, 'time_hours': 0.0, 'volume': 0.0, 'linear_length': 0.0} for d in self.depot_node_ids}
+        for vehicle_id, route in routes.items():
+            stats = route_stats_clean.get(str(vehicle_id), {})
+            first_vendor = next((n for n in route if n in vendor_nodes), None)
+            if first_vendor is None:
+                continue
+            depot_id = self.vendor_depot_map.get(int(first_vendor))
+            if depot_id is None or depot_id not in depot_totals:
+                continue
+            depot_totals[depot_id]['vendors'] += int(stats.get('num_vendors', 0))
+            depot_totals[depot_id]['distance'] += float(stats.get('total_distance', 0.0))
+            depot_totals[depot_id]['cargo'] += float(stats.get('total_cargo', 0.0))
+            depot_totals[depot_id]['time_hours'] += float(stats.get('total_time_hours', 0.0))
+            depot_totals[depot_id]['volume'] += float(stats.get('total_loading', 0.0))
+            depot_totals[depot_id]['linear_length'] += float(stats.get('total_linear_length', 0.0))
+
+        for d_id, totals in depot_totals.items():
+            node_summary_data[str(d_id)] = {
+                'title': node_info.get(d_id, {}).get('name', f'Depot {d_id}'),
+                'type': 'Depot',
+                'vendors': int(totals['vendors']),
+                'distance': float(totals['distance']),
+                'cargo': float(totals['cargo']),
+                'time_hours': float(totals['time_hours']),
+                'volume': float(totals['volume']),
+                'linear_length': float(totals['linear_length']),
+            }
+
+        # Map node_id -> route numbers for filter visibility
+        node_route_map = {}
+        for v_id in vendor_nodes:
+            route_num = vendor_visits.get(v_id, {}).get('route_number')
+            if route_num:
+                node_route_map[str(v_id)] = [int(route_num)]
+
+        depot_route_map = {}
+        for vehicle_id, route in routes.items():
+            route_num = route_mapping.get(vehicle_id)
+            if route_num is None:
+                continue
+            first_vendor = next((n for n in route if n in vendor_nodes), None)
+            if first_vendor is None:
+                continue
+            depot_id = self.vendor_depot_map.get(int(first_vendor))
+            if depot_id is None:
+                continue
+            depot_route_map.setdefault(str(depot_id), set()).add(int(route_num))
+
+        for depot_id, rset in depot_route_map.items():
+            node_route_map[depot_id] = sorted(list(rset))
         
         route_stats_js = f"""
         <script>
@@ -2984,9 +2812,66 @@ class DeliveryOptimizer:
         
         var routeStatsData = {json.dumps(route_stats_clean)};
         var routeMapping = {json.dumps(route_mapping_clean)};
+        var nodeSummaryData = {json.dumps(node_summary_data)};
+        var nodeRouteMap = {json.dumps(node_route_map)};
         </script>
         """
         m.get_root().html.add_child(folium.Element(route_stats_js))
+
+        node_summary_js = """
+        <script>
+        document.addEventListener('click', function(evt) {
+            var el = evt.target && evt.target.closest ? evt.target.closest('[data-node-id]') : null;
+            if (!el) return;
+            var nodeId = el.getAttribute('data-node-id');
+            if (!nodeId) return;
+            console.log('[NODE SUMMARY] DOM click on data-node-id:', nodeId);
+            if (window.showNodeSummary) {
+                window.showNodeSummary(nodeId);
+            } else {
+                window.__pendingNodeSummary = nodeId;
+            }
+        });
+
+        window.showNodeSummary = function(nodeId) {
+            console.log('[NODE SUMMARY] showNodeSummary called for nodeId:', nodeId);
+            var data = nodeSummaryData ? nodeSummaryData[String(nodeId)] : null;
+            var summaryDiv = document.getElementById('nodeSummary');
+            if (!summaryDiv || !data) {
+                console.warn('[NODE SUMMARY] Missing summaryDiv or data', {
+                    hasDiv: !!summaryDiv,
+                    hasData: !!data,
+                    knownIds: nodeSummaryData ? Object.keys(nodeSummaryData).slice(0, 10) : []
+                });
+                return;
+            }
+
+            var nodeType = data.type || 'Node';
+            document.getElementById('nodeType').textContent = nodeType;
+            document.getElementById('nodeTitle').textContent = data.title || '-';
+            var note = (nodeType === 'Depot')
+                ? 'Totals expected to be arrived'
+                : 'Totals expected to be picked';
+            document.getElementById('nodeNote').textContent = note;
+            document.getElementById('nodeVendors').textContent = (data.vendors !== undefined ? data.vendors : '-');
+            document.getElementById('nodeCargo').textContent = (data.cargo !== undefined ? data.cargo.toFixed(0) + ' kg' : '-');
+            document.getElementById('nodeVolume').textContent = (data.volume !== undefined ? data.volume.toFixed(2) + ' m³' : '-');
+            document.getElementById('nodeLinear').textContent = (data.linear_length !== undefined ? data.linear_length.toFixed(2) + ' m' : '-');
+
+            summaryDiv.style.display = 'block';
+            var routeSummary = document.getElementById('routeSummary');
+            if (routeSummary) routeSummary.style.display = 'none';
+            console.log('[NODE SUMMARY] Summary displayed for nodeId:', nodeId);
+        }
+
+        if (window.__pendingNodeSummary !== undefined) {
+            console.log('[NODE SUMMARY] Flushing pending node summary:', window.__pendingNodeSummary);
+            window.showNodeSummary(window.__pendingNodeSummary);
+            window.__pendingNodeSummary = undefined;
+        }
+        </script>
+        """
+        m.get_root().html.add_child(folium.Element(node_summary_js))
 
         # Legend (bottom-right): vendor pin, depot marker, route + highlight
         legend_html = """

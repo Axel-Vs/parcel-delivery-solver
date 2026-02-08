@@ -1,7 +1,1 @@
-{"gap": true,
- "gap_value": 0.05,
- "max_time": 20,
- "solver_mode": "auto",
- "vendor_threshold": 10,
- "alns_max_iterations": 2500,
- "alns_time": 10}
+{"alns_max_iterations": 2500}

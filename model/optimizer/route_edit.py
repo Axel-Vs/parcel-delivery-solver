@@ -63,8 +63,10 @@ def insert_stop_best_position(
     distance_matrix,
     capacity_matrix,
     loading_matrix,
+    linear_length_matrix,
     max_capacity_kg: float,
-    max_ldms_vc: float,
+    max_volume: float,
+    max_linear_length: float,
     frozen_prefix: Optional[List[int]] = None,
     allow_new_route: bool = True,
     depot_node_ids: Optional[List[int]] = None,
@@ -76,7 +78,7 @@ def insert_stop_best_position(
 ) -> Dict[str, Any]:
     """Insert a stop into the cheapest feasible position across routes.
 
-    - Respects capacity (weight & volume).
+    - Respects capacity (weight, volume, linear length).
     - Respects frozen_prefix: positions strictly before frozen_prefix[idx]
       are immutable for that route.
     - If no feasible insertion and allow_new_route, opens [0, new_stop, 0].
@@ -113,7 +115,11 @@ def insert_stop_best_position(
             weight, volume = _route_load(route, capacity_matrix, loading_matrix, depot_node_ids)
             weight += capacity_matrix[new_stop]
             volume += loading_matrix[new_stop]
-            if weight > max_capacity_kg or volume > max_ldms_vc:
+            linear = 0.0
+            if linear_length_matrix is not None:
+                linear = sum(linear_length_matrix[node] for node in route if not _is_depot(node, depot_node_ids))
+                linear += linear_length_matrix[new_stop]
+            if weight > max_capacity_kg or volume > max_volume or (linear_length_matrix is not None and linear > max_linear_length):
                 continue
 
             # Basic time-window check for new_stop only (optional)

@@ -7,11 +7,10 @@
 *Enterprise web interface: parameter configuration and optimization results.*
 
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
-[![OR-Tools](https://img.shields.io/badge/OR--Tools-9.7%2B-orange.svg)](https://developers.google.com/optimization)
 [![Flask](https://img.shields.io/badge/Flask-3.1%2B-black.svg)](https://flask.palletsprojects.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-An elegant, enterprise-grade AI-powered route optimization platform for vehicle routing and parcel delivery. Featuring a sophisticated web interface with real-time optimization, interactive map visualization, and comprehensive network parameter configuration. Built with OR-Tools, ALNS metaheuristics, and OSRM routing integration.
+An elegant, enterprise-grade AI-powered route optimization platform for vehicle routing and parcel delivery. Featuring a sophisticated web interface with real-time optimization, interactive map visualization, and comprehensive network parameter configuration. Built with ALNS metaheuristics and OSRM routing integration.
 
 ## ✨ Features
 
@@ -28,13 +27,11 @@ An elegant, enterprise-grade AI-powered route optimization platform for vehicle 
 
 ### 🚚 Advanced Optimization
 - **Multi-Vehicle Routing** - Efficiently assigns parcels to vehicles and optimizes delivery routes
-- **Dual Solver Architecture** - CBC MIP for exact solutions + ALNS metaheuristic for large-scale problems
 - **K-Medoids Clustering** - Intelligent geographical grouping using PAM algorithm on travel time matrix
   - Creates 12+ clusters for 58 vendors (target: 3 vendors per cluster)
   - Uses real travel distances, not Euclidean coordinates
   - Identifies extreme outliers for dedicated routes
 - **12 Network Parameters** - Comprehensive configuration for depot hours, driving limits, vehicle capacity
-- **Smart Auto-Scaling** - Automatically switches to metaheuristic for datasets with 20+ vendors
 - **Selective Route Fixing** - Only fixes violated routes instead of full fallback to trivial solution
 - **Route Merging Optimization** - Intelligently combines routes when feasible, maintaining constraints
 - **Scalable to 50+ Vendors** - Handles large datasets with advanced ALNS optimization
@@ -45,8 +42,10 @@ An elegant, enterprise-grade AI-powered route optimization platform for vehicle 
 - **Professional Vendor Pins** - Elegant blue gradient teardrop markers, perfectly anchored at exact coordinates
 - **Depot Highlights** - Unfilled concentric red circles marking distribution center
 - **Route Visualization** - Color-coded polylines with real road geometry
-- **Route Visibility Control** - Excel-style filter: Select All/Deselect All from results panel
+- **Route Visibility Control** - Excel-style filters for routes, vendors, and weeks
+- **Week Filter** - Uses each route’s start date (first vendor requested loading)
 - **Segment Details** - Click routes for right-side popup with distance, duration, speed metrics
+- **Vendor/Depot Summaries** - Click vendor or depot symbols for concise totals
 
 ### 📊 Comprehensive Analytics
 - **Route Statistics** - Total routes, vendors, distance, cargo weight, loading volume
@@ -86,12 +85,14 @@ Comprehensive route details with 14 columns per stop:
 - **Excel-Style Route Filter**:
   - Collapsible filter panel with transparent styling
   - Select All/Deselect All for quick toggling
-  - Individual route visibility controls
-  - Real-time map layer synchronization
+  - Route, vendor, and week filters
+  - Week filter based on route start date (first vendor requested loading)
+  - Real-time map layer synchronization (routes + symbols)
 - **Professional Markers**:
   - **Depot**: Unfilled concentric red circles (three rings) marking distribution hub
   - **Vendors**: Elegant blue gradient pins with precise coordinate anchoring
 - **Segment Details**: Click any route to display metrics (distance, duration, speed) in right-side popup
+- **Vendor/Depot Summaries**: Click vendor or depot symbols for concise totals
 ### Data Processing
 - CSV-based vendor and parcel data
 - Geocoding with persistent cache
@@ -158,10 +159,9 @@ python app.py
    - **Vendor Hours**: Start (6) and Pickup End (14) times
    - **Time Windows**: Early Arrival (24h) and Late Arrival (24h) penalties
   - **Loading & Driving**: Loading Time (2h), Max Driving (70h), Driving Start/Stop (6-21)
-   - **Vehicle Capacity**: Max Weight (30 kg), Max Loading Meters (70 m³)
+- **Vehicle Capacity**: Max Weight (30 kg), Max Volume (90 m³), Max Linear Length (16.1 m)
 
 5. **Run optimization**
-   - Check "ALNS METAHEURISTIC" for large datasets (20+ vendors)
    - Click "INITIATE OPTIMIZATION"
    - Watch the progress message: "Finding optimal routes with minimal distance and fewest vehicles required"
 
@@ -263,18 +263,12 @@ The web interface provides 12 configurable network parameters in an elegant 2-co
 | **Driving Start** | Earliest driving start time | 6 | Hour |
 | **Driving Stop** | Latest driving end time | 21 | Hour |
 | **Max Weight** | Maximum vehicle cargo weight | 30 | kg |
-| **Max Loading Meters** | Maximum vehicle volume capacity | 70 | m³ |
+| **Max Volume** | Maximum vehicle volume capacity | 90 | m³ |
+| **Max Linear Length** | Maximum vehicle linear capacity | 16.1 | m |
 
 ### Model Parameters (`model/config/model_params.txt`)
 ```ini
-max_nodes = 100                   # Maximum number of nodes to process
-solver_time_limit = 900          # Solver timeout in seconds (15 minutes)
-mip_gap_tolerance = 0.1          # MIP optimality gap (10%)
-optimization_weight = 0.5        # Balance: distance (0.5) vs vehicle count (0.5)
-use_metaheuristic = True         # Auto-switch to ALNS for large problems
-alns_iterations = 2000           # ALNS: number of iterations
-alns_temperature = 1500          # ALNS: initial temperature
-alns_cooling = 0.997             # ALNS: cooling rate
+alns_max_iterations = 2500       # ALNS: number of iterations
 ```
 
 ### Network Parameters (`model/config/network_params.txt`)
@@ -291,7 +285,8 @@ max_driving = 70                 # Maximum driving hours
 driving_starts = 6               # Earliest driving start
 driving_stop = 21                # Latest driving end
 max_weight = 30                  # Maximum cargo weight (kg)
-max_ldms = 70                    # Maximum loading meters (m³)
+max_volume = 90                 # Maximum volume (m³)
+max_linear_length = 16.1        # Maximum linear length (m)
 ```
 
 ### Simulation Parameters (`model/config/simulation_params.txt`)
@@ -406,7 +401,7 @@ Distance reduction achieved: 24.03%
 
 ### Saved Files
 - `results/optimization/routes_[date]_metaheuristic.html` - Interactive map (ALNS solver)
-- `results/optimization/routes_[date].html` - Interactive map (CBC solver)
+- `results/optimization/routes_[date].html` - Interactive map
 - `results/optimization/solution[N]_[date].npy` - Numpy arrays with decision variables
 - `data/geocode_cache.csv` - Cached geocoding results
 
@@ -439,13 +434,12 @@ parcel-delivery-solver/
 │   │   ├── model_params.txt      # Solver parameters
 │   │   ├── network_params.txt    # 12 network parameters (depot, driving, capacity)
 │   │   └── simulation_params.txt # Simulation settings
-│   ├── graph_creator/            # Time-expanded network generation
+│   ├── graph_creator/            # Graph creation utilities
 │   │   └── graph_creator.py
 │   ├── optimizer/                # Optimization model
-│   │   └── delivery_model.py    # ALNS + CBC optimization with Folium maps
+│   │   └── delivery_model.py    # ALNS optimization with Folium maps
 │   └── utils/                    # Utility functions
 │       ├── geocoder.py           # Address geocoding
-│       ├── pre_processing.py     # Data preprocessing
 │       └── project_utils.py      # OSRM distance/routing utilities
 ├── example/
 │   └── simulator.py              # Command-line simulation script
@@ -460,35 +454,17 @@ parcel-delivery-solver/
 ### Web Application Stack
 - **Backend**: Flask 3.1+ (Python web framework)
 - **Frontend**: Vanilla HTML/CSS/JavaScript with elegant design system
-- **Optimization**: OR-Tools 9.7+ with ALNS metaheuristics
+- **Optimization**: ALNS metaheuristics
 - **Mapping**: Folium with OSRM routing integration
 - **Colors**: Light beige backgrounds (#FAFAF8, #F7F7F5), black text/buttons, deep navy branding (#1f2d3d)
 
 ## 🧮 Algorithms & Methods
 
-### Dual Solver Architecture
-
-The system intelligently selects between two optimization approaches:
-
-#### 1. OR-Tools CBC Solver (Small-Medium Problems)
-The **Coin-or Branch and Cut (CBC)** solver provides exact solutions for smaller datasets (typically <20 vendors).
+### ALNS Metaheuristic
+The **Adaptive Large Neighborhood Search (ALNS)** provides high-quality solutions for large datasets.
 
 **Key Features:**
-- Linear programming with integer constraints
-- Branch and cut algorithm for optimal solutions
-- Configurable time limits and gap tolerance
-- Requires time-expanded network for temporal modeling
-
-**Optimization Objectives:**
-- Minimize total distance traveled
-- Minimize number of vehicles used
-- Balance trade-off via `optimization_weight` parameter
-
-#### 2. ALNS Metaheuristic (Large-Scale Problems)
-The **Adaptive Large Neighborhood Search (ALNS)** provides high-quality solutions for large datasets (20+ vendors).
-
-**Key Features:**
-- Route-based optimization (no time-expansion needed)
+- Route-based optimization (no time expansion)
 - Adaptive destroy/repair operators
 - Simulated annealing acceptance criterion
 - Scales to 50+ vendors efficiently
@@ -500,22 +476,6 @@ start_temperature = 1500      # Initial acceptance temperature
 cooling_rate = 0.997          # Temperature decay
 removal_fraction = 0.15-0.45  # Vendors removed per iteration
 local_search_iterations = 100 # Local optimization steps
-```
-
-**When to Use Each:**
-- **CBC MIP**: Exact solutions, <20 vendors, time windows critical
-- **ALNS**: Fast solutions, 20-100+ vendors, large date ranges
-
-### Time-Expanded Network
-Discretizes time into fixed periods (e.g., 4 hours) to:
-- Model temporal constraints efficiently
-- Handle delivery time windows
-- Optimize arrival schedules
-- Reduce problem complexity
-
-**Time Discretization Formula:**
-```python
-discrete_time = ceil(travel_time_seconds / 3600 / discretization_constant)
 ```
 
 ### Distance Matrix Calculation
@@ -616,14 +576,11 @@ The Intelligent Router features an elegant, enterprise-grade design system:
 
 **Issue: "No feasible solution found"**
 - Solutions:
-  - Switch to metaheuristic solver (check "ALNS METAHEURISTIC" in web interface)
-  - Increase `solver_time_limit` in model_params.txt
   - Adjust network parameters: increase Max Driving, adjust time windows
-  - Reduce dataset size or increase vehicle capacities (Max Weight, Max Loading Meters)
+  - Reduce dataset size or increase vehicle capacities (Max Weight, Max Volume, Max Linear Length)
 
 **Issue: "Optimization takes too long"**
-- Solution: Enable ALNS metaheuristic for datasets with 20+ vendors
-- Reduce `alns_iterations` in model_params.txt for faster (but potentially less optimal) solutions
+- Solution: Reduce `alns_max_iterations` in model_params.txt for faster (but potentially less optimal) solutions
 - Consider reducing date range in simulation parameters
 
 **Issue: "Geocoding failed"**
@@ -634,7 +591,7 @@ The Intelligent Router features an elegant, enterprise-grade design system:
 - This is normal for vendors at the same location - the system handles it with circular markers
 
 **Issue: "max() iterable argument is empty"**
-- Solution: Use metaheuristic solver for large date ranges (enable ALNS checkbox)
+- Solution: Reduce dataset size or validate date ranges
 
 **Issue: "Routes not visible on map"**
 - Solution: Check the Routes dropdown in top-right - ensure routes are toggled on
@@ -681,7 +638,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🙏 Acknowledgments
 
-- **[Google OR-Tools](https://developers.google.com/optimization)** - Powerful optimization solver
 - **[OSRM](http://project-osrm.org/)** - Open Source Routing Machine
 - **[Folium](https://python-visualization.github.io/folium/)** - Interactive map visualization
 - **[Nominatim](https://nominatim.org/)** - OpenStreetMap geocoding service
@@ -701,7 +657,6 @@ For questions, issues, or suggestions:
 
 ## 📚 Additional Resources
 
-- [OR-Tools Documentation](https://developers.google.com/optimization/routing)
 - [Vehicle Routing Problem](https://en.wikipedia.org/wiki/Vehicle_routing_problem)
 - [OSRM API Documentation](http://project-osrm.org/docs/v5.5.1/api/)
 - [Time-Expanded Networks](https://en.wikipedia.org/wiki/Time-expanded_network)

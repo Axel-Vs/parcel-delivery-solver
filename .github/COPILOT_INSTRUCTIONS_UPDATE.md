@@ -14,25 +14,19 @@
    - Clarified capacity constraint handling and time window feasibility checks
    - Explained the `allow_new_route` parameter
 
-### 3. **New Route Identifier Documentation**
-   - Added `route_identifier.py` module for consistent route naming
-   - Documented `RouteIdentifier` class and display name format
-   - Explained GeoJSON serialization for frontend integration
-   - Referenced route number extraction utility
-
-### 4. **Enhanced Common Pitfalls Section**
+### 3. **Enhanced Common Pitfalls Section**
    - Added "Swapped Coordinates" detection logic
    - Added "APP_STATE Sync" considerations for matrix alignment
    - Added "Frozen Prefix Validation" off-by-one error warnings
 
-### 5. **New Error Handling Patterns Section**
+### 4. **New Error Handling Patterns Section**
    - Validation workflow details (`validate_coordinates()` return structure)
    - Date parsing graceful degradation patterns
    - CSV column flexibility approach (`_first_present()`)
    - Flask API error patterns and logging
    - Solver auto-recovery mechanisms
 
-### 6. **Enhanced Testing & Dependencies Section**
+### 5. **Enhanced Testing & Dependencies Section**
    - Added "Testing Patterns" subsection
    - Added "Common Dev Workflows" with three practical examples:
      - Debugging coordinate issues
@@ -40,9 +34,8 @@
      - Inspecting optimization runs via API
    - Cross-referenced test data files
 
-### 7. **Updated File Organization**
+### 6. **Updated File Organization**
    - Added `coordinate_validator.py` with detailed description
-   - Added `route_identifier.py` with detailed description
    - Clarified route_edit.py purpose and scope
 
 ## Key Additions for AI Agent Productivity

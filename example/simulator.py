@@ -2,27 +2,79 @@ from pathlib import Path
 import sys
 import pandas as pd
 import os
+import json
+import datetime
 
-# Ensure project root is on sys.path before importing model modules
+# Ensure project root is first on sys.path before importing model modules
 project_root = Path(__file__).resolve().parent.parent
-sys.path.append(str(project_root))
+sys.path.insert(0, str(project_root))
 
 from model.graph_creator.graph_creator import Graph
 from model.optimizer.delivery_model import DeliveryOptimizer
 from model.utils.project_utils import *
+
+
+def import_parameters(parameters_path):
+    network_params_file_name = 'network_params.txt'
+    model_params_file_name = 'model_params.txt'
+    simulation_params_file_name = 'simulation_params.txt'
+
+    network_params_path = os.path.join(parameters_path, network_params_file_name)
+    model_params_path = os.path.join(parameters_path, model_params_file_name)
+    simulation_params_path = os.path.join(parameters_path, simulation_params_file_name)
+
+    network_params = json.load(open(network_params_path))
+    model_params = json.load(open(model_params_path))
+    simulation_params = json.load(open(simulation_params_path))
+
+    return network_params, model_params, simulation_params
+
+
+def periods_generator(simulation_period, simulation_interval, vendor_start_hr, pickup_end_hr):
+    start = simulation_period[0]
+    end = simulation_period[1]
+    delta = datetime.timedelta(days=simulation_interval)
+
+    start = datetime.datetime.strptime(start, '%Y-%m-%d')
+    end = datetime.datetime.strptime(end, '%Y-%m-%d')
+    t = start
+
+    periods = []
+    while t <= end:
+        if t + delta < end:
+            start_dt = t.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(hours=vendor_start_hr)
+            end_dt = (t + delta).replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(hours=pickup_end_hr)
+            periods.append([start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                            end_dt.strftime("%Y-%m-%d %H:%M:%S")])
+            t = t + (delta + datetime.timedelta(days=1))
+        else:
+            start_dt = t.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(hours=vendor_start_hr)
+            end_dt = end.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(hours=pickup_end_hr)
+            periods.append([start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                            end_dt.strftime("%Y-%m-%d %H:%M:%S")])
+            t = t + (delta + datetime.timedelta(days=1))
+    return periods
 
 # Get the current working directory
 main_root = os.getcwd()
 
 # Define paths for configuration files, data, and results
 parameters_path = os.path.join(main_root, 'model/config')
-data_path = os.path.join(main_root, 'data/amazon_test_dataset.csv')  # Using medium test with 5 vendors
+data_path = os.environ.get(
+    'SIM_DATA_PATH',
+    os.path.join(main_root, 'data/amazon_test_dataset_small.csv')
+)
 results_path = os.path.join(main_root, 'results/optimization')
 
 print('\nStarting Simulation\n')
 
 # Import parameters for the simulation from configuration files
 network_params, model_params, simulation_params = import_parameters(parameters_path)
+if os.environ.get('SIM_ALNS_ITERS'):
+    try:
+        model_params['alns_max_iterations'] = int(os.environ['SIM_ALNS_ITERS'])
+    except ValueError:
+        pass
 
 # Read dataset (attempt to normalize to the fields expected by the Graph code)
 df_raw = pd.read_csv(data_path)
@@ -38,18 +90,9 @@ if 'Vendor Name' in df.columns:
     df['vendor Name'] = df['Vendor Name']
     df['vendor Name'] = df['vendor Name'].astype(str)
 
-# Map gross weight / loading meters
+# Map gross weight / volume / linear length
 if 'Vendor Gross Weight' in df.columns:
     df['Total Gross Weight'] = df['Vendor Gross Weight']
-if 'Vendor Volume in m3' in df.columns:
-    df['Calculated Loading Meters'] = df['Vendor Volume in m3']
-elif 'Vendor Linear Length' in df.columns:
-    df['Calculated Loading Meters'] = df['Vendor Linear Length']
-elif 'Vendor Loading Meters' in df.columns:
-    df['Calculated Loading Meters'] = df['Vendor Loading Meters']
-elif 'Vendor Dimensions in m3' in df.columns:
-    # fallback: use dimensions as a proxy
-    df['Calculated Loading Meters'] = df['Vendor Dimensions in m3']
 
 # Normalize requested loading/delivery names and formats
 if 'Requested Loading Date' in df.columns:
@@ -84,21 +127,14 @@ if simulation_params.get('perform_geocoding', False):
         print('\n  ⚙️  Normalizing postcodes...')
         for col in ['Vendor Postcode', 'Recipient Postcode', 'vendor Postcode', 'recipient Postcode']:
             if col in df.columns:
-                # Convert floats that represent postcodes to integer-like strings
-                # Handle float postcodes like 98101.0 -> '98101', but preserve trailing zeros in actual postcodes
-                def normalize_postcode(v):
-                    if pd.isna(v):
-                        return ''
-                    s = str(v).strip()
-                    # Only remove .0 if it's actually a float representation (contains decimal point)
-                    if '.' in s and s.endswith('.0'):
-                        try:
-                            # Convert to float then int to remove .0 safely
-                            return str(int(float(s)))
-                        except:
-                            return s
-                    return s
-                df[col] = df[col].apply(normalize_postcode)
+                # Remove trailing ".0" from float-like postcodes while keeping other formats intact.
+                df[col] = (
+                    df[col]
+                    .fillna('')
+                    .astype(str)
+                    .str.strip()
+                    .str.replace(r'\.0$', '', regex=True)
+                )
         print('  ✓ Postcodes normalized')
 
         # First pass: populate coordinates where we have cached answers or quick-lookups.
@@ -216,128 +252,140 @@ for w in [0.5]:
         if len(vendors_df) >= 1:  # Process if there are vendors in this period
             print(f'Number of vendors extracted: {len(vendors_df)}')
 
-            # Determine solver mode BEFORE creating time-expanded network
-            solver_mode = model_params.get('solver_mode', 'auto')
-            vendor_threshold = model_params.get('vendor_threshold', 15)
             num_vendors = len(vendors_df)
             
-            # Auto mode: choose solver based on problem size
-            if solver_mode == 'auto':
-                use_metaheuristic = num_vendors > vendor_threshold
-            elif solver_mode == 'metaheuristic' or solver_mode == 'alns':
-                use_metaheuristic = True
-            else:  # 'exact' or 'mip'
-                use_metaheuristic = False
-
             print('\n Create Graph')
-            # Create and discretize the Graph; wrap network calls to avoid hard failure during smoke runs
+            # Create the Graph; wrap network calls to avoid hard failure during smoke runs
             try:
                 net.create_network(complete_coordinates, vendors_df)
-                net.discretize()
-                
-                # Only create time-expanded network for exact MIP solver
-                # Metaheuristic doesn't need it and it can fail with large date ranges
-                if not use_metaheuristic:
-                    time_expanded_network, complete_time_index, time_expanded_network_index = net.create_time_network(vendors_df, period[0], period[1])
-                    
-                    # Print network statistics for MIP solver
-                    print(f'Time-expanded network created: {len(time_expanded_network)} arcs')
-                    print(f'Unique nodes in network: {len(set([arc[0][0] for arc in time_expanded_network] + [arc[1][0] for arc in time_expanded_network]))}')
-                    print(f'Time index range: {min(time_expanded_network_index)} to {max(time_expanded_network_index)}')
-                    
-                    # Check arc distribution per node
-                    from collections import Counter
-                    node_arcs = Counter([arc[0][0] for arc in time_expanded_network] + [arc[1][0] for arc in time_expanded_network])
-                    print(f'\nArcs per node: {dict(sorted(node_arcs.items()))}')
-                    
-                    print(f'\nSample arcs (first 10):')
-                    for i, arc in enumerate(time_expanded_network[:10]):
-                        print(f'  Arc {i}: {arc} -> Node {arc[0][0]} at time {arc[0][1]} → Node {arc[1][0]} at time {arc[1][1]}')
-                else:
-                    # For metaheuristic, use dummy time-expanded network and set required attributes
-                    print('✓ Skipping time-expanded network (not needed for metaheuristic)')
-                    time_expanded_network = []  # Empty list, won't be used
-                    complete_time_index = []
-                    time_expanded_network_index = []
-                    # Set dummy Tau_hours attribute (metaheuristic doesn't use it)
-                    net.Tau_hours = [0]
-                    net.min_date = pd.to_datetime(period[0])
+                print('✓ Skipping network expansion (ALNS only)')
+                net.min_date = pd.to_datetime(period[0])
             except Exception as e:
                 print('Skipping network creation due to error (likely ORS/network):', e)
                 continue
 
-            # Create cargo and loading matrices
-            capacity_matrix = cargo_vector(vendors_df)
-            loading_matrix = loading_vector(vendors_df)
+            depot_node_ids = depots_df['node_id'].tolist() if depots_df is not None and 'node_id' in depots_df.columns else []
+            vendor_node_ids = vendors_df['node_id'].tolist() if 'node_id' in vendors_df.columns else list(range(1, len(vendors_df) + 1))
+            vendor_depot_map = {}
+            if 'depot_node_id' in vendors_df.columns:
+                vendor_depot_map = {
+                    int(v_node): int(d_node)
+                    for v_node, d_node in zip(vendor_node_ids, vendors_df['depot_node_id'])
+                    if pd.notna(d_node)
+                }
+
+            # Align max_driving with actual travel times (same approach as app.py)
+            calculated_max_driving = None
+            min_default_max_driving = 70.0
+            if net.time_distance_matrix is not None and len(net.time_distance_matrix) > 1:
+                vendor_to_depot_times = []
+                for v_node in vendor_node_ids:
+                    depot_node = vendor_depot_map.get(int(v_node))
+                    if depot_node is None:
+                        continue
+                    if v_node < len(net.time_distance_matrix) and depot_node < len(net.time_distance_matrix):
+                        vendor_to_depot_times.append(net.time_distance_matrix[v_node][depot_node])
+                if vendor_to_depot_times:
+                    max_vendor_depot_time_hours = max(vendor_to_depot_times) / 3600.0
+                    service_time_hours = float(network_params.get('loading', 2))
+                    vendor_count = len(vendor_node_ids)
+                    vendor_to_vendor_times = []
+                    matrix_len = len(net.time_distance_matrix)
+                    for i in vendor_node_ids:
+                        if i >= matrix_len:
+                            continue
+                        for j in vendor_node_ids:
+                            if i != j and j < matrix_len:
+                                vendor_to_vendor_times.append(net.time_distance_matrix[i][j])
+                    max_vendor_to_vendor_hours = (max(vendor_to_vendor_times) / 3600.0) if vendor_to_vendor_times else 0.0
+                    target_routes = max(2, int(np.ceil(vendor_count / 3))) if vendor_count > 1 else 1
+                    stops_per_route = max(1, int(np.ceil(vendor_count / target_routes)))
+                    estimated_multi_stop = (
+                        max_vendor_depot_time_hours +
+                        max_vendor_to_vendor_hours * max(0, stops_per_route - 1) +
+                        service_time_hours * stops_per_route +
+                        2.0
+                    )
+                    calculated_max_driving = max(
+                        max_vendor_depot_time_hours + service_time_hours + 2.0,
+                        estimated_multi_stop,
+                        min_default_max_driving
+                    )
+                    if float(network_params.get('max_driving', 0)) < calculated_max_driving:
+                        network_params['max_driving'] = calculated_max_driving
+                        print(f"✅ Max driving time set: {calculated_max_driving:.1f}h")
+
+            # Create cargo and loading matrices aligned to node_id
+            max_node_id = max([0] + depot_node_ids + vendor_node_ids)
+            matrix_size = max_node_id + 1
+            capacity_matrix = np.zeros(matrix_size, dtype=float)
+            loading_matrix = np.zeros(matrix_size, dtype=float)
+            linear_length_matrix = np.zeros(matrix_size, dtype=float)
+            for _, row in vendors_df.iterrows():
+                v_node = int(row.get('node_id', 0))
+                if v_node <= 0 or v_node >= matrix_size:
+                    continue
+                capacity_matrix[v_node] = float(row.get('Total Gross Weight', 0) or 0)
+                loading_matrix[v_node] = float(row.get('Vendor Volume in m3', row.get('Vendor Dimensions in m3', 0)) or 0)
+                linear_length_matrix[v_node] = float(row.get('Vendor Linear Length', 0) or 0)
+            service_time_minutes = float(network_params.get('loading', 2)) * 60.0
+            service_time_matrix = np.zeros(matrix_size)
+            for v_node in vendor_node_ids:
+                if v_node < matrix_size:
+                    service_time_matrix[v_node] = service_time_minutes
             
             # Print solver information (use_metaheuristic already determined above)
-            if use_metaheuristic:
-                print(f'\n 🚀 Solver: ALNS Metaheuristic (fast mode for {num_vendors} vendors)')
-                print(f'   - Max iterations: {model_params.get("alns_max_iterations", 1000)}')
-                print(f'   - Problem size: {num_vendors} vendors')
-            else:
-                print(f'\n 🎯 Solver: OR-Tools MIP (exact mode for {num_vendors} vendors)')
-                print(f'   - Max solving time: {model_params.get("max_time", 360)} minutes')
-                print(f'   - MIP gap tolerance: {model_params.get("gap_value", 0.05)}')
-                print(f'   - Network size: {len(time_expanded_network)} arcs, {num_vendors+1} nodes')
+            print(f'\n 🚀 Solver: ALNS Metaheuristic (fast mode for {num_vendors} vendors)')
+            print(f'   - Max iterations: {model_params.get("alns_max_iterations", 1000)}')
+            print(f'   - Problem size: {num_vendors} vendors')
             
             try:
                 # Create optimizer instance
                 optimizer = DeliveryOptimizer(
                     evaluation_period=period,
                     discretization_constant=net.discretization_constant,
-                    time_expanded_network=time_expanded_network,
-                    time_expanded_network_index=time_expanded_network_index,
-                    Tau_hours=net.Tau_hours,
                     distance_matrix=net.distance_matrix,
                     time_distance_matrix=net.time_distance_matrix,
-                    disc_time_distance_matrix=net.disc_time_distance_matrix,
                     capacity_matrix=capacity_matrix,
                     loading_matrix=loading_matrix,
+                    linear_length_matrix=linear_length_matrix,
+                    service_time_matrix=service_time_matrix,
                     max_capacity=network_params['max_weight'],
                     max_volume=network_params.get('max_volume', 90),
                     max_linear_length=network_params.get('max_linear_length', 16.1),
                     max_driving=network_params['max_driving'],
-                    is_gap=model_params.get('gap', False),
-                    mip_gap=model_params.get('gap_value', 0.05),
-                    maximum_minutes=model_params.get('max_time', 360),
-                    vendors_df=vendors_df
+                    vendors_df=vendors_df,
+                    depots_df=depots_df,
+                    depot_node_ids=depot_node_ids,
+                    vendor_node_ids=vendor_node_ids,
+                    vendor_depot_map=vendor_depot_map,
+                    vendor_start_hr=network_params.get('vendor_start_hr'),
+                    pickup_end_hr=network_params.get('pickup_end_hr'),
+                    starting_depot=network_params.get('starting_depot'),
+                    closing_depot=network_params.get('closing_depot'),
+                    allow_night_wait=network_params.get('allow_night_wait', True)
                 )
                 
                 # Set minimum date for time conversion in output
                 optimizer.min_date = net.min_date
                 
-                # Solve using selected method
-                if use_metaheuristic:
-                    # Use ALNS metaheuristic solver
-                    status, x, y = optimizer.solve_with_metaheuristic(
-                        w=w,
-                        max_iterations=model_params.get('alns_max_iterations', 1000),
-                        verbose=True
-                    )
-                else:
-                    # Use exact MIP solver
-                    print('   - Building optimization model...')
-                    print(f'   - Optimizing with weight w={w} (distance) vs {1-w} (vehicles)')
-                    optimizer.create_model(w=w)
-                    
-                    print(f'   - Nodes to visit: {optimizer.nodes}')
-                    print(f'   - Constraint: each node visited exactly once')
-                    print('   - Solving (this may take several minutes)...')
-                    status, x, y = optimizer.solve_model()
+                # Solve using ALNS metaheuristic solver
+                status, x, y = optimizer.solve_with_metaheuristic(
+                    w=w,
+                    max_iterations=model_params.get('alns_max_iterations', 1000),
+                    verbose=False
+                )
                 
                 # Print results
                 print('\n Results:')
-                print(f'   - Solver status: {status} (0=optimal, 1=feasible, 2=infeasible)')
+                print(f'   - Solver status: {status} (0=feasible, 2=infeasible)')
                 
-                if status == 0:  # OPTIMAL
+                if status == 0:  # FEASIBLE
                     # Print friendly solution summary
                     optimizer.print_solution_summary(x, y)
                     
-                    optimizer.print_status(status, x, y)
-                    
                     # Plot the routes with solver type in filename
-                    solver_type = 'metaheuristic' if use_metaheuristic else 'exact'
+                    solver_type = 'alns'
                     plot_path = os.path.join(results_path, f'routes_{period[0][:10]}_{solver_type}.html')
                     os.makedirs(results_path, exist_ok=True)
                     optimizer.plot_routes(x, y, show_plot=True, save_path=plot_path)

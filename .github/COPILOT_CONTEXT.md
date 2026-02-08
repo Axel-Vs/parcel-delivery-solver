@@ -117,7 +117,7 @@ tail -f /tmp/flask_app.log
 ### Sidebar (Left)
 - **Data Input**: Upload CSV or load past run
 - **Parameters**: 12 controls (max_driving, max_weight, loading time, etc.)
-- **Optimize**: Runs solver (MIP for <20 vendors, ALNS for ≥20)
+- **Optimize**: Runs ALNS solver
 
 ### Main Area (3 Tabs)
 1. **Optimizer Tab** (default)
@@ -135,22 +135,9 @@ tail -f /tmp/flask_app.log
 
 ---
 
-## ⚙️ Solver Auto-Selection
-
-```
-if num_vendors < 20:
-    Use MIP (exact optimizer) → guaranteed optimal
-else:
-    Use ALNS (metaheuristic) → fast heuristic (~90s for 58 vendors)
-```
-
-**Override**: Check "ALNS Metaheuristic" checkbox to force metaheuristic for any size
-
----
-
 ## 📊 Configuration Files
 
-- **Runtime**: `model_params.txt` (MIP gap, time limits, thresholds)
+- **Runtime**: `model_params.txt` (ALNS iterations)
 - **Default parameters**: Hardcoded in `app.py` lines 180-210
 - **Live override**: Via web UI parameter inputs
 

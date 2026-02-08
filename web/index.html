@@ -505,6 +505,12 @@
             left: 0;
         }
 
+        .preview-vendor-icon {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+        }
+
         .map-placeholder {
             color: var(--text-muted);
             font-size: 72px;
@@ -1083,6 +1089,10 @@
                             <span class="summary-label">TOTAL VOLUME</span>
                             <span class="summary-value" id="summaryVolume">0 m³</span>
                         </div>
+                        <div class="summary-row">
+                            <span class="summary-label">TOTAL LINEAR</span>
+                            <span class="summary-value" id="summaryLinear">0 m</span>
+                        </div>
                     </div>
 
                     <!-- Action Buttons -->
@@ -1117,7 +1127,7 @@
 
                         <div class="param-group">
                             <label class="param-label">Pickup End <span style="color: #9A9892;">Hour</span></label>
-                            <input type="number" class="param-input" id="pickupEndHr" value="14" min="0" max="23">
+                            <input type="number" class="param-input" id="pickupEndHr" value="16" min="0" max="23">
                         </div>
 
                         <div class="param-group">
@@ -1158,10 +1168,10 @@
                         </div>
                     </div>
 
-                    <div class="param-group" style="margin-top: 12px;">
+                    <div class="param-group" style="margin-top: 6px;">
                         <div class="checkbox-group">
-                            <input type="checkbox" id="useMetaheuristic" checked>
-                            <label class="param-label" for="useMetaheuristic" style="margin: 0;">ALNS Metaheuristic</label>
+                            <input type="checkbox" id="allowNightWait" checked>
+                            <label class="param-label" for="allowNightWait" style="margin: 0;">Allow Night Waiting (22:00–05:00)</label>
                         </div>
                     </div>
 
@@ -1244,9 +1254,21 @@
                             <!-- Add Delivery -->
                             <div style="background: var(--surface-bg); border: 1px solid var(--border-color); padding: 20px; border-radius: 10px;">
                                 <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.05em;">Add Delivery</div>
-                                <input type="text" class="param-input" id="addDeliveryVendor" placeholder="Vendor name or ID" style="margin-bottom: 10px;">
+                                <input type="text" class="param-input" id="addDeliveryVendorName" value="Oak Logistics" placeholder="Vendor name" style="margin-bottom: 8px;">
+                                <input type="text" class="param-input" id="addDeliveryAddress" value="7421 Oak Meadow Dr, Austin, TX 78745, United States" placeholder="Full address (street, city, country)" style="margin-bottom: 8px;">
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px;">
+                                    <input type="number" class="param-input" id="addDeliveryWeight" value="350" placeholder="Weight (kg)" step="0.1">
+                                    <input type="number" class="param-input" id="addDeliveryVolume" value="5.64" placeholder="Volume (m³)" step="0.01">
+                                </div>
+                                <input type="number" class="param-input" id="addDeliveryLinearLength" value="6.7" placeholder="Linear Length (m)" step="0.01" style="margin-bottom: 8px;">
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px;">
+                                    <input type="datetime-local" class="param-input" id="addDeliveryRequestedLoading" value="2023-10-23T10:30">
+                                    <input type="datetime-local" class="param-input" id="addDeliveryRequestedDelivery" value="2023-10-25T11:00">
+                                </div>
+                                <input type="text" class="param-input" id="addDeliveryDepotName" value="Amazon Distribution Center Seattle" placeholder="Depot name" style="margin-bottom: 8px;">
+                                <input type="text" class="param-input" id="addDeliveryDepotAddress" value="456 Distribution Rd, Seattle, WA 98101, United States" placeholder="Depot address" style="margin-bottom: 8px;">
                                 <button class="btn btn-primary" onclick="addDeliveryToRoute()" style="width: 100%; padding: 10px; font-size: 11px;">
-                                    Add to Route
+                                    Add Route (Preview)
                                 </button>
                             </div>
 
@@ -1419,6 +1441,8 @@
         let activeRouteFilterSet = null;
         let mapFrameReady = false;
         let pendingRouteVisibility = null;
+        let pendingPreviewVisibility = null;
+        let pendingVendorFilterIds = null;
         
         // Helper: format hours (float) into "Xh Ym"
         function formatHours(hours) {
@@ -1899,7 +1923,7 @@
                 });
                 
                 // Create detailed CSV content
-                let csvContent = 'Route Number,Stop Sequence,Stop Type,Vendor ID,Vendor Name,Vendor City,Vendor Address,Recipient Name,Recipient City,Recipient Address,Cargo Weight (kg),Cargo Volume (m³),Requested Delivery Date,Requested Loading Date\n';
+                let csvContent = 'Route Number,Stop Sequence,Stop Type,Vendor ID,Vendor Name,Vendor City,Vendor Address,Recipient Name,Recipient City,Recipient Address,Cargo Weight (kg),Cargo Volume (m³),Linear Length (m),Requested Delivery Date,Requested Loading Date\n';
                 
                 routes.forEach((route, routeIdx) => {
                     route.forEach((nodeId, stopIdx) => {
@@ -1916,11 +1940,12 @@
                             const recipientCity = vendor['Recipient City'] || 'N/A';
                             const recipientAddress = `${vendor['Recipient Street'] || ''} ${vendor['Recipient Postcode'] || ''}`.trim() || 'N/A';
                             const weight = vendor['Vendor Gross Weight'] || vendor['Total Gross Weight'] || '0';
-                            const volume = vendor['Vendor Loading Meters'] || vendor['Calculated Loading Meters'] || vendor['Vendor Dimensions in m3'] || '0';
+                            const volume = vendor['Vendor Volume in m3'] || vendor['Vendor Dimensions in m3'] || '0';
+                            const linear = vendor['Vendor Linear Length'] || '0';
                             const deliveryDate = vendor['Requested Delivery Date'] || vendor['Requested Delivery'] || 'N/A';
                             const loadingDate = vendor['Requested Loading Date'] || vendor['Requested Loading'] || 'N/A';
                             
-                            csvContent += `${routeIdx + 1},${stopIdx + 1},Pickup,${nodeId},"${vendorName}","${vendorCity}","${vendorAddress}","${recipientName}","${recipientCity}","${recipientAddress}",${weight},${volume},"${deliveryDate}","${loadingDate}"\n`;
+                            csvContent += `${routeIdx + 1},${stopIdx + 1},Pickup,${nodeId},"${vendorName}","${vendorCity}","${vendorAddress}","${recipientName}","${recipientCity}","${recipientAddress}",${weight},${volume},${linear},"${deliveryDate}","${loadingDate}"\n`;
                         }
                     });
                 });
@@ -1997,7 +2022,7 @@
                         vendors: vendors,
                         csv_filepath: csvFilepath,
                         parameters: {
-                            use_metaheuristic: document.getElementById('useMetaheuristic').checked,
+                            use_metaheuristic: true,
                             starting_depot: parseInt(document.getElementById('startingDepot').value),
                             closing_depot: parseInt(document.getElementById('closingDepot').value),
                             vendor_start_hr: parseInt(document.getElementById('vendorStartHr').value),
@@ -2008,7 +2033,8 @@
                             max_driving: parseInt(document.getElementById('maxDriving').value),
                             max_weight: parseInt(document.getElementById('maxWeight').value),
                             max_volume: parseFloat(document.getElementById('maxVolume').value),
-                            max_linear_length: parseFloat(document.getElementById('maxLinearLength').value)
+                            max_linear_length: parseFloat(document.getElementById('maxLinearLength').value),
+                            allow_night_wait: document.getElementById('allowNightWait').checked
                         }
                     })
                 });
@@ -2101,8 +2127,42 @@
                 populateTruckDropdown(data.statistics.num_routes);
             }
 
-            // Geocoding + preprocessing warnings
+            // Geocoding + preprocessing + optimization warnings
             const warningsDiv = document.getElementById('geocodeWarnings');
+            console.log('Optimization warnings payload:', {
+                max_driving_warning: data.max_driving_warning,
+                forced_vendor_violations: data.forced_vendor_violations
+            });
+            const forcedViolations = data.forced_vendor_violations || {};
+            const forcedViolationEntries = Object.entries(forcedViolations);
+            const optimizationWarnings = (forcedViolationEntries.length > 0) ? `
+                <div class="warning-box">
+                    <div class="warning-header">OPTIMIZATION WARNINGS (${forcedViolationEntries.length})</div>
+                    <div class="warning-list">
+                        ${forcedViolationEntries.map(([vendorId, violations]) => {
+                            const first = Array.isArray(violations) && violations.length > 0 ? violations[0] : 'Infeasible time window';
+                            const extra = Array.isArray(violations) && violations.length > 1 ? ` (+${violations.length - 1} more)` : '';
+                            return `
+                                <div class="warning-item">
+                                    <div class="warning-item-type">VENDOR ${vendorId}</div>
+                                    <div class="warning-item-detail">${first}${extra}</div>
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+                </div>
+            ` : '';
+            const maxDrivingWarn = data.max_driving_warning ? `
+                <div class="warning-box">
+                    <div class="warning-header">CONSTRAINT WARNING</div>
+                    <div class="warning-list">
+                        <div class="warning-item">
+                            <div class="warning-item-type">MAX DRIVING</div>
+                            <div class="warning-item-detail">${data.max_driving_warning}</div>
+                        </div>
+                    </div>
+                </div>
+            ` : '';
             const geocodeWarnings = (data.failed_geocodes && data.failed_geocodes.length > 0) ? `
                 <div class="warning-box">
                     <div class="warning-header">GEOCODING WARNINGS (${data.failed_geocodes.length})</div>
@@ -2145,7 +2205,7 @@
                 </div>
             ` : '';
 
-            warningsDiv.innerHTML = `${geocodeWarnings}${preprocessingWarnings}${osrmWarnings}`;
+            warningsDiv.innerHTML = `${optimizationWarnings}${maxDrivingWarn}${geocodeWarnings}${preprocessingWarnings}${osrmWarnings}`;
 
             // Statistics
             const stats = data.statistics;
@@ -2169,11 +2229,23 @@
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">TOTAL LOADING</div>
-                    <div class="stat-value">${stats.total_loading.toLocaleString()}<span class="stat-unit">m</span></div>
+                    <div class="stat-value">${stats.total_loading.toLocaleString()}<span class="stat-unit">m³</span></div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">TOTAL LINEAR</div>
+                    <div class="stat-value">${(stats.total_linear_length ?? 0).toLocaleString()}<span class="stat-unit">m</span></div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">SOLVING TIME</div>
                     <div class="stat-value">${stats.solving_time}<span class="stat-unit">sec</span></div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">DISTANCE REDUCTION</div>
+                    <div class="stat-value">${(stats.quality_score ?? 0).toFixed(3)}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">PERFORMANCE SCORE</div>
+                    <div class="stat-value">${(stats.performance_score ?? 0).toFixed(3)}</div>
                 </div>
             `;
 
@@ -2217,6 +2289,10 @@
                                 <div class="metric-row">
                                     <span class="metric-label">VOLUME</span>
                                     <span class="metric-value">${route.loading.toLocaleString()} m³</span>
+                                </div>
+                                <div class="metric-row">
+                                    <span class="metric-label">LINEAR</span>
+                                    <span class="metric-value">${(route.linear_length_m || 0).toLocaleString()} m</span>
                                 </div>
                             </div>
                         </div>
@@ -2277,8 +2353,10 @@
 
             const metadata = currentSolutionData.filter_metadata || {};
             const vendorRoutes = metadata.vendor_routes || {};
+            const vendorNameToIds = metadata.vendor_name_to_ids || {};
             const routeVendors = metadata.route_vendors || {};
-            const vendorDates = metadata.vendor_delivery_dates || {};
+            const routeStartDates = metadata.route_start_dates || {};
+            const routeEndDates = metadata.route_end_dates || {};
             const weekOptions = metadata.week_options || [];
 
             if (Object.keys(routeVendors).length === 0) {
@@ -2308,11 +2386,18 @@
                 weekValue = '';
                 routeValue = '';
             }
-            if (weekValue === '' && activeId === 'weekFilter') {
-                if (vendorSelectEl) vendorSelectEl.value = '';
-                if (routeSelectEl) routeSelectEl.value = '';
-                vendorValue = '';
-                routeValue = '';
+            if (activeId === 'weekFilter') {
+                if (weekValue === '') {
+                    if (vendorSelectEl) vendorSelectEl.value = '';
+                    if (routeSelectEl) routeSelectEl.value = '';
+                    vendorValue = '';
+                    routeValue = '';
+                } else {
+                    if (vendorSelectEl) vendorSelectEl.value = '';
+                    if (routeSelectEl) routeSelectEl.value = '';
+                    vendorValue = '';
+                    routeValue = '';
+                }
             }
 
             // Start with all routes
@@ -2325,9 +2410,12 @@
             }
 
             // Filter by vendor (intersect with vendor's routes)
+            let vendorFilterIds = null;
             if (vendorValue && !routeValue) {
                 const vendorRouteList = vendorRoutes[vendorValue] || [];
                 routesToShow = new Set([...routesToShow].filter(r => vendorRouteList.includes(r)));
+                const idList = vendorNameToIds[vendorValue] || [];
+                vendorFilterIds = new Set(idList.map(v => parseInt(v)));
             }
 
             // Filter by week range
@@ -2339,15 +2427,15 @@
                 const routesWithinWeek = new Set();
                 Object.entries(routeVendors).forEach(([routeIdStr, vendorIds]) => {
                     const routeId = parseInt(routeIdStr);
-                    vendorIds.forEach(vid => {
-                        const dateStr = vendorDates[vid] || vendorDates[String(vid)];
-                        if (dateStr) {
-                            const dt = new Date(dateStr + 'T00:00:00');
-                            if (dt >= startDate && dt <= endDate) {
-                                routesWithinWeek.add(routeId);
-                            }
-                        }
-                    });
+                    const startStrDate = routeStartDates[routeIdStr] || routeStartDates[String(routeId)] || routeStartDates[routeId];
+                    const endStrDate = routeEndDates[routeIdStr] || routeEndDates[String(routeId)] || routeEndDates[routeId];
+                    const startDt = startStrDate ? new Date(startStrDate + 'T00:00:00') : null;
+                    const endDt = endStrDate ? new Date(endStrDate + 'T00:00:00') : null;
+                    const matchesStart = startDt && !isNaN(startDt.getTime()) && startDt >= startDate && startDt <= endDate;
+                    const matchesEnd = endDt && !isNaN(endDt.getTime()) && endDt >= startDate && endDt <= endDate;
+                    if (matchesStart || matchesEnd) {
+                        routesWithinWeek.add(routeId);
+                    }
                 });
                 routesToShow = new Set([...routesToShow].filter(r => routesWithinWeek.has(r)));
             }
@@ -2355,19 +2443,60 @@
             // Track current filter set
             activeRouteFilterSet = routesToShow;
 
+            // Close route detail popup if its route is filtered out
+            const popup = document.getElementById('routeDetailPopup');
+            if (popup && popup.dataset && popup.dataset.routeId) {
+                const popupRouteId = parseInt(popup.dataset.routeId);
+                if (!routesToShow.has(popupRouteId)) {
+                    closeRouteDetail();
+                    highlightRouteOnMap(popupRouteId, false);
+                }
+            }
+
             // Update route cards
             updateRouteCardVisibility(routesToShow);
             
+            // Compute preview visibility based on active filters
+            const previewShouldShow = computePreviewVisibility({ weekValue, vendorValue, routeValue });
+
             // Update map route visibility
             if (!mapFrameReady) {
                 // Defer map updates until iframe finishes loading
                 pendingRouteVisibility = new Set(routesToShow);
+                pendingPreviewVisibility = previewShouldShow;
+                pendingVendorFilterIds = vendorFilterIds;
             } else {
+                const mapFrame = document.getElementById('mapFrame');
+                if (mapFrame?.contentWindow) {
+                    mapFrame.contentWindow.__previewShouldShow = previewShouldShow;
+                    mapFrame.contentWindow.__vendorFilterIds = vendorFilterIds;
+                }
                 updateMapRouteVisibility(routesToShow);
             }
 
             // Update linked filter options so selections are related
             updateLinkedFilterOptions(metadata, routesToShow, { weekValue, vendorValue, routeValue });
+        }
+
+        function computePreviewVisibility({ weekValue, vendorValue, routeValue }) {
+            const meta = window.previewMeta;
+            if (!meta) return null;
+            if (routeValue) return false;
+            if (vendorValue) {
+                const target = String(vendorValue).trim().toLowerCase();
+                const name = String(meta.vendorName || '').trim().toLowerCase();
+                return target !== '' && name === target;
+            }
+            if (weekValue) {
+                const [startStr, endStr] = weekValue.split('|');
+                const startDate = new Date(startStr + 'T00:00:00');
+                const endDate = new Date(endStr + 'T23:59:59');
+                const raw = meta.requestedLoading || meta.requestedDelivery;
+                const dt = raw ? new Date(raw) : null;
+                if (!dt || isNaN(dt.getTime())) return false;
+                return dt >= startDate && dt <= endDate;
+            }
+            return true;
         }
 
         function updateRouteCardVisibility(routesToShow) {
@@ -2455,8 +2584,11 @@
                         <div><strong>Vendors:</strong> ${route.num_vendors}</div>
                         <div><strong>Distance:</strong> ${route.distance.toLocaleString()} km</div>
                         <div><strong>Time:</strong> ${formatHours(route.total_time_hours)}</div>
+                        <div><strong>Driving:</strong> ${formatHours(route.driving_time_hours || 0)}</div>
+                        <div><strong>Service:</strong> ${formatHours(route.service_time_hours || 0)}</div>
                         <div><strong>Cargo:</strong> ${route.cargo.toLocaleString()} kg</div>
                         <div><strong>Volume:</strong> ${route.loading.toLocaleString()} m³</div>
+                        <div><strong>Linear:</strong> ${(route.linear_length_m || 0).toLocaleString()} m</div>
                     </div>
                 </div>
                 <div style="margin-bottom: 16px; padding: 12px; background: rgba(179, 154, 124, 0.08); border-radius: 8px; border-left: 3px solid #B39A7C;">
@@ -2472,7 +2604,7 @@
                         </div>
                         <div style="display: flex; justify-content: space-between;">
                             <span>Linear length:</span>
-                            <span><strong>${getUtilizationIndicator(route.linear_length_utilization || 0)} ${(route.linear_length_utilization || 0).toFixed(1)}%</strong> (est. ${(route.loading * 0.18).toFixed(1)} / ${route.max_linear_length_m || 16.1} m)</span>
+                            <span><strong>${getUtilizationIndicator(route.linear_length_utilization || 0)} ${(route.linear_length_utilization || 0).toFixed(1)}%</strong> (${(route.linear_length_m || 0).toFixed(1)} / ${route.max_linear_length_m || 16.1} m)</span>
                         </div>
                         <div style="display: flex; justify-content: space-between;">
                             <span>Driving hours:</span>
@@ -2494,6 +2626,7 @@
                             <div class="full-width">⏱️ Expected arrival: ${route.start_expected_arrival || 'N/A'}</div>
                             <div class="full-width">📦 Cargo: ${route.start_cargo_kg ? route.start_cargo_kg.toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1}) : '0.0'} kg</div>
                             <div class="full-width">📐 Volume: ${route.start_volume_m3 ? route.start_volume_m3.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '0.00'} m³</div>
+                            <div class="full-width">📏 Linear: ${route.start_linear_m ? route.start_linear_m.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '0.00'} m</div>
                         </div>
                     </div>
                     ${route.segments.map((seg, idx) => `
@@ -2508,6 +2641,7 @@
                             ${seg.service_time_hours > 0 ? `<div>🛠️ Loading: ${seg.service_time_hours.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} hrs</div>` : ''}
                             <div>📦 Cargo: ${seg.cargo_kg ? seg.cargo_kg.toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1}) : '0.0'} kg</div>
                             <div>📐 Volume: ${seg.volume_m3 ? seg.volume_m3.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '0.00'} m³</div>
+                            <div>📏 Linear: ${seg.linear_m ? seg.linear_m.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '0.00'} m</div>
                             ${seg.is_depot_destination ? 
                                 `<div class="full-width">🧭 Vendor time: ${seg.expected_arrival_vendor_from || 'N/A'} (expected)</div>
                                  <div class="full-width">📅 Vendor window: ${seg.requested_vendor_pickup_from || 'N/A'} (requested)</div>
@@ -2657,6 +2791,85 @@
                         console.warn('Error toggling layer for route', routeId, ':', layerErr);
                     }
                 });
+
+                // Toggle depot symbols based on route filters
+                const nodeRouteMap = mapWin.nodeRouteMap || {};
+                const depotGroups = mapWin.depotLayerGroups || {};
+                Object.entries(depotGroups).forEach(([depotIdStr, layer]) => {
+                    const depotId = parseInt(depotIdStr);
+                    const routes = nodeRouteMap[String(depotId)] || nodeRouteMap[depotId] || [];
+                    const routeList = Array.isArray(routes) ? routes : (routes ? [routes] : []);
+                    const shouldShowDepot = activeSet.size === 0 || routeList.some(r => activeSet.has(parseInt(r)));
+                    try {
+                        if (shouldShowDepot && !map.hasLayer(layer)) {
+                            map.addLayer(layer);
+                        } else if (!shouldShowDepot && map.hasLayer(layer)) {
+                            map.removeLayer(layer);
+                        }
+                    } catch (depotErr) {
+                        console.warn('Error toggling depot for', depotId, depotErr);
+                    }
+                });
+
+                // Toggle unassigned vendors (vendors without route) when filtering
+                const unassignedGroup = mapWin.unassignedVendorGroup;
+                if (unassignedGroup) {
+                    const showUnassigned = activeSet.size === 0;
+                    try {
+                        if (showUnassigned && !map.hasLayer(unassignedGroup)) {
+                            map.addLayer(unassignedGroup);
+                        } else if (!showUnassigned && map.hasLayer(unassignedGroup)) {
+                            map.removeLayer(unassignedGroup);
+                        }
+                    } catch (unassignedErr) {
+                        console.warn('Error toggling unassigned vendors', unassignedErr);
+                    }
+                }
+
+                // Toggle preview group visibility based on filters
+                const previewGroup = mapWin.previewGroup;
+                if (previewGroup && typeof mapWin.__previewShouldShow === 'boolean') {
+                    const shouldShowPreview = mapWin.__previewShouldShow;
+                    try {
+                        if (shouldShowPreview && !map.hasLayer(previewGroup)) {
+                            map.addLayer(previewGroup);
+                        } else if (!shouldShowPreview && map.hasLayer(previewGroup)) {
+                            map.removeLayer(previewGroup);
+                        }
+                    } catch (previewErr) {
+                        console.warn('Error toggling preview group', previewErr);
+                    }
+                }
+
+                // Vendor-only filter: hide other vendor markers within visible routes
+                const vendorFilterIds = mapWin.__vendorFilterIds;
+                if (vendorFilterIds) {
+                    try {
+                        const depotIds = new Set(Object.keys(mapWin.depotLayerGroups || {}).map(id => parseInt(id)));
+                        const nodes = mapWin.document?.querySelectorAll('[data-node-id]') || [];
+                        nodes.forEach(el => {
+                            const raw = el.getAttribute('data-node-id');
+                            if (!raw || raw === 'preview-vendor') return;
+                            const idNum = parseInt(raw);
+                            if (Number.isNaN(idNum)) return;
+                            if (depotIds.has(idNum)) return;
+                            el.style.display = vendorFilterIds.has(idNum) ? '' : 'none';
+                        });
+                    } catch (vendorFilterErr) {
+                        console.warn('Error toggling vendor markers', vendorFilterErr);
+                    }
+                } else {
+                    try {
+                        const nodes = mapWin.document?.querySelectorAll('[data-node-id]') || [];
+                        nodes.forEach(el => {
+                            const raw = el.getAttribute('data-node-id');
+                            if (!raw || raw === 'preview-vendor') return;
+                            el.style.display = '';
+                        });
+                    } catch (vendorFilterResetErr) {
+                        console.warn('Error resetting vendor markers', vendorFilterResetErr);
+                    }
+                }
             } catch (e) {
                 // Cross-origin or other access error - map filtering won't work
                 console.warn('Cannot access map iframe:', e);
@@ -2671,6 +2884,14 @@
                     mapFrameReady = true;
                     const targetVisibility = pendingRouteVisibility || activeRouteFilterSet || new Set();
                     pendingRouteVisibility = null;
+                    if (pendingPreviewVisibility !== null && pendingPreviewVisibility !== undefined) {
+                        mapFrame.contentWindow.__previewShouldShow = pendingPreviewVisibility;
+                        pendingPreviewVisibility = null;
+                    }
+                    if (pendingVendorFilterIds !== null && pendingVendorFilterIds !== undefined) {
+                        mapFrame.contentWindow.__vendorFilterIds = pendingVendorFilterIds;
+                        pendingVendorFilterIds = null;
+                    }
                     setTimeout(() => updateMapRouteVisibility(targetVisibility), 800);
                 });
             }
@@ -2680,7 +2901,7 @@
         function updateLinkedFilterOptions(metadata, routesToShow, selectionCtx) {
             const vendorRoutes = metadata.vendor_routes || {};
             const routeVendors = metadata.route_vendors || {};
-            const vendorDates = metadata.vendor_delivery_dates || {};
+            const routeStartDates = metadata.route_start_dates || {};
             const weekOptions = metadata.week_options || [];
 
             const weekSelect = document.getElementById('weekFilter');
@@ -2704,7 +2925,7 @@
                 }
             });
 
-            // Allowed weeks = weeks that contain at least one vendor date from allowedRoutes
+            // Allowed weeks = weeks that contain at least one route start date
             const allowedWeeksSet = new Set();
             weekOptions.forEach(wo => {
                 const [startStr, endStr] = String(wo.value).split('|');
@@ -2712,15 +2933,12 @@
                 const startDate = new Date(startStr + 'T00:00:00');
                 const endDate = new Date(endStr + 'T23:59:59');
                 outer: for (const routeId of allowedRoutes) {
-                    const vendorIds = routeVendors[String(routeId)] || routeVendors[routeId] || [];
-                    for (const vid of vendorIds) {
-                        const dateStr = vendorDates[vid] || vendorDates[String(vid)];
-                        if (dateStr) {
-                            const dt = new Date(dateStr + 'T00:00:00');
-                            if (dt >= startDate && dt <= endDate) {
-                                allowedWeeksSet.add(wo.value);
-                                break outer;
-                            }
+                    const routeDateStr = routeStartDates[String(routeId)] || routeStartDates[routeId];
+                    if (routeDateStr) {
+                        const dt = new Date(routeDateStr + 'T00:00:00');
+                        if (dt >= startDate && dt <= endDate) {
+                            allowedWeeksSet.add(wo.value);
+                            break outer;
                         }
                     }
                 }
@@ -2782,37 +3000,208 @@
 
         // Route Operations Functions
         async function addDeliveryToRoute() {
-            const vendorInput = document.getElementById('addDeliveryVendor').value.trim();
-            if (!vendorInput) {
-                alert('Please enter a vendor name or ID');
+            const vendorName = document.getElementById('addDeliveryVendorName').value.trim();
+            const address = document.getElementById('addDeliveryAddress').value.trim();
+            const weightKg = document.getElementById('addDeliveryWeight').value.trim();
+            const volumeM3 = document.getElementById('addDeliveryVolume').value.trim();
+            const linearLengthM = document.getElementById('addDeliveryLinearLength').value.trim();
+            const requestedLoading = document.getElementById('addDeliveryRequestedLoading').value.trim();
+            const requestedDelivery = document.getElementById('addDeliveryRequestedDelivery').value.trim();
+            const depotName = document.getElementById('addDeliveryDepotName').value.trim();
+            const depotAddress = document.getElementById('addDeliveryDepotAddress').value.trim();
+
+            const missing = [];
+            if (!vendorName) missing.push('vendor name');
+            if (!address) missing.push('address');
+            if (weightKg === '' || isNaN(Number(weightKg))) missing.push('weight');
+            if (volumeM3 === '' || isNaN(Number(volumeM3))) missing.push('volume');
+            if (linearLengthM === '' || isNaN(Number(linearLengthM))) missing.push('linear length');
+            if (!requestedLoading) missing.push('requested loading');
+            if (!requestedDelivery) missing.push('requested delivery');
+            if (!depotName) missing.push('depot name');
+            if (!depotAddress) missing.push('depot address');
+            if (missing.length > 0) {
+                console.warn('Add Route (Preview) missing fields:', missing, {
+                    vendorName, address, weightKg, volumeM3, linearLengthM, requestedLoading, requestedDelivery, depotName, depotAddress
+                });
+                alert(`Please fill: ${missing.join(', ')}`);
                 return;
             }
 
-            // Save state before operation
-            if (currentSolutionData) {
-                saveStateToHistory();
-            }
-
             try {
-                const response = await fetch(`${API_BASE}/api/route/add-stop-state`, {
+                const vendorResp = await fetch(`${API_BASE}/api/geocode-address`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ vendor_name: vendorInput })
+                    body: JSON.stringify({ address })
                 });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    alert(`✓ Delivery added to ${data.message}`);
-                    document.getElementById('addDeliveryVendor').value = '';
-                    // Refresh the current view
-                    location.reload();
-                } else {
-                    alert('Error: ' + (data.error || 'Failed to add delivery'));
+                const vendorData = await vendorResp.json();
+                console.log('Vendor geocode response:', vendorData);
+                if (!vendorData.success) {
+                    alert('Vendor geocode failed: ' + (vendorData.error || 'Unknown error'));
+                    return;
                 }
+
+                const depotQuery = depotName ? `${depotName}, ${depotAddress}` : depotAddress;
+                let depotResp = await fetch(`${API_BASE}/api/geocode-address`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ address: depotQuery, allow_depot_match: true, depot_name: depotName })
+                });
+                const depotData = await depotResp.json();
+                console.log('Depot geocode response:', depotData);
+                if (!depotData.success) {
+                    depotResp = await fetch(`${API_BASE}/api/geocode-address`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ address: depotAddress, allow_depot_match: true, depot_name: depotName })
+                    });
+                    const depotFallback = await depotResp.json();
+                    console.log('Depot geocode fallback response:', depotFallback);
+                    if (!depotFallback.success) {
+                        alert('Depot geocode failed: ' + (depotFallback.error || 'Unknown error'));
+                        return;
+                    }
+                    depotData.lat = depotFallback.lat;
+                    depotData.lon = depotFallback.lon;
+                }
+
+                addPreviewMarkersToMap({
+                    vendor: {
+                        name: vendorName,
+                        lat: vendorData.lat,
+                        lon: vendorData.lon,
+                        city: vendorData.city || '',
+                        country: vendorData.country || '',
+                        weightKg,
+                        volumeM3,
+                        linearLengthM,
+                        requestedLoading,
+                        requestedDelivery
+                    },
+                    depot: {
+                        name: depotName,
+                        lat: depotData.lat,
+                        lon: depotData.lon,
+                        city: depotData.city || '',
+                        country: depotData.country || ''
+                    }
+                });
+
+                const previewResp = await fetch(`${API_BASE}/api/route/add-delivery-preview`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        vendor_name: vendorName,
+                        address,
+                        weight_kg: weightKg,
+                        volume_m3: volumeM3,
+                        requested_loading: requestedLoading,
+                        requested_delivery: requestedDelivery,
+                        vendor_lat: vendorData.lat,
+                        vendor_lon: vendorData.lon,
+                        vendor_city: vendorData.city || '',
+                        vendor_country: vendorData.country || '',
+                        vendor_postal: vendorData.postal_code || '',
+                        linear_length_m: linearLengthM,
+                        depot_name: depotName,
+                        depot_address: depotAddress,
+                        depot_lat: depotData.lat,
+                        depot_lon: depotData.lon,
+                        depot_city: depotData.city || '',
+                        depot_country: depotData.country || '',
+                        depot_postal: depotData.postal_code || ''
+                    })
+                });
+                const previewData = await previewResp.json();
+                if (!previewData.success) {
+                    alert('Preview saved, but CSV update failed: ' + (previewData.error || 'Unknown error'));
+                    return;
+                }
+
+                alert('✓ Preview markers added to map and CSV updated');
             } catch (e) {
                 alert('Failed to add delivery: ' + e.message);
             }
+        }
+
+        function addPreviewMarkersToMap(payload) {
+            const mapFrame = document.getElementById('mapFrame');
+            const mapWin = mapFrame?.contentWindow;
+            const map = mapWin?.routeMap || findIframeMap(mapWin);
+            if (!map || !mapWin || !mapWin.L) {
+                alert('Map not ready yet. Please wait for the map to load.');
+                return;
+            }
+
+            mapWin.previewMarkers = mapWin.previewMarkers || [];
+            if (!mapWin.previewGroup) {
+                mapWin.previewGroup = mapWin.L.featureGroup().addTo(map);
+            }
+            const previewGroup = mapWin.previewGroup;
+            if (!map.hasLayer(previewGroup)) {
+                map.addLayer(previewGroup);
+            }
+
+            const vendor = payload.vendor;
+            const depot = payload.depot;
+            window.previewMeta = {
+                vendorName: vendor.name,
+                requestedLoading: vendor.requestedLoading,
+                requestedDelivery: vendor.requestedDelivery
+            };
+            mapWin.previewMeta = window.previewMeta;
+
+            const vendorPinHtml = `
+                <div data-node-id="preview-vendor" style="position: relative; width: 20px; height: 28px;">
+                    <svg width="20" height="28" viewBox="0 0 30 40" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M15,0 C8.373,0 3,5.373 3,12 C3,20.25 15,40 15,40 C15,40 27,20.25 27,12 C27,5.373 21.627,0 15,0 Z"
+                              fill="#1976D2" stroke="#1565C0" stroke-width="1"/>
+                        <circle cx="15" cy="12" r="6" fill="white"/>
+                    </svg>
+                </div>
+            `;
+            const vendorMarker = mapWin.L.marker(
+                [vendor.lat, vendor.lon],
+                {
+                    icon: mapWin.L.divIcon({
+                        html: vendorPinHtml,
+                        iconSize: [20, 28],
+                        iconAnchor: [10, 28],
+                        className: 'preview-vendor-icon'
+                    })
+                }
+            ).addTo(previewGroup);
+            const vendorTooltip = vendor.city
+                ? `<b>${vendor.name}</b><br>${vendor.city}${vendor.country ? ', ' + vendor.country : ''}`
+                : `<b>${vendor.name}</b>`;
+            vendorMarker.bindTooltip(vendorTooltip, { direction: 'top' });
+            vendorMarker.bindPopup(
+                `<b>Vendor (Preview)</b><br>${vendor.name}<br>${vendor.lat.toFixed(5)}, ${vendor.lon.toFixed(5)}`
+            );
+
+            const depotOuter = mapWin.L.circle([depot.lat, depot.lon], {
+                radius: 15000, color: '#E74C3C', fill: false, weight: 3, opacity: 0.8
+            }).addTo(previewGroup);
+            const depotMiddle = mapWin.L.circle([depot.lat, depot.lon], {
+                radius: 8000, color: '#C0392B', fill: false, weight: 3, opacity: 0.9
+            }).addTo(previewGroup);
+            const depotInner = mapWin.L.circleMarker([depot.lat, depot.lon], {
+                radius: 15, color: '#922B21', fill: false, weight: 4, opacity: 1.0
+            }).addTo(previewGroup);
+            const depotCenter = mapWin.L.circleMarker([depot.lat, depot.lon], {
+                radius: 15, color: '#922B21', fill: false, weight: 3, opacity: 1.0
+            }).addTo(previewGroup);
+            const depotTooltip = depot.city
+                ? `<b>${depot.name}</b><br>${depot.city}${depot.country ? ', ' + depot.country : ''}`
+                : `<b>${depot.name}</b>`;
+            depotInner.bindTooltip(depotTooltip, { direction: 'top' });
+            const depotPopup = mapWin.L.popup()
+                .setLatLng([depot.lat, depot.lon])
+                .setContent(`<b>Depot (Preview)</b><br>${depot.name}<br>${depot.lat.toFixed(5)}, ${depot.lon.toFixed(5)}`);
+            depotInner.bindPopup(depotPopup);
+
+            mapWin.previewMarkers.push(vendorMarker, depotOuter, depotMiddle, depotInner, depotCenter);
+            map.setView([vendor.lat, vendor.lon], Math.max(map.getZoom(), 6));
         }
 
         async function removeDeliveryFromRoute() {
@@ -2901,18 +3290,22 @@
 
             let totalWeight = 0;
             let totalVolume = 0;
+            let totalLinear = 0;
             
             vendors.forEach(v => {
                 // Try both backend format (weight, volume) and CSV format
                 const weight = parseFloat(v.weight || v['Vendor Gross Weight'] || v['Total Gross Weight'] || 0);
-                const volume = parseFloat(v.volume || v['Vendor Loading Meters'] || v['Calculated Loading Meters'] || v['Vendor Dimensions in m3'] || 0);
+                const volume = parseFloat(v.volume || v['Vendor Volume in m3'] || v['Vendor Dimensions in m3'] || 0);
+                const linear = parseFloat(v['Vendor Linear Length'] || 0);
                 totalWeight += weight;
                 totalVolume += volume;
+                totalLinear += linear;
             });
 
             document.getElementById('summaryVendors').textContent = vendors.length;
             document.getElementById('summaryWeight').textContent = `${(totalWeight / 1000).toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1})} tons`;
             document.getElementById('summaryVolume').textContent = `${totalVolume.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} m³`;
+            document.getElementById('summaryLinear').textContent = `${totalLinear.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} m`;
             summary.classList.add('show');
             actions.style.display = 'flex';
         }
@@ -3018,7 +3411,7 @@
                     <div style="font-weight: 600; margin-bottom: 8px;">Route ${routeData.route_id}</div>
                     <div style="font-size: 11px; color: var(--text-muted);">
                         Distance: ${routeData.distance} km | 
-                        Time: ${formatHours(routeData.total_time_hours)} | 
+                        Time: ${formatHours(routeData.total_time_hours)} (drive ${formatHours(routeData.driving_time_hours || 0)} + service ${formatHours(routeData.service_time_hours || 0)}) | 
                         Cargo: ${routeData.cargo} kg | 
                         Stops: ${routeData.stops || 0}
                     </div>

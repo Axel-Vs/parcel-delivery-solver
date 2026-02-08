@@ -1,6 +1,6 @@
 """
 Route-based solution representation for VRP metaheuristics.
-Compact representation using routes instead of time-expanded binary tensors.
+Compact representation using routes.
 """
 
 import numpy as np
@@ -21,11 +21,15 @@ class RouteSolution:
     """
     
     def __init__(self, routes, vendors_df, distance_matrix, time_matrix, 
-                 capacity_matrix, loading_matrix, max_capacity_kg, max_volume, max_linear_length,
+                 capacity_matrix, loading_matrix, linear_length_matrix, max_capacity_kg, max_volume, max_linear_length,
                  discretization_constant, min_date, max_driving_hours=None,
                  service_time_matrix=None, evaluation_period=None,
                  allowed_early_hours=12, allowed_late_hours=12,
-                 depot_node_ids=None, vendor_node_ids=None, vendor_depot_map=None):
+                 depot_node_ids=None, vendor_node_ids=None, vendor_depot_map=None,
+                 vendor_start_hr=None, pickup_end_hr=None,
+                 starting_depot=None, closing_depot=None,
+                 allow_night_wait=True,
+                 verbose=False):
         """
         Initialize route solution.
         
@@ -50,6 +54,7 @@ class RouteSolution:
         self.time_matrix = time_matrix
         self.capacity_matrix = capacity_matrix
         self.loading_matrix = loading_matrix
+        self.linear_length_matrix = linear_length_matrix if linear_length_matrix is not None else np.zeros(len(distance_matrix))
         self.service_time_matrix = service_time_matrix if service_time_matrix is not None else np.zeros(len(distance_matrix))
         self.max_capacity_kg = max_capacity_kg
         self.max_volume = max_volume
@@ -64,6 +69,12 @@ class RouteSolution:
         self.depot_node_ids = set(depot_node_ids or [])
         self.vendor_node_ids = set(vendor_node_ids or [])
         self.vendor_depot_map = vendor_depot_map or {}
+        self.vendor_start_hr = vendor_start_hr
+        self.pickup_end_hr = pickup_end_hr
+        self.starting_depot = starting_depot
+        self.closing_depot = closing_depot
+        self.allow_night_wait = bool(allow_night_wait)
+        self.verbose = bool(verbose)
         self._vendor_row_by_node = {}
         if self.vendors_df is not None and 'node_id' in self.vendors_df.columns:
             for _, row in self.vendors_df.iterrows():
@@ -182,6 +193,7 @@ class RouteSolution:
             # Track dynamic load to enforce capacity with mid-route depots
             current_weight = 0.0
             current_volume = 0.0
+            current_linear_length = 0.0
             picked_vendors = []
             depot_deliveries = {}
             for node in route:
@@ -189,6 +201,7 @@ class RouteSolution:
                     picked_vendors.append(node)
                     current_weight += float(self.capacity_matrix[node])
                     current_volume += float(self.loading_matrix[node])
+                    current_linear_length += float(self.linear_length_matrix[node])
                     if route_idx < len(self.max_capacity_kg):
                         if current_weight > self.max_capacity_kg[route_idx]:
                             self._constraint_violations.append(
@@ -204,6 +217,13 @@ class RouteSolution:
                             if not check_all:
                                 self._is_feasible = False
                                 return False
+                        if current_linear_length > self.max_linear_length[route_idx]:
+                            self._constraint_violations.append(
+                                f"Route {route_idx}: Linear {current_linear_length:.1f} > {self.max_linear_length[route_idx]:.1f} m"
+                            )
+                            if not check_all:
+                                self._is_feasible = False
+                                return False
                 elif node in self.depot_node_ids:
                     delivered_here = [v for v in picked_vendors if self.vendor_depot_map.get(v) == node]
                     if delivered_here:
@@ -211,14 +231,20 @@ class RouteSolution:
                         for v in delivered_here:
                             current_weight -= float(self.capacity_matrix[v])
                             current_volume -= float(self.loading_matrix[v])
+                            current_linear_length -= float(self.linear_length_matrix[v])
                         picked_vendors = [v for v in picked_vendors if v not in delivered_here]
 
             route_weight = sum(self.capacity_matrix[node] for node in route if self._is_vendor(node))
             route_volume = sum(self.loading_matrix[node] for node in route if self._is_vendor(node))
+            route_linear = sum(self.linear_length_matrix[node] for node in route if self._is_vendor(node))
             
-            # Calculate travel time from time_matrix (expecting seconds)
-            # Count full path including depot → first vendor
-            route_travel_time_seconds = sum(self.time_matrix[route[i]][route[i + 1]] for i in range(0, len(route) - 1))
+            # Calculate travel time from time_matrix (expecting seconds).
+                    # Exclude dummy-start (node 0) → first vendor leg.
+            route_travel_time_seconds = 0.0
+            for i in range(0, len(route) - 1):
+                if route[i] == 0:
+                    continue
+                route_travel_time_seconds += self.time_matrix[route[i]][route[i + 1]]
             route_travel_time_hours = route_travel_time_seconds / 3600.0
             
             # Debug: Check if time values seem reasonable
@@ -255,7 +281,7 @@ class RouteSolution:
                     violation_msg = f"Route {route_idx}: Total time (travel {route_travel_time_hours:.2f}h + service {route_service_time_hours:.2f}h = {route_time_hours:.2f}h) > {self.max_driving_hours:.2f}h max"
                     self._constraint_violations.append(violation_msg)
                     # Log first few violations for debugging
-                    if route_idx < 3 and len(self._constraint_violations) < 5:
+                    if self.verbose and route_idx < 3 and len(self._constraint_violations) < 5:
                         print(f"⚠️  {violation_msg}")
                     if not check_all:
                         self._is_feasible = False
@@ -339,6 +365,24 @@ class RouteSolution:
                         return _to_naive(parsed)
                 return None
 
+            def _daily_window_for(dt_value, start_hr, end_hr):
+                if dt_value is None or start_hr is None or end_hr is None:
+                    return None, None
+                base = _to_naive(dt_value)
+                if base is None:
+                    return None, None
+                try:
+                    start_hr = int(start_hr)
+                    end_hr = int(end_hr)
+                except (TypeError, ValueError):
+                    return None, None
+                base_day = base.replace(hour=0, minute=0, second=0, microsecond=0)
+                start_dt = base_day + timedelta(hours=start_hr)
+                end_dt = base_day + timedelta(hours=end_hr)
+                if end_dt < start_dt:
+                    end_dt = end_dt + timedelta(days=1)
+                return start_dt, end_dt
+
             def _depot_window_for_deliveries(delivery_vendor_nodes):
                 deliveries = []
                 for v in delivery_vendor_nodes:
@@ -347,8 +391,15 @@ class RouteSolution:
                         deliveries.append(delivery_time)
                 if not deliveries:
                     return None, None
-                window_start = max([d - allowed_early for d in deliveries])
-                window_end = min([d + allowed_late for d in deliveries])
+                window_start = None
+                window_end = None
+                for d in deliveries:
+                    candidate_start = d - allowed_early
+                    candidate_end = d + allowed_late
+                    if candidate_start > candidate_end:
+                        return None, None
+                    window_start = candidate_start if window_start is None else max(window_start, candidate_start)
+                    window_end = candidate_end if window_end is None else min(window_end, candidate_end)
                 return window_start, window_end
 
             for route_idx, route in enumerate(self.routes):
@@ -606,6 +657,21 @@ class RouteSolution:
                         latest_allowed = requested_loading + allowed_late
                         if current_time < earliest_allowed:
                             current_time = earliest_allowed
+                        # If vendor has daily open hours, allow waiting until next open window
+                        if self.vendor_start_hr is not None and self.pickup_end_hr is not None:
+                            open_start, open_end = _daily_window_for(
+                                current_time,
+                                self.vendor_start_hr,
+                                self.pickup_end_hr
+                            )
+                            if open_start is not None and open_end is not None:
+                                if current_time < open_start:
+                                    current_time = open_start
+                                elif current_time > open_end and self.allow_night_wait:
+                                    # Wait until next day's opening (if allowed)
+                                    next_open = open_start + timedelta(days=1)
+                                    if next_open <= latest_allowed:
+                                        current_time = next_open
                         if current_time > latest_allowed:
                             violation_msg = (
                                 f"Route {route_idx}: {self._vendor_name(node)} arrival too late "
@@ -617,16 +683,32 @@ class RouteSolution:
                     elif node in self.depot_node_ids:
                         delivered_here = depot_deliveries.get(node, [])
                         window_start, window_end = _depot_window_for_deliveries(delivered_here)
-                        if window_start is None or window_end is None:
-                            continue
-                        if current_time < window_start:
+                        if delivered_here and (window_start is None or window_end is None):
                             violation_msg = (
-                                f"Route {route_idx}: depot arrival too early "
-                                f"({_fmt_time(current_time)}; window starts {_fmt_time(window_start)})"
+                                f"Route {route_idx}: depot arrival window infeasible "
+                                f"(no overlap with depot hours)"
                             )
                             self._constraint_violations.append(violation_msg)
                             if not check_all:
                                 return False
+                            continue
+                        if window_start is None or window_end is None:
+                            continue
+                        if current_time < window_start:
+                            current_time = window_start
+                        if self.starting_depot is not None and self.closing_depot is not None:
+                            open_start, open_end = _daily_window_for(
+                                current_time,
+                                self.starting_depot,
+                                self.closing_depot
+                            )
+                            if open_start is not None and open_end is not None:
+                                if current_time < open_start:
+                                    current_time = open_start
+                                elif current_time > open_end and self.allow_night_wait:
+                                    next_open = open_start + timedelta(days=1)
+                                    if next_open <= window_end:
+                                        current_time = next_open
                         if current_time > window_end:
                             violation_msg = (
                                 f"Route {route_idx}: depot arrival too late "
@@ -643,26 +725,16 @@ class RouteSolution:
         """Return number of routes (vehicles used)."""
         return len(self.routes)
     
-    def get_route_cost(self, route_idx):
-        """Get distance cost of a specific route."""
-        if route_idx >= len(self.routes):
-            return 0
-        
-        route = self.routes[route_idx]
-        distance = 0
-        for i in range(len(route) - 1):
-            distance += self.distance_matrix[route[i]][route[i + 1]]
-        return distance
-    
     def get_route_capacity_usage(self, route_idx):
         """Get capacity usage for a specific route."""
         if route_idx >= len(self.routes):
-            return 0, 0
+            return 0, 0, 0
         
         route = self.routes[route_idx]
         weight = sum(self.capacity_matrix[node] for node in route if self._is_vendor(node))
         volume = sum(self.loading_matrix[node] for node in route if self._is_vendor(node))
-        return weight, volume
+        linear_length = sum(self.linear_length_matrix[node] for node in route if self._is_vendor(node))
+        return weight, volume, linear_length
     
     def copy(self):
         """Create a deep copy of this solution."""
@@ -673,6 +745,7 @@ class RouteSolution:
             time_matrix=self.time_matrix,
             capacity_matrix=self.capacity_matrix,
             loading_matrix=self.loading_matrix,
+            linear_length_matrix=self.linear_length_matrix,
             service_time_matrix=self.service_time_matrix,
             max_capacity_kg=self.max_capacity_kg,
             max_volume=self.max_volume,
@@ -685,7 +758,12 @@ class RouteSolution:
             allowed_late_hours=self.allowed_late_hours,
             depot_node_ids=list(self.depot_node_ids),
             vendor_node_ids=list(self.vendor_node_ids),
-            vendor_depot_map=self.vendor_depot_map
+            vendor_depot_map=self.vendor_depot_map,
+            vendor_start_hr=self.vendor_start_hr,
+            pickup_end_hr=self.pickup_end_hr,
+            starting_depot=self.starting_depot,
+            closing_depot=self.closing_depot,
+            allow_night_wait=self.allow_night_wait
         )
     
     def invalidate_cache(self):

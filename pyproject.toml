@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "parcel-delivery-solver"
 version = "1.0.0"
-description = "A sophisticated optimization system for vehicle routing and parcel delivery using OR-Tools and OSRM"
+description = "A sophisticated optimization system for vehicle routing and parcel delivery using ALNS and OSRM"
 readme = "README.md"
 authors = [
     { name = "Axel Vargas", email = "axel@example.com" }
@@ -18,12 +18,10 @@ keywords = [
     "optimization",
     "vehicle-routing",
     "logistics",
-    "or-tools",
     "osrm",
     "delivery",
     "routing",
-    "mixed-integer-programming",
-    "time-expanded-network"
+    "metaheuristic"
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -45,7 +43,6 @@ requires-python = ">=3.8"
 dependencies = [
     "pandas>=2.0.0",
     "numpy>=1.24.0",
-    "ortools>=9.7.0",
     "folium>=0.14.0",
     "requests>=2.31.0",
     "geopy>=2.4.0",
